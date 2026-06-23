@@ -1,0 +1,32 @@
+회사 PC에서 Codex/ChatGPT에게 그대로 붙여넣기
+
+아래 폴더는 집 PC에서 쓰던 로컬 Arca 채팅앱 압축본을 푼 것입니다.
+로그인/포인트/세이프티/배너/작품 이미지 선택 UI는 로컬 전용으로 제거되어 있고,
+채팅방 안의 이미지 렌더링은 유지되어 있습니다.
+
+작업 폴더:
+C:\경로\ai
+
+원하는 것:
+1. 이 폴더를 열어서 현재 상태를 파악해줘.
+2. 로컬 실행은 run-local.ps1로 하면 돼.
+3. 모델 선택지는 gemini-2.5-pro, gemini-3-flash-preview, gemini-3.1-pro-preview만 유지해줘.
+4. Vertex AI/ADC 방식으로 Gemini를 쓰고 있어. .env.local 설정을 확인해줘.
+5. 회사 PC에는 Google Cloud 인증이 없을 수 있으니, Gemini 호출이 인증 오류면 아래를 실행하게 안내해줘.
+
+실행:
+cd C:\경로\ai
+powershell -ExecutionPolicy Bypass -File .\run-local.ps1
+
+Google Cloud 인증이 필요할 때:
+gcloud auth login
+gcloud auth application-default login
+gcloud auth application-default set-quota-project project-34be93f4-4301-4d61-a04
+
+브라우저:
+http://localhost:3000
+
+주의:
+- 이 프로젝트는 로컬 PC 한 명 사용 기준입니다.
+- node_modules와 로컬 Node 런타임을 같이 가져온 상태라 보통 npm install 없이 실행됩니다.
+- 그래도 better-sqlite3 오류가 나면 실행 중인 node.exe를 모두 끄고 다시 실행하거나, 같은 Node 버전으로 npm install을 다시 해야 합니다.
