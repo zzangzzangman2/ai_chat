@@ -1868,9 +1868,10 @@ export function enforceNovelOnlyOutput(text: string): string {
     }
   }
 
-// Drop leading lines that violate the strict output channels.
+// Repair leading plain narration that violates strict output channels.
 // Allowed starts (after whitespace): *...* narration, "..." dialogue, or fenced ```INFO/```STATUS blocks.
-// This prevents title echoes like "작품명..." from appearing above the actual story.
+// Older logic dropped these lines, but Gemini sometimes starts with valid narration without *...*.
+// In that case, preserve the text by wrapping the first plain paragraph as narration.
 {
   const allowedStart = (t: string) => {
     const u = (t || "").trimStart();
@@ -1886,19 +1887,35 @@ export function enforceNovelOnlyOutput(text: string): string {
 
   if (!allowedStart(s)) {
     const lines = s.split(/\r?\n/);
-    let i = 0;
-    while (i < lines.length) {
+    let firstTextIdx = -1;
+    let firstAllowedIdx = -1;
+    for (let i = 0; i < Math.min(lines.length, 8); i++) {
+      const line = String(lines[i] || "");
+      if (!line.trim()) continue;
+      if (firstTextIdx < 0) firstTextIdx = i;
       const rest = lines.slice(i).join("\n");
-      if (!rest.trim()) {
-        s = "";
-        break;
-      }
       if (allowedStart(rest)) {
-        s = rest.replace(/^\s*\n+/, "");
+        firstAllowedIdx = i;
         break;
       }
-      i += 1;
-      if (i > 8) break; // safety
+    }
+
+    if (firstAllowedIdx > 0) {
+      s = lines.slice(firstAllowedIdx).join("\n").replace(/^\s*\n+/, "");
+    } else if (firstTextIdx >= 0) {
+      const raw = String(lines[firstTextIdx] || "");
+      const t = raw.trim();
+      const looksLikePlainNarration =
+        t.length > 0 &&
+        !allowedStart(t) &&
+        !isImageLine(t) &&
+        !/^\s{0,3}#{1,6}\s/.test(t) &&
+        !/^\s*[-*+]\s+/.test(t);
+      if (looksLikePlainNarration) {
+        const indent = raw.match(/^\s*/)?.[0] || "";
+        lines[firstTextIdx] = `${indent}*${t}*`;
+        s = lines.join("\n").replace(/^\s*\n+/, "");
+      }
     }
   }
 }
