@@ -114,6 +114,8 @@ function Test-PortAvailable {
 
 function Test-AppHealth {
   param([int]$Port)
+  $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+  if (-not $listener) { return $false }
   try {
     $res = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/api/auth/me" -TimeoutSec 2
     return $res.StatusCode -ge 200 -and $res.StatusCode -lt 500
@@ -158,9 +160,28 @@ function Find-HealthyAppPort {
   return 0
 }
 
+function Write-StartupProgress {
+  param(
+    [string]$Message,
+    [int]$Elapsed,
+    [int]$Total
+  )
+  Write-Host ("{0} {1}/{2}s" -f $Message, [Math]::Max(0, $Elapsed), [Math]::Max(1, $Total)) -ForegroundColor DarkGray
+}
+
 function Wait-HealthyAppPort {
-  param([int]$Seconds = 25)
-  for ($i = 0; $i -lt $Seconds; $i++) {
+  param(
+    [int]$Seconds = 25,
+    [string]$Message = "Waiting for existing server..."
+  )
+  $startedAt = Get-Date
+  $lastProgressAt = -99
+  while (((Get-Date) - $startedAt).TotalSeconds -lt $Seconds) {
+    $elapsed = [int][Math]::Floor(((Get-Date) - $startedAt).TotalSeconds)
+    if ($elapsed -eq 0 -or ($elapsed - $lastProgressAt) -ge 3) {
+      Write-StartupProgress -Message $Message -Elapsed $elapsed -Total $Seconds
+      $lastProgressAt = $elapsed
+    }
     $candidate = Find-HealthyAppPort
     if ($candidate -gt 0) { return $candidate }
     Start-Sleep -Seconds 1
@@ -257,12 +278,23 @@ function Start-DosServer {
   Set-Content -LiteralPath $portFile -Value "$Port" -Encoding ASCII
   Set-Content -LiteralPath $runnerPidFile -Value "$($proc.Id)" -Encoding ASCII
 
-  for ($i = 0; $i -lt 90; $i++) {
+  $startupLimitSeconds = 90
+  $startedAt = Get-Date
+  $lastProgressAt = -99
+  Write-Host "Next dev is starting. First launch or code changes can take 10-40s." -ForegroundColor DarkGray
+  while (((Get-Date) - $startedAt).TotalSeconds -lt $startupLimitSeconds) {
+    $elapsed = [int][Math]::Floor(((Get-Date) - $startedAt).TotalSeconds)
+    if ($elapsed -eq 0 -or ($elapsed - $lastProgressAt) -ge 3) {
+      Write-StartupProgress -Message "Opening port 3000 server..." -Elapsed $elapsed -Total $startupLimitSeconds
+      $lastProgressAt = $elapsed
+    }
     if (Test-AppHealth -Port $Port) {
+      $elapsed = [int][Math]::Floor(((Get-Date) - $startedAt).TotalSeconds)
+      Write-Host ("Internal server ready. Port: {0} ({1}s)" -f $Port, $elapsed) -ForegroundColor Green
       return [pscustomobject]@{ Port = $Port; Started = $true }
     }
     if ($proc.HasExited) {
-      $healthyPort = Wait-HealthyAppPort -Seconds 8
+      $healthyPort = Wait-HealthyAppPort -Seconds 8 -Message "Checking whether another server is starting..."
       if ($healthyPort -gt 0) {
         Write-Host "Using existing text-only internal server. Port: $healthyPort" -ForegroundColor Green
         return [pscustomobject]@{ Port = $healthyPort; Started = $false }
@@ -388,7 +420,7 @@ if ($port -gt 0) {
   } else {
     if (Test-Path -LiteralPath $nextLockFile) {
       Write-Host "Existing Next dev server is starting. Waiting for it instead of opening another port..." -ForegroundColor Cyan
-      $port = Wait-HealthyAppPort -Seconds 30
+      $port = Wait-HealthyAppPort -Seconds 30 -Message "Waiting for existing Next dev server..."
       if ($port -gt 0) {
         Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
       } else {
