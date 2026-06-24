@@ -38,6 +38,21 @@ export function buildFormatGuide(args: FormatGuideArgs): string {
       : 0;
 
   const softCapChars = metaRequired === "YES" ? bodyMaxChars : promptMaxChars;
+  const bodyTargetChars = Math.max(200, Math.min(bodyMaxChars, targetChars || bodyMaxChars));
+  const bodyFloorChars =
+    metaRequired === "YES"
+      ? Math.max(200, Math.floor(bodyTargetChars * 0.78))
+      : Math.max(200, Math.floor((targetChars || promptMinChars) * 0.9));
+  const beatCount =
+    bodyTargetChars >= 2400 ? 7 :
+    bodyTargetChars >= 1700 ? 5 :
+    bodyTargetChars >= 1200 ? 4 :
+    3;
+  const paragraphHint =
+    bodyTargetChars >= 2400 ? "4~6" :
+    bodyTargetChars >= 1700 ? "3~5" :
+    bodyTargetChars >= 1200 ? "3~4" :
+    "2~3";
 const metaTemplateFence = String(args?.metaTemplateFence || "").trim();
 const metaTemplateSig = metaTemplateFence ? `${metaTemplateFence.length}:${metaTemplateFence.slice(0, 24)}` : "";
 const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars}|${bodyMaxChars}|${metaMaxChars}|${metaLabelHint}|${metaRequired}|${metaTemplateSig}`;
@@ -90,6 +105,10 @@ const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars
       ? `   - 본문 약 ${Math.min(bodyMaxChars, targetChars)}자 내외(권장 ${Math.max(200, Math.floor(Math.min(bodyMaxChars, targetChars) * 0.80))}~${Math.min(bodyMaxChars, targetChars)}자)로 마무리하고 즉시 메타로. 전체(본문+메타) 최소 ${promptMinChars}자, 최대 ${promptMaxChars}자.`
       : `   - 최소 ${promptMinChars}자 이상을 채워 길고 풍성하게. 짧으면 묘사/심리/배경을 대폭 보강해 분량을 늘려라.`),
 `   - 너무 길어지면 ${softCapChars}자 근처에서 자연스럽게 마무리하고 메타로 넘어간다. 본문 상한을 맞추려고 문장/지문/따옴표를 중간에 끊지 않는다.`,
+`6.1) 단일 호출 분량 계약: 서버는 짧은 답변을 재호출로 늘리지 않는다. 첫 답변 안에서 직접 분량을 채운다.`,
+`   - 본문이 약 ${bodyFloorChars}자보다 짧은 상태에서는 종료하지 않는다. 글자수를 정확히 셀 수 없으면 최소 ${beatCount}개 장면 비트를 채운 뒤 끝낸다.`,
+`   - 장면 비트는 관찰 가능한 반응, 표정/몸짓, 주변 상황 변화, NPC의 판단 변화, 다음 선택지를 압박하는 대사 중 서로 다른 요소로 구성한다.`,
+`   - 목표 문단 수는 ${paragraphHint}문단이다. 한 문단짜리 요약이나 즉답만으로 끝내지 않는다.`,
 `6.5) statusRequired=YES 또는 metaRequired=YES면 메타/STATUS fenced 블록을 답변 맨 끝에 반드시 1회 포함한다. 본문보다 우선이고 닫는 ${FENCE} 필수.`,
 `7) 2단계 종료 구조: 1단계(본문, *지문*/"대사")로 장면 전개 → 2단계(필요할 때만 메타 fenced 1회). 2단계가 필요하면 출력 전 종료 금지. 서사 본문이 대사로 끝났다면 짧은 지문 1~2문장으로 마무리 권장(단, '*...*' 단독 자리표시자 금지).`,
 `8) 장면은 사용자의 다음 입력이 필요한 지점(상대 반응/질문/긴장)에서 멈춘다. 한 답변 안에 며칠/몇 주 건너뛰기 및 자가 결말 금지. 주인공의 다음 발화/행동을 대신 쓰지 않는다.`,

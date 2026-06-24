@@ -2135,6 +2135,31 @@ const systemRaw = [
       ? stripUrlsAndMediaMarkdown(stripStatusErrorFences(String(continueBaseText || ""))).slice(-1400)
       : "";
 
+    const oneShotBodyTargetChars = Math.max(200, Math.min(bodyMaxChars, targetChars));
+    const oneShotBodyFloorChars =
+      metaRequired === "YES"
+        ? Math.max(200, Math.floor(oneShotBodyTargetChars * 0.78))
+        : Math.max(200, Math.floor(targetChars * 0.9));
+    const oneShotBeatCount =
+      oneShotBodyTargetChars >= 2400 ? 7 :
+      oneShotBodyTargetChars >= 1700 ? 5 :
+      oneShotBodyTargetChars >= 1200 ? 4 :
+      3;
+    const oneShotParagraphHint =
+      oneShotBodyTargetChars >= 2400 ? "4~6" :
+      oneShotBodyTargetChars >= 1700 ? "3~5" :
+      oneShotBodyTargetChars >= 1200 ? "3~4" :
+      "2~3";
+    const oneShotLengthContract = [
+      `[이번 턴 분량 계약]`,
+      `- 이 서버는 속도 유지를 위해 짧은 답변을 2차 호출로 보강하지 않는다. 첫 호출에서 직접 충분히 쓴다.`,
+      `- 서사 본문 목표: 약 ${targetChars}자. 메타/상태창이 필요하면 본문 뒤에 별도 코드블록으로 붙인다.`,
+      `- 본문이 약 ${oneShotBodyFloorChars}자보다 짧은 상태에서는 종료하지 않는다. 글자수를 정확히 셀 수 없으면 최소 ${oneShotBeatCount}개 장면 비트를 채운다.`,
+      `- 장면 비트는 서로 다른 내용이어야 한다: 관찰 가능한 반응, 표정/몸짓, 주변 상황 변화, NPC의 판단 변화, 다음 선택지를 압박하는 대사.`,
+      `- 목표 문단 수: ${oneShotParagraphHint}문단. 한 문단 요약, 짧은 즉답, 조기 종료 금지.`,
+      `- 주인공의 다음 행동/대사는 대신 쓰지 말고, NPC 반응과 현재 장면만 충분히 전개한다.`,
+    ].join("\n");
+
     const user = continueMode
       ? [
           context ? `[최근 대화]\n${context}` : "",
@@ -2154,6 +2179,8 @@ const systemRaw = [
           ``,
           `다음은 사용자의 최신 입력이다. 이 입력(주인공 발화)은 이미 화면에 표시되어 있으므로, 이를 다시 "..." 대사로 출력하지 말고 그 다음 장면(지문 + 상대의 반응)만 이어서 출력하라. 사용자의 문장을 교정/재작성하지 말고, 상대가 이를 들었다는 전제 하에 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
           `사용자 최신 입력(참고용, 재출력 금지): ${userLine}`,
+          ``,
+          oneShotLengthContract,
           ``,
           `출력은 곧바로 시작하라.`,
         ]
