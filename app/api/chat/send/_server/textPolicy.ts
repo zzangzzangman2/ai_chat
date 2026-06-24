@@ -1193,6 +1193,52 @@ function _minimalInfoBlock(body: string, statusContent?: string): string {
   ].join("\n");
 }
 
+function _isDanglingMetaCueLine(line: string): boolean {
+  const raw = String(line || "").trim();
+  if (!raw || raw.length > 80) return false;
+
+  let core = raw
+    .replace(/^[\s"'“”‘’`]+/g, "")
+    .replace(/[\s"'“”‘’`]+$/g, "")
+    .trim();
+
+  core = core
+    .replace(/^\[+/, "")
+    .replace(/\]+$/, "")
+    .replace(/[:：]+$/, "")
+    .trim();
+
+  if (!core || core.length > 40) return false;
+
+  const compact = core.replace(/\s+/g, "").toLowerCase();
+  if (/^(?:status|info|meta)(?:dialogue|dialog|talk|message|panel|window|block|output)?$/.test(compact)) {
+    return true;
+  }
+
+  return /^(?:상태|상태창|상태대화|상태정보|상태패널|상태출력|상태표시|상태창대화|상태창정보|상태창패널|상태창출력|상태창표시|메타|메타정보|메타패널|메타출력)$/.test(compact);
+}
+
+function _stripDanglingMetaCueTail(body: string): string {
+  const src = String(body || "").replace(/\r\n/g, "\n").trimEnd();
+  if (!src) return src;
+
+  const lines = src.split("\n");
+  let changed = false;
+
+  while (lines.length > 0) {
+    const last = String(lines[lines.length - 1] || "").trim();
+    if (!last) {
+      lines.pop();
+      continue;
+    }
+    if (!_isDanglingMetaCueLine(last)) break;
+    lines.pop();
+    changed = true;
+  }
+
+  return changed ? lines.join("\n").trimEnd() : src;
+}
+
 export type LocalMetaFallbackContext = {
   /** The contents inside the first [...] line (without brackets), e.g. 05월 12일|14:30 */
   bracketLine?: string;
@@ -1389,6 +1435,7 @@ export function finalizeOneShotOutputWithMeta(
   const ex = _extractMetaFenceBlocksAnywhere(t, allowed);
   let body = ex.body;
   let meta = ex.meta;
+  if (meta) body = _stripDanglingMetaCueTail(body);
 
   // Apply BODY budget ONLY.
   if (body.length > bodyBudget) {
@@ -1397,6 +1444,7 @@ export function finalizeOneShotOutputWithMeta(
   } else {
     body = ensureCleanBodyEnd(body, { preferAppendOnly: !!opts?.preferAppendOnly, maxLen: bodyBudget }).body;
   }
+  if (meta) body = _stripDanglingMetaCueTail(body);
 
   // Preserve/repair META outside budget.
   let injectedStatus = false;

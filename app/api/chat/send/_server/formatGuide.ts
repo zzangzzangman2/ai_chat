@@ -92,6 +92,7 @@ const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars
 	    : null
 	),
 `   메타/상태 fenced 코드블록은 서사 본문이 끝난 뒤 답변의 맨 마지막에 1회. 서사 중간 삽입 금지. 닫는 ${FENCE} 이후엔 어떤 텍스트도 출력하지 않는다.`,
+`   - "[상태창 대화]" 같은 메타 라벨만 대사처럼 출력 금지. 상태창/시스템이 말한다면 실제 대사 문장까지 완성하고, 라벨은 메타 fenced 코드블록에만 쓴다.`,
 (metaRequired === "YES"
   ? `   (최우선) 메타 fenced 코드블록은 절대 생략 금지. 공간이 부족하면 본문을 줄여서라도 메타를 완성한다.
    - 본문 + 메타 합쳐 약 ${promptMaxChars}자 이내. 본문은 약 ${bodyMaxChars}자 이내에서 완결된 문장/지문/대사로 마무리한 뒤 ${FENCE}로 메타 시작.
