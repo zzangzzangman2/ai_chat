@@ -20,6 +20,7 @@ $runnerPidFile = Join-Path $PSScriptRoot ".dos-server-runner-pid"
 $childPidFile = Join-Path $PSScriptRoot ".dos-server-child-pid"
 $outLog = Join-Path $PSScriptRoot ".dos-next.out.log"
 $errLog = Join-Path $PSScriptRoot ".dos-next.err.log"
+$nextLockFile = Join-Path $PSScriptRoot ".next\dev\lock"
 
 function Add-LocalNodeToPath {
   $portableNodeDir = Join-Path $PSScriptRoot ".codex-tools\node20\node-v20.19.5-win-x64"
@@ -156,6 +157,27 @@ function Find-HealthyAppPort {
   return 0
 }
 
+function Wait-HealthyAppPort {
+  param([int]$Seconds = 25)
+  for ($i = 0; $i -lt $Seconds; $i++) {
+    $candidate = Find-HealthyAppPort
+    if ($candidate -gt 0) { return $candidate }
+    Start-Sleep -Seconds 1
+  }
+  return 0
+}
+
+function Show-ServerLogs {
+  if (Test-Path -LiteralPath $errLog) {
+    Write-Host "Last error log lines:" -ForegroundColor Yellow
+    Get-Content -LiteralPath $errLog -Tail 30
+  }
+  if (Test-Path -LiteralPath $outLog) {
+    Write-Host "Last server log lines:" -ForegroundColor Yellow
+    Get-Content -LiteralPath $outLog -Tail 20
+  }
+}
+
 function Start-DosServer {
   param([int]$Port)
   $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
@@ -177,15 +199,32 @@ function Start-DosServer {
   Set-Content -LiteralPath $runnerPidFile -Value "$($proc.Id)" -Encoding ASCII
 
   for ($i = 0; $i -lt 90; $i++) {
-    if (Test-AppHealth -Port $Port) { return }
+    if (Test-AppHealth -Port $Port) {
+      return [pscustomobject]@{ Port = $Port; Started = $true }
+    }
+    if ($proc.HasExited) {
+      $healthyPort = Wait-HealthyAppPort -Seconds 8
+      if ($healthyPort -gt 0) {
+        Write-Host "Using existing text-only internal server. Port: $healthyPort" -ForegroundColor Green
+        return [pscustomobject]@{ Port = $healthyPort; Started = $false }
+      }
+      Write-Host "The internal server stopped while starting." -ForegroundColor Red
+      Show-ServerLogs
+      exit 1
+    }
+    if ($i -ge 3 -and (Test-Path -LiteralPath $nextLockFile)) {
+      $healthyPort = Find-HealthyAppPort
+      if ($healthyPort -gt 0 -and $healthyPort -ne $Port) {
+        try { taskkill /PID $($proc.Id) /T /F 2>$null | Out-Null } catch {}
+        Write-Host "Using existing text-only internal server. Port: $healthyPort" -ForegroundColor Green
+        return [pscustomobject]@{ Port = $healthyPort; Started = $false }
+      }
+    }
     Start-Sleep -Seconds 1
   }
 
   Write-Host "The internal server did not become ready in time." -ForegroundColor Red
-  if (Test-Path -LiteralPath $errLog) {
-    Write-Host "Last error log lines:" -ForegroundColor Yellow
-    Get-Content -LiteralPath $errLog -Tail 30
-  }
+  Show-ServerLogs
   exit 1
 }
 
@@ -245,9 +284,23 @@ $port = Find-HealthyAppPort
 if ($port -gt 0) {
   Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
 } else {
-  $port = Find-FreePort
-  Start-DosServer -Port $port
-  $startedByThisScript = $true
+  if (Test-Path -LiteralPath $nextLockFile) {
+    Write-Host "Existing Next dev server is starting. Waiting for it instead of opening another port..." -ForegroundColor Cyan
+    $port = Wait-HealthyAppPort -Seconds 30
+    if ($port -gt 0) {
+      Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
+    } else {
+      Write-Host "Next dev lock exists, but no healthy internal server responded." -ForegroundColor Red
+      Write-Host "Close the other ARCA DOS/Next window and run this again." -ForegroundColor Yellow
+      Show-ServerLogs
+      exit 1
+    }
+  } else {
+    $port = Find-FreePort
+    $startResult = Start-DosServer -Port $port
+    $port = [int]$startResult.Port
+    $startedByThisScript = [bool]$startResult.Started
+  }
 }
 
 try {

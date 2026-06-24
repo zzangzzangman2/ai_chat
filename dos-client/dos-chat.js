@@ -113,6 +113,29 @@ const state = {
   shortcutAction: "",
 };
 
+function restoreTerminal() {
+  try {
+    process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}`);
+  } catch {}
+  try {
+    if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+      process.stdin.setRawMode(false);
+    }
+  } catch {}
+}
+
+process.on("exit", restoreTerminal);
+process.on("uncaughtException", (err) => {
+  restoreTerminal();
+  console.error(`오류: ${err && err.message ? err.message : err}`);
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  restoreTerminal();
+  console.error(`오류: ${err && err.message ? err.message : err}`);
+  process.exit(1);
+});
+
 function abortActiveRequest() {
   if (state.activeController) {
     try { state.activeController.abort(); } catch {}
