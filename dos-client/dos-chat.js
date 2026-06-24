@@ -4,6 +4,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const readlineCore = require("readline");
 const readline = require("readline/promises");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -107,21 +108,66 @@ const state = {
   lastTiming: null,
   // 현재 진행 중인 요청의 AbortController. Ctrl+C 시 abort()해서 진행 중지하고 prompt로 복귀한다.
   activeController: null,
+  // readline prompt 대기 중 Ctrl+C / Ctrl+Z를 명령으로 처리하기 위한 컨트롤러.
+  promptController: null,
+  shortcutAction: "",
 };
 
-// Ctrl+C 처리:
-// - 진행 중인 요청이 있으면 → abort (프로그램은 안 끝남)
-// - 진행 중인 요청이 없으면 → 종료
-process.on("SIGINT", () => {
+function abortActiveRequest() {
   if (state.activeController) {
     try { state.activeController.abort(); } catch {}
     state.activeController = null;
     process.stdout.write("\n[요청 취소됨 — 새로 입력하세요]\n");
+    return true;
+  }
+  return false;
+}
+
+function requestPromptShortcut(action) {
+  if (abortActiveRequest()) return;
+  if (!state.promptController) return;
+  if (!state.shortcutAction) state.shortcutAction = action;
+  try { state.promptController.abort(); } catch {}
+}
+
+// Ctrl+C 처리:
+// - 진행 중인 요청이 있으면 → abort
+// - 입력 대기 중이면 → 이전 화면으로 이동
+process.on("SIGINT", () => {
+  if (abortActiveRequest()) return;
+  if (state.promptController) {
+    requestPromptShortcut("back");
   } else {
-    console.log("\n종료합니다.");
-    process.exit(0);
+    process.stdout.write("\nCtrl+C: 이전 화면으로 이동할 입력 대기 상태가 아닙니다. 종료는 /exit\n");
   }
 });
+
+function installPromptShortcuts(rl) {
+  try {
+    rl.on("SIGINT", () => requestPromptShortcut("back"));
+    rl.on("SIGTSTP", () => requestPromptShortcut("delete"));
+  } catch {}
+
+  if (!process.stdin.isTTY) return;
+  try {
+    readlineCore.emitKeypressEvents(process.stdin, rl);
+  } catch {
+    return;
+  }
+
+  const onKeypress = (str, key) => {
+    if (!state.promptController || state.activeController) return;
+    if ((key && key.ctrl && key.name === "z") || str === "\x1a") {
+      requestPromptShortcut("delete");
+    } else if (key && key.ctrl && key.name === "c") {
+      requestPromptShortcut("back");
+    }
+  };
+  process.stdin.on("keypress", onKeypress);
+  try {
+    rl.on("close", () => process.stdin.off("keypress", onKeypress));
+  } catch {}
+}
 
 function parseArgs(argv) {
   const out = {};
@@ -1320,7 +1366,7 @@ async function chooseContinueChat(preset) {
     const onData = (buf) => {
       const s = buf.toString("utf8");
       if (s === "\u0003") {
-        cleanup(null);
+        cleanup({ back: true });
         return;
       }
       const mouse = parseMouseSgr(s);
@@ -1539,6 +1585,22 @@ async function startupPresetLauncher() {
     }
     await createChat(choice.preset.id);
     return true;
+  }
+}
+
+async function goBackToPreviousPage(rl) {
+  const prevChatId = state.chatId;
+  const prevSettings = state.settings;
+  process.stdout.write("\n[이전 화면]\n");
+  try { rl?.pause?.(); } catch {}
+  const opened = await startupPresetLauncher();
+  try { rl?.resume?.(); } catch {}
+
+  if (!opened) {
+    state.chatId = prevChatId;
+    state.settings = prevSettings;
+    if (state.chatId) await loadSettings().catch(() => null);
+    console.log(state.chatId ? "원래 채팅으로 돌아왔습니다." : "선택을 취소했습니다.");
   }
 }
 
@@ -2275,7 +2337,8 @@ function help() {
   console.log("");
   console.log(`${ANSI.gray}각 명령어를 인자 없이 그냥 입력하면 사용법/현재 상태를 보여줍니다.${ANSI.reset}`);
   console.log(`${ANSI.gray}줄임말: /cs /o /p /n /hi /set /md /out /rs /per /mem /ref /ch /ac /bf /cls /q${ANSI.reset}`);
-  console.log(`${ANSI.gray}Ctrl+C : 진행 중인 호출 취소 (호출 없으면 종료)${ANSI.reset}`);
+  console.log(`${ANSI.gray}Ctrl+Z : 방금 user+assistant 한 쌍 삭제${ANSI.reset}`);
+  console.log(`${ANSI.gray}Ctrl+C : 진행 중이면 취소, 입력 대기 중이면 이전 화면${ANSI.reset}`);
 }
 
 async function handleCommand(line, rl) {
@@ -2345,6 +2408,7 @@ async function main() {
     output: process.stdout,
     historySize: 100,
   });
+  installPromptShortcuts(rl);
 
   try {
     while (true) {
@@ -2353,7 +2417,29 @@ async function main() {
       const prompt = state.chatId
         ? `\n${promptName}> `
         : "\nARCA(채팅없음)> ";
-      const line = (await rl.question(prompt)).trim();
+      let lineRaw = "";
+      state.shortcutAction = "";
+      state.promptController = new AbortController();
+      try {
+        lineRaw = await rl.question(prompt, { signal: state.promptController.signal });
+      } catch (err) {
+        const action = state.shortcutAction;
+        state.shortcutAction = "";
+        if (err && err.name === "AbortError" && action === "delete") {
+          process.stdout.write("\n");
+          await deleteRecent("");
+          continue;
+        }
+        if (err && err.name === "AbortError" && action === "back") {
+          await goBackToPreviousPage(rl);
+          continue;
+        }
+        if (err && err.name === "AbortError") continue;
+        throw err;
+      } finally {
+        state.promptController = null;
+      }
+      const line = String(lineRaw || "").trim();
       if (!line) continue;
 
       // (요구) 입력한 줄을 narration(*...*) 회색 처리해서 다시 표시.
