@@ -291,7 +291,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_chat_role_createdAt_desc ON mes
 
       userNote TEXT NOT NULL DEFAULT '',
 
-	      model TEXT NOT NULL DEFAULT 'gemini-2.5-pro',
+	      model TEXT NOT NULL DEFAULT 'gemini-3.1-pro-preview',
 	      maxOutputTokens INTEGER NOT NULL DEFAULT 1300,
       maxReasoningTokens INTEGER NOT NULL DEFAULT 768,
 
@@ -832,7 +832,7 @@ if (!hasColumn("chat_settings", "narrationColor")) {
           c.id,
           '', 0, '', '',
           7, 3, 80,
-          '', 'gemini-2.5-pro', 1200, 384, 384,
+          '', 'gemini-3.1-pro-preview', 1200, 384, 384,
           '#CCC7C7', 'novel', 80, ${now}
         FROM chats c
         WHERE NOT EXISTS (SELECT 1 FROM chat_settings s WHERE s.chatId = c.id);

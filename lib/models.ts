@@ -1,10 +1,11 @@
-export const DEFAULT_CHAT_MODEL = "gemini-2.5-pro" as const;
+export const GEMINI_25_PRO_MODEL = "gemini-2.5-pro" as const;
 // (변경 2026-05) gemini-3-flash-preview → gemini-3.5-flash. 변수명은 보존(하위 호환).
 export const GEMINI_3_FLASH_MODEL = "gemini-3.5-flash" as const;
 export const GEMINI_31_PRO_MODEL = "gemini-3.1-pro-preview" as const;
+export const DEFAULT_CHAT_MODEL = GEMINI_31_PRO_MODEL;
 
 export const CHAT_MODEL_IDS = [
-  DEFAULT_CHAT_MODEL,
+  GEMINI_25_PRO_MODEL,
   GEMINI_3_FLASH_MODEL,
   GEMINI_31_PRO_MODEL,
 ] as const;
@@ -24,8 +25,8 @@ export function normalizeModelId(model: string): string {
   const m = stripProviderPrefix(model).trim().toLowerCase();
   if (!m) return "";
 
-  if (m === "gemini-2-5-flash" || m === "gemini-2.5-flash") return DEFAULT_CHAT_MODEL;
-  if (m === "gemini-2-5-pro") return DEFAULT_CHAT_MODEL;
+  if (m === "gemini-2-5-flash" || m === "gemini-2.5-flash") return GEMINI_25_PRO_MODEL;
+  if (m === "gemini-2-5-pro") return GEMINI_25_PRO_MODEL;
 
   if (
     m === "gemini-3-flash" ||
@@ -85,5 +86,5 @@ export function isGemini3Model(model: string): boolean {
 
 export function isGemini25ProModel(model: string): boolean {
   const m = normalizeModelId(model);
-  return m === DEFAULT_CHAT_MODEL || m.startsWith(`${DEFAULT_CHAT_MODEL}-`);
+  return m === GEMINI_25_PRO_MODEL || m.startsWith(`${GEMINI_25_PRO_MODEL}-`);
 }
