@@ -415,6 +415,63 @@ function dbGet(sql, params = []) {
   return openDb().prepare(sql).get(...params);
 }
 
+function cleanPromptName(value) {
+  return String(value || "")
+    .replace(/[\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 24);
+}
+
+function readPromptPersonaNameFromDb() {
+  let name = cleanPromptName(state.settings && state.settings.personaName);
+  if (name) return name;
+
+  if (state.chatId) {
+    try {
+      const row = dbGet(`SELECT personaName FROM chat_settings WHERE chatId=?`, [state.chatId]);
+      name = cleanPromptName(row && row.personaName);
+      if (name) return name;
+    } catch {
+      // ignore missing table/row while DOS is starting
+    }
+  }
+
+  try {
+    const row = dbGet(
+      `SELECT personaName
+         FROM persona_profiles
+        WHERE userEmail=?
+        ORDER BY updatedAt DESC
+        LIMIT 1`,
+      [LOCAL_USER_EMAIL]
+    );
+    name = cleanPromptName(row && row.personaName);
+    if (name) return name;
+  } catch {
+    // older local DBs may not have persona_profiles
+  }
+
+  try {
+    const row = dbGet(`SELECT personaName FROM user_profile WHERE id=1`);
+    name = cleanPromptName(row && row.personaName);
+    if (name) return name;
+  } catch {
+    // older local DBs may not have user_profile
+  }
+
+  return "";
+}
+
+function getPromptDisplayName() {
+  const name = readPromptPersonaNameFromDb();
+  if (name) {
+    state.settings = { ...(state.settings || {}), personaName: name };
+    return name;
+  }
+  return "ARCA";
+}
+
 function textOnly(value, options = {}) {
   let s = decryptIfPossible(String(value || ""));
 
@@ -2258,10 +2315,10 @@ async function main() {
 
   try {
     while (true) {
-      // (요구) prompt를 페르소나명으로. 페르소나 미지정이면 ARCA를 그대로 fallback.
-      const personaName = String((state.settings && state.settings.personaName) || "").trim();
+      // 채팅 설정/전역 프로필에서 페르소나명을 즉시 반영한다.
+      const promptName = getPromptDisplayName();
       const prompt = state.chatId
-        ? `\n${personaName || "ARCA"}> `
+        ? `\n${promptName}> `
         : "\nARCA(채팅없음)> ";
       const line = (await rl.question(prompt)).trim();
       if (!line) continue;

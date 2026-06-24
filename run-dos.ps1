@@ -15,6 +15,7 @@ try {
 }
 
 $portFile = Join-Path $PSScriptRoot ".dos-server-port"
+$localPortFile = Join-Path $PSScriptRoot ".local-server-port"
 $runnerPidFile = Join-Path $PSScriptRoot ".dos-server-runner-pid"
 $childPidFile = Join-Path $PSScriptRoot ".dos-server-child-pid"
 $outLog = Join-Path $PSScriptRoot ".dos-next.out.log"
@@ -127,14 +128,30 @@ function Find-FreePort {
   exit 1
 }
 
-function Get-SavedPort {
-  if (-not (Test-Path -LiteralPath $portFile)) { return 0 }
+function Get-PortFromFile {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return 0 }
   try {
-    $raw = (Get-Content -LiteralPath $portFile -TotalCount 1).Trim()
+    $raw = (Get-Content -LiteralPath $Path -TotalCount 1).Trim()
     $port = [int]$raw
     if ($port -gt 0) { return $port }
   } catch {
     return 0
+  }
+  return 0
+}
+
+function Find-HealthyAppPort {
+  $candidates = @()
+  $candidates += Get-PortFromFile -Path $portFile
+  $candidates += Get-PortFromFile -Path $localPortFile
+  if ($env:PORT) {
+    try { $candidates += [int]$env:PORT } catch {}
+  }
+  $candidates += 3000..3020
+
+  foreach ($candidate in ($candidates | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
+    if (Test-AppHealth -Port $candidate) { return $candidate }
   }
   return 0
 }
@@ -224,10 +241,9 @@ if (-not (Test-BetterSqliteReady)) {
 }
 
 $startedByThisScript = $false
-$port = Get-SavedPort
-if ($port -gt 0 -and (Test-AppHealth -Port $port)) {
+$port = Find-HealthyAppPort
+if ($port -gt 0) {
   Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
-  $startedByThisScript = $true
 } else {
   $port = Find-FreePort
   Start-DosServer -Port $port
