@@ -178,6 +178,47 @@ function Show-ServerLogs {
   }
 }
 
+function Get-ProcessCommandLine {
+  param([int]$ProcessId)
+  try {
+    $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if ($procInfo) { return [string]$procInfo.CommandLine }
+  } catch {
+    # ignore process lookup races
+  }
+  return ""
+}
+
+function Test-ProjectServerProcess {
+  param([int]$ProcessId)
+  $cmd = Get-ProcessCommandLine -ProcessId $ProcessId
+  if (-not $cmd) { return $false }
+  $rootPattern = [regex]::Escape($PSScriptRoot)
+  if ($cmd -notmatch $rootPattern) { return $false }
+  return $cmd -match "dos-client\\dos-server\.js|dos-client\\dos-chat\.js|next\\dist\\server\\lib\\start-server\.js|npm-cli\.js.*run dev|next dev"
+}
+
+function Test-PidFileServerProcess {
+  param([int]$ProcessId)
+  $cmd = Get-ProcessCommandLine -ProcessId $ProcessId
+  if (-not $cmd) { return $false }
+  if (Test-ProjectServerProcess -ProcessId $ProcessId) { return $true }
+  return $cmd -match "npm\.cmd.*run dev.*--hostname 127\.0\.0\.1.*--port|next dev.*--hostname 127\.0\.0\.1.*--port"
+}
+
+function Stop-ProcessTree {
+  param([int]$ProcessId)
+  if (-not $ProcessId -or $ProcessId -eq $PID) { return $false }
+  try {
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (-not $proc) { return $false }
+    taskkill /PID $ProcessId /T /F 2>$null | Out-Null
+    return $true
+  } catch {
+    return $false
+  }
+}
+
 function Start-DosServer {
   param([int]$Port)
   $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
@@ -234,12 +275,15 @@ function Stop-DosServerByPort {
 
   $pids = @()
   if ($connections) {
-    $pids += $connections | Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($owner in ($connections | Select-Object -ExpandProperty OwningProcess -Unique)) {
+      if (Test-ProjectServerProcess -ProcessId $owner) { $pids += $owner }
+    }
   }
   foreach ($pidFile in @($childPidFile, $runnerPidFile)) {
     if (Test-Path -LiteralPath $pidFile) {
       try {
-        $pids += [int]((Get-Content -LiteralPath $pidFile -TotalCount 1).Trim())
+        $pidFromFile = [int]((Get-Content -LiteralPath $pidFile -TotalCount 1).Trim())
+        if (Test-PidFileServerProcess -ProcessId $pidFromFile) { $pids += $pidFromFile }
       } catch {
         # ignore bad pid file
       }
@@ -247,19 +291,46 @@ function Stop-DosServerByPort {
   }
 
   foreach ($pidValue in ($pids | Select-Object -Unique)) {
-    if (-not $pidValue) { continue }
-    try {
-      $proc = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
-      if ($proc) {
-        taskkill /PID $pidValue /T /F 2>$null | Out-Null
-      }
-    } catch {
-      # ignore stop failures during automatic cleanup
-    }
+    Stop-ProcessTree -ProcessId $pidValue | Out-Null
   }
   Remove-Item -LiteralPath $portFile -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $runnerPidFile -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $childPidFile -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-ExistingDosInstance {
+  $rootPattern = [regex]::Escape($PSScriptRoot)
+  $targetPids = @()
+
+  try {
+    $targetPids += Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.ProcessId -ne $PID -and
+        [string]$_.CommandLine -match $rootPattern -and
+        [string]$_.CommandLine -match "run-dos\.ps1|dos-client\\dos-server\.js|dos-client\\dos-chat\.js"
+      } |
+      Select-Object -ExpandProperty ProcessId
+  } catch {
+    # ignore process lookup races
+  }
+
+  $stopped = $false
+  foreach ($targetPid in ($targetPids | Select-Object -Unique)) {
+    if (Stop-ProcessTree -ProcessId $targetPid) { $stopped = $true }
+  }
+
+  foreach ($portCandidate in @(
+    (Get-PortFromFile -Path $portFile),
+    (Get-PortFromFile -Path $localPortFile),
+    3000
+  ) | Where-Object { $_ -gt 0 } | Select-Object -Unique) {
+    Stop-DosServerByPort -Port $portCandidate
+  }
+
+  if ($stopped) {
+    Write-Host "Previous ARCA DOS window/server was closed. Starting fresh..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 2
+  }
 }
 
 Add-LocalNodeToPath
@@ -277,6 +348,10 @@ if (-not (Test-DependenciesReady)) {
 if (-not (Test-BetterSqliteReady)) {
   Write-Host "Preparing SQLite module for this Node runtime..." -ForegroundColor Cyan
   Invoke-Npm rebuild better-sqlite3
+}
+
+if (-not $Check) {
+  Stop-ExistingDosInstance
 }
 
 $startedByThisScript = $false
