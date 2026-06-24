@@ -219,6 +219,23 @@ function Stop-ProcessTree {
   }
 }
 
+function Get-ProtectedStartupPids {
+  $protected = @()
+  $current = [int]$PID
+  for ($i = 0; $i -lt 20; $i++) {
+    if (-not $current -or $protected -contains $current) { break }
+    $protected += $current
+    try {
+      $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
+      if (-not $procInfo) { break }
+      $current = [int]$procInfo.ParentProcessId
+    } catch {
+      break
+    }
+  }
+  return $protected
+}
+
 function Start-DosServer {
   param([int]$Port)
   $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
@@ -300,12 +317,13 @@ function Stop-DosServerByPort {
 
 function Stop-ExistingDosInstance {
   $rootPattern = [regex]::Escape($PSScriptRoot)
+  $protectedPids = @(Get-ProtectedStartupPids)
   $targetPids = @()
 
   try {
     $targetPids += Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
       Where-Object {
-        $_.ProcessId -ne $PID -and
+        $protectedPids -notcontains [int]$_.ProcessId -and
         [string]$_.CommandLine -match $rootPattern -and
         [string]$_.CommandLine -match "run-dos\.ps1|dos-client\\dos-server\.js|dos-client\\dos-chat\.js"
       } |
