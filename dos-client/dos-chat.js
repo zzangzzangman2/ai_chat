@@ -84,6 +84,7 @@ const ANSI = {
   dim: "\x1b[2m",
   gray: "\x1b[38;5;244m",
   narration: "\x1b[38;5;242m",
+  dialogue: "\x1b[97m",
   meta: "\x1b[38;5;109m",
   soft: "\x1b[38;5;250m",
   title: "\x1b[38;5;153m",
@@ -590,6 +591,16 @@ function colorNovelText(text, options = {}) {
       /^[^|:\n]{1,40}\s*[|:]\s*["'“‘「『]/.test(s)
     );
   };
+  const unwrapEmphasizedDialogueLine = (line) => {
+    const raw = String(line || "");
+    const t = raw.trim();
+    const m = t.match(/^\*+\s*([\s\S]*?)\s*\*+$/);
+    if (!m) return "";
+    const inner = String(m[1] || "").trim();
+    if (!looksLikeDialogueLine(inner)) return "";
+    const indent = raw.match(/^\s*/)?.[0] || "";
+    return `${indent}${inner}`;
+  };
   const looksLikeTableLine = (line) => {
     const s = String(line || "").trim();
     return /^\+-[-+]+\+$/.test(s) || /^\|.*\|$/.test(s);
@@ -618,8 +629,16 @@ function colorNovelText(text, options = {}) {
         narrState.inNarration = false;
       }
       inMetaBlock = false;
+      const emphasizedDialogue = unwrapEmphasizedDialogueLine(line);
+      if (emphasizedDialogue) {
+        narrState.inNarration = false;
+        return `${ANSI.dialogue}${emphasizedDialogue}${ANSI.reset}`;
+      }
       if (narrState.inNarration && looksLikeDialogueLine(line)) {
         narrState.inNarration = false;
+      }
+      if (!narrState.inNarration && looksLikeDialogueLine(line)) {
+        return `${ANSI.dialogue}${line}${ANSI.reset}`;
       }
       if (defaultPlainNarration && !narrState.inNarration && !line.includes("*") && shouldDefaultToNarration(line)) {
         return `${ANSI.narration}${line}${ANSI.reset}`;
