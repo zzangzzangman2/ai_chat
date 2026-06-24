@@ -46,6 +46,7 @@ import {
   preserveTrailingMetaFenceBlocksOutsideBudget,
   finalizeOneShotOutputWithMeta,
   buildLocalFallbackMetaFence,
+  isMetaFenceLikelyIncomplete,
 } from "./_server/textPolicy";
 import { sanitizePromptCached } from "./_server/promptCache";
 import { buildFormatGuide } from "./_server/formatGuide";
@@ -2138,17 +2139,18 @@ const systemRaw = [
     const oneShotBodyTargetChars = Math.max(200, Math.min(bodyMaxChars, targetChars));
     const oneShotBodyFloorChars =
       metaRequired === "YES"
-        ? Math.max(200, Math.floor(oneShotBodyTargetChars * 0.78))
+        ? Math.max(200, Math.floor(oneShotBodyTargetChars * 0.72))
         : Math.max(200, Math.floor(targetChars * 0.9));
+    const oneShotBeatBasisChars = metaRequired === "YES" ? oneShotBodyFloorChars : oneShotBodyTargetChars;
     const oneShotBeatCount =
-      oneShotBodyTargetChars >= 2400 ? 7 :
-      oneShotBodyTargetChars >= 1700 ? 5 :
-      oneShotBodyTargetChars >= 1200 ? 4 :
+      oneShotBeatBasisChars >= 2400 ? 7 :
+      oneShotBeatBasisChars >= 1700 ? 5 :
+      oneShotBeatBasisChars >= 1200 ? 4 :
       3;
     const oneShotParagraphHint =
-      oneShotBodyTargetChars >= 2400 ? "4~6" :
-      oneShotBodyTargetChars >= 1700 ? "3~5" :
-      oneShotBodyTargetChars >= 1200 ? "3~4" :
+      oneShotBeatBasisChars >= 2400 ? "4~6" :
+      oneShotBeatBasisChars >= 1700 ? "3~5" :
+      oneShotBeatBasisChars >= 1200 ? "3~4" :
       "2~3";
     const oneShotLengthContract = [
       `[이번 턴 분량 계약]`,
@@ -2157,6 +2159,7 @@ const systemRaw = [
       `- 본문이 약 ${oneShotBodyFloorChars}자보다 짧은 상태에서는 종료하지 않는다. 글자수를 정확히 셀 수 없으면 최소 ${oneShotBeatCount}개 장면 비트를 채운다.`,
       `- 장면 비트는 서로 다른 내용이어야 한다: 관찰 가능한 반응, 표정/몸짓, 주변 상황 변화, NPC의 판단 변화, 다음 선택지를 압박하는 대사.`,
       `- 목표 문단 수: ${oneShotParagraphHint}문단. 한 문단 요약, 짧은 즉답, 조기 종료 금지.`,
+      `- 메타/상태창이 필요하면 본문을 더 늘리는 것보다 완성된 fenced 코드블록이 우선이다. 메타를 시작했다면 항목 일부만 쓰고 닫지 말고, 짧더라도 의미 있는 전체 상태창을 완성한다.`,
       `- 주인공의 다음 행동/대사는 대신 쓰지 말고, NPC 반응과 현재 장면만 충분히 전개한다.`,
     ].join("\n");
 
@@ -2875,15 +2878,23 @@ if (!TRANSPORT_STREAMING) {
 	            // Streaming에서는 이미 저장 전에 delta와 함께 주입하므로 여기서 절대 재주입/재작성하지 않는다.
 	            
 // (Local fallback) Non-streaming mode only:
-// If meta/status is required but the model omitted the trailing fenced block,
+// If meta/status is required but the model omitted or half-emitted the trailing fenced block,
 // inject a small, closed fence locally based on the author template (NO extra LLM call).
+const _metaLooksIncomplete =
+  !TRANSPORT_STREAMING &&
+  (metaRequired === "YES" || statusRequired === "YES") &&
+  fin.metaChars > 0 &&
+  isMetaFenceLikelyIncomplete(String((fin as any)?.meta || ""), {
+    minChars: Math.max(160, Math.min(metaMaxChars || 700, 420)),
+    minContentLines: metaFenceTemplateHint ? 5 : 4,
+  });
 const _localMetaFallbackEnabled =
   !TRANSPORT_STREAMING &&
   (metaRequired === "YES" || statusRequired === "YES") &&
-  fin.metaChars === 0 &&
+  (fin.metaChars === 0 || _metaLooksIncomplete) &&
   // If the model already emitted a trailing fenced block that *looks* like a meta panel,
   // don't inject another fallback fence (prevents duplicate panels).
-  !tailFenceLooksLikeMeta &&
+  !(tailFenceLooksLikeMeta && !_metaLooksIncomplete) &&
   String(process.env.AI_LOCAL_META_FALLBACK || "1").trim() !== "0";
 
 if (_localMetaFallbackEnabled) {
@@ -2915,7 +2926,9 @@ if (_localMetaFallbackEnabled) {
     });
 
     if (fallback && fallback.includes("```")) {
-      assistantText = `${String(assistantText || "").trimEnd()}\n\n${fallback}\n`;
+      // Replace a partial meta block instead of appending a second one.
+      const baseBody = String((fin as any)?.body || assistantText || "").trimEnd();
+      assistantText = `${baseBody}\n\n${fallback}\n`;
 
       // Ensure the injected label is part of allowedLabels so meta extraction works.
       const allowed2 = Array.from(new Set([...allowedMetaLabels, labelHint.toUpperCase()]));
@@ -2940,6 +2953,7 @@ if (_localMetaFallbackEnabled) {
       if (enrichedUsage && typeof enrichedUsage === "object") {
         (enrichedUsage as any).metaFallbackInjected = true;
         (enrichedUsage as any).metaFallbackLabel = labelHint;
+        (enrichedUsage as any).metaFallbackReason = _metaLooksIncomplete ? "incomplete" : "missing";
       }
     }
   } catch (e) {

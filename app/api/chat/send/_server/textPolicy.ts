@@ -590,6 +590,36 @@ export function splitTrailingFenceBlockAtEnd(text: string): { body: string; meta
   return { body, meta };
 }
 
+export function isMetaFenceLikelyIncomplete(
+  meta: string,
+  opts?: { minChars?: number; minContentLines?: number }
+): boolean {
+  const repaired = repairUnclosedAnyFence(normalizeAnyFenceOpen(String(meta || ""))).trim();
+  if (!repaired) return true;
+
+  const m = repaired.match(/^```[^\n]*\n([\s\S]*?)\n```\s*$/);
+  const body = (m ? String(m[1] || "") : repaired.replace(/^```[^\n]*(?:\n|$)/, "").replace(/\n?```\s*$/, "")).trim();
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const minChars = Math.max(80, Math.floor(Number(opts?.minChars ?? 180) || 180));
+  const minContentLines = Math.max(3, Math.floor(Number(opts?.minContentLines ?? 4) || 4));
+
+  if (lines.length <= 2) return true;
+  if (_charLen(body) < minChars && lines.length < minContentLines) return true;
+
+  // Common partial status shape: header + one or two stat rows, then a closing fence.
+  const joined = lines.join("\n");
+  const hasOnlyEarlyStats =
+    lines.length <= 4 &&
+    /체력|HP|마나|MP|상태/i.test(joined) &&
+    !/위치|장소|목표|관계|소지품|시각|시간|요약|상황/i.test(joined);
+  if (hasOnlyEarlyStats) return true;
+
+  return false;
+}
+
 function splitTrailingOpenMetaFenceAtEnd(
   text: string,
   allowedLabels: readonly string[] = []
@@ -829,6 +859,33 @@ function _trimToWhitespaceBoundaryNearEnd(s: string, maxBacktrack: number): stri
   return t.trimEnd();
 }
 
+function _looksLikeTrailingMetaFenceBlock(block: string): boolean {
+  const s = String(block || "").trim();
+  const m = s.match(/^```[^\n]*\n([\s\S]*?)\n```\s*$/);
+  if (!m) return false;
+  const body = String(m[1] || "").trim();
+  if (!body) return false;
+  const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+
+  const hay = body.replace(/\s+/g, " ");
+  const statusKeywordHits = [
+    /체력|HP\b/i,
+    /마나|MP\b/i,
+    /상태/,
+    /위치|장소/,
+    /소지품|인벤토리/,
+    /관계도|호감도/,
+    /현재\s*(시각|시간|목표|유저|사용자|신분)/,
+    /목표|퀘스트|평가|소속/,
+    /📍|🌐|📜|👤|⏲|🕒/,
+  ].reduce((n, re) => n + (re.test(hay) ? 1 : 0), 0);
+
+  if (statusKeywordHits >= 2) return true;
+  if (/^\[[^\]]{1,80}\]$/m.test(body) && statusKeywordHits >= 1) return true;
+  return false;
+}
+
 function _closeDanglingSquareBracketNearTail(s: string): { text: string; changed: boolean } {
   const raw = String(s ?? "");
   const trimmed = raw.trimEnd();
@@ -1029,6 +1086,17 @@ function _extractMetaFenceBlocksAnywhere(
           ranges.push({ start: lastIdx, end: src.length, block: src.slice(lastIdx) });
         }
       }
+    }
+  }
+
+  // Fallback: a creator may ask for a trailing status panel as a bare closed fence
+  // (``` ... ```) instead of ```STATUS / ```INFO. Treat status-looking trailing
+  // fences as META so body-length finalization never slices them as story text.
+  if (ranges.length === 0) {
+    const sp = splitTrailingFenceBlockAtEnd(src);
+    if (sp.meta && _looksLikeTrailingMetaFenceBlock(sp.meta)) {
+      const start = src.trimEnd().length - sp.meta.length;
+      ranges.push({ start: Math.max(0, start), end: src.trimEnd().length, block: sp.meta });
     }
   }
 
