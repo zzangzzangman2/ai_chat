@@ -1,5 +1,6 @@
 param(
-  [switch]$Check
+  [switch]$Check,
+  [switch]$Fresh
 )
 
 $ErrorActionPreference = "Stop"
@@ -368,31 +369,40 @@ if (-not (Test-BetterSqliteReady)) {
   Invoke-Npm rebuild better-sqlite3
 }
 
-if (-not $Check) {
-  Stop-ExistingDosInstance
+$startedByThisScript = $false
+$port = 0
+
+if (-not $Fresh) {
+  $port = Find-HealthyAppPort
 }
 
-$startedByThisScript = $false
-$port = Find-HealthyAppPort
 if ($port -gt 0) {
   Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
 } else {
-  if (Test-Path -LiteralPath $nextLockFile) {
-    Write-Host "Existing Next dev server is starting. Waiting for it instead of opening another port..." -ForegroundColor Cyan
-    $port = Wait-HealthyAppPort -Seconds 30
-    if ($port -gt 0) {
-      Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
-    } else {
-      Write-Host "Next dev lock exists, but no healthy internal server responded." -ForegroundColor Red
-      Write-Host "Close the other ARCA DOS/Next window and run this again." -ForegroundColor Yellow
-      Show-ServerLogs
-      exit 1
-    }
+  if (-not $Check) {
+    Stop-ExistingDosInstance
+  }
+  $port = Find-HealthyAppPort
+  if ($port -gt 0) {
+    Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
   } else {
-    $port = Find-FreePort
-    $startResult = Start-DosServer -Port $port
-    $port = [int]$startResult.Port
-    $startedByThisScript = [bool]$startResult.Started
+    if (Test-Path -LiteralPath $nextLockFile) {
+      Write-Host "Existing Next dev server is starting. Waiting for it instead of opening another port..." -ForegroundColor Cyan
+      $port = Wait-HealthyAppPort -Seconds 30
+      if ($port -gt 0) {
+        Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
+      } else {
+        Write-Host "Next dev lock exists, but no healthy internal server responded." -ForegroundColor Red
+        Write-Host "Close the other ARCA DOS/Next window and run this again." -ForegroundColor Yellow
+        Show-ServerLogs
+        exit 1
+      }
+    } else {
+      $port = Find-FreePort
+      $startResult = Start-DosServer -Port $port
+      $port = [int]$startResult.Port
+      $startedByThisScript = [bool]$startResult.Started
+    }
   }
 }
 
