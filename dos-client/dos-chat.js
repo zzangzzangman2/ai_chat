@@ -796,14 +796,18 @@ function listChats(limit = 15) {
       c.id,
       c.presetId,
       COALESCE(NULLIF(c.title, ''), NULLIF(p.name, ''), NULLIF(p.characterName, ''), '채팅') AS title,
-      COALESCE(c.lastStatusUpdatedAt, c.createdAt) AS updatedAt,
+      MAX(
+        COALESCE(c.lastStatusUpdatedAt, 0),
+        COALESCE((SELECT MAX(COALESCE(mx.updatedAt, mx.createdAt)) FROM messages mx WHERE mx.chatId = c.id), 0),
+        COALESCE(c.createdAt, 0)
+      ) AS updatedAt,
       p.name AS presetName,
       p.characterName AS characterName,
       (
         SELECT m.content
         FROM messages m
         WHERE m.chatId = c.id
-        ORDER BY m.createdAt DESC, m.id DESC
+        ORDER BY COALESCE(m.updatedAt, m.createdAt) DESC, m.id DESC
         LIMIT 1
       ) AS lastContent,
       (
@@ -836,12 +840,16 @@ function listChatsForPreset(presetId, limit = 10) {
       c.id,
       c.presetId,
       COALESCE(NULLIF(c.title, ''), NULLIF(p.name, ''), NULLIF(p.characterName, ''), '채팅') AS title,
-      COALESCE(c.lastStatusUpdatedAt, c.createdAt) AS updatedAt,
+      MAX(
+        COALESCE(c.lastStatusUpdatedAt, 0),
+        COALESCE((SELECT MAX(COALESCE(mx.updatedAt, mx.createdAt)) FROM messages mx WHERE mx.chatId = c.id), 0),
+        COALESCE(c.createdAt, 0)
+      ) AS updatedAt,
       (
         SELECT m.content
         FROM messages m
         WHERE m.chatId = c.id
-        ORDER BY m.createdAt DESC, m.id DESC
+        ORDER BY COALESCE(m.updatedAt, m.createdAt) DESC, m.id DESC
         LIMIT 1
       ) AS lastContent,
       (
@@ -886,10 +894,16 @@ function listPresets(limit = 30) {
     //   필터를 명시해 두면 새로 추가되는 데이터에도 안전.
     const latestStmt = db.prepare(
       `
-      SELECT id, COALESCE(lastStatusUpdatedAt, createdAt) AS updatedAt
+      SELECT
+        id,
+        MAX(
+          COALESCE(lastStatusUpdatedAt, 0),
+          COALESCE((SELECT MAX(COALESCE(m.updatedAt, m.createdAt)) FROM messages m WHERE m.chatId = chats.id), 0),
+          COALESCE(createdAt, 0)
+        ) AS updatedAt
       FROM chats
       WHERE presetId=? AND LOWER(COALESCE(userEmail,'')) = ?
-      ORDER BY COALESCE(lastStatusUpdatedAt, createdAt) DESC, id DESC
+      ORDER BY updatedAt DESC, id DESC
       LIMIT 1
       `
     );
