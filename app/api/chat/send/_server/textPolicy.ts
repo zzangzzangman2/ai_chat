@@ -1901,7 +1901,25 @@ export function enforceNovelOnlyOutput(text: string): string {
     }
 
     if (firstAllowedIdx > 0) {
-      s = lines.slice(firstAllowedIdx).join("\n").replace(/^\s*\n+/, "");
+      const prefix = lines.slice(0, firstAllowedIdx).join("\n").trim();
+      const prefixFlat = prefix.replace(/\s+/g, " ").trim();
+      const looksMeaningfulPrefix =
+        prefixFlat.length >= 40 ||
+        /\b(?:sorry|safety|policy|cannot|unable|decline)\b/i.test(prefixFlat) ||
+        /죄송|안전|정책|지침|도와드릴|생성할 수 없|참여할 수 없|불가능/.test(prefixFlat);
+
+      if (looksMeaningfulPrefix) {
+        const fixedPrefix = prefix
+          .split(/\n{2,}/)
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .map((part) => (allowedStart(part) ? part : `*${part}*`))
+          .join("\n\n");
+        const rest = lines.slice(firstAllowedIdx).join("\n").replace(/^\s*\n+/, "");
+        s = [fixedPrefix, rest].filter(Boolean).join("\n\n").trim();
+      } else {
+        s = lines.slice(firstAllowedIdx).join("\n").replace(/^\s*\n+/, "");
+      }
     } else if (firstTextIdx >= 0) {
       const raw = String(lines[firstTextIdx] || "");
       const t = raw.trim();
