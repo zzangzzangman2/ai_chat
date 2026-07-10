@@ -7,6 +7,7 @@ import {
   defaultReasoningTokensForModel,
   isAllowedChatModel,
   isGemini3FlashModel,
+  isGemini3ProModel,
 } from "@/lib/models";
 
 // 장기기억(턴당 글자수) 기본값: 80
@@ -143,7 +144,8 @@ export async function GET(req: Request) {
     patched.maxOutputTokens = 800;
     changed = true;
   }
-  const minReasoning = isGemini3FlashModel(String(patched.model || "")) ? 0 : 384;
+  const patchedModel = String(patched.model || "");
+  const minReasoning = isGemini3FlashModel(patchedModel) || isGemini3ProModel(patchedModel) ? 0 : 384;
   if (Number(patched.maxReasoningTokens ?? 0) < minReasoning) {
     patched.maxReasoningTokens = defaultReasoningTokens(String(patched.model || ""));
     changed = true;
@@ -226,10 +228,11 @@ export async function POST(req: Request) {
 
   // NOTE: UI에서는 "출력길이"를 글자수(자)로 노출한다.
   if (maxOutputTokens < 800 || maxOutputTokens > 5000) return bad("출력길이는 800~5000자 사이로 설정해 주세요.");
-  const minReasoning = isGemini3FlashModel(model) ? 0 : 384;
+  const supportsZeroReasoning = isGemini3FlashModel(model) || isGemini3ProModel(model);
+  const minReasoning = supportsZeroReasoning ? 0 : 384;
   if (maxReasoningTokens < minReasoning || maxReasoningTokens > 8192) {
     return bad(
-      isGemini3FlashModel(model)
+      supportsZeroReasoning
         ? "추론길이는 0~8192 토큰 사이로 설정해 주세요."
         : "추론길이는 384~8192 토큰 사이로 설정해 주세요."
     );

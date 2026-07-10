@@ -5,7 +5,7 @@ import { getSessionUser, isAdminEmail } from "@/lib/auth";
 import { randomUUID } from "crypto";
 import { countTokens, generateText, generateTextStream, summarizeKorean, summarizeLongMemoryKorean, isRefusalText, REFUSAL_FALLBACK_MODEL } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
-import { DEFAULT_CHAT_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini3FlashModel } from "@/lib/models";
+import { DEFAULT_CHAT_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
 
 import { stripUrlsAndMediaMarkdown } from "@/lib/memory_sanitize";
 
@@ -1079,7 +1079,7 @@ export async function POST(req: Request) {
       maxReasoningTokens: (() => {
         const v = Number(reasonRaw);
         // UI 선택값(low/mid/high)을 그대로 반영하되, 안전 범위만 클램프한다.
-        const minReasoning = isGemini3FlashModel(chosenModel) ? 0 : 384;
+        const minReasoning = isGemini3FlashModel(chosenModel) || isGemini3ProModel(chosenModel) ? 0 : 384;
         return Math.max(minReasoning, Math.min(8192, Math.floor(v)));
       })(),
     };

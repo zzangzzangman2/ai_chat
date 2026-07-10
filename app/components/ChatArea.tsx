@@ -6280,9 +6280,10 @@ const insertNarrationMarkers = useCallback(() => {
                     // 서버(route.ts)는 settings.maxOutputTokens 값을 "목표 글자수"(targetChars)로 해석합니다.
                     // 따라서 UI도 토큰이 아닌 "글자수 프리셋"으로 노출합니다.
                     // (요구) 1200/1700/2500자 프리셋
-                    const presets: Record<ReasoningLevel, number> = { low: 1200, middle: 1700, high: 2500 };
+                    type OutputLevel = "low" | "middle" | "high";
+                    const presets: Record<OutputLevel, number> = { low: 1200, middle: 1700, high: 2500 };
                     const v = Number(settings.maxOutputTokens || presets.low);
-                    const level: ReasoningLevel = v <= (presets.low + presets.middle) / 2 ? "low" : v <= (presets.middle + presets.high) / 2 ? "middle" : "high";
+                    const level: OutputLevel = v <= (presets.low + presets.middle) / 2 ? "low" : v <= (presets.middle + presets.high) / 2 ? "middle" : "high";
                     const btnStyle = (active: boolean): React.CSSProperties => ({
                       flex: 1,
                       padding: "10px 0",
@@ -6293,11 +6294,11 @@ const insertNarrationMarkers = useCallback(() => {
                       cursor: "pointer",
                       fontWeight: 900,
                     });
-                    const label: Record<ReasoningLevel, string> = { low: "LOW", middle: "MID", high: "HIGH" };
+                    const label: Record<OutputLevel, string> = { low: "LOW", middle: "MID", high: "HIGH" };
                     return (
                       <>
                         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
-                          {(Object.keys(presets) as ReasoningLevel[]).map((k) => (
+                          {(Object.keys(presets) as OutputLevel[]).map((k) => (
                             <button
                               key={k}
                               type="button"
@@ -6333,7 +6334,7 @@ const insertNarrationMarkers = useCallback(() => {
                       cursor: "pointer",
                       fontWeight: 900,
                     });
-                    const label: Record<ReasoningLevel, string> = { low: "LOW", middle: "MID", high: "HIGH" };
+                    const label: Record<ReasoningLevel, string> = { zero: "ZERO", low: "LOW", middle: "MID", high: "HIGH" };
                     return (
                       <>
                         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
@@ -6353,10 +6354,22 @@ const insertNarrationMarkers = useCallback(() => {
                             const modelName = String(settings.model || "");
                             const isG3 = /^gemini-3(?:\.|-)/i.test(modelName);
                             const isG3Pro = /gemini-3(?:\.\d+)?-pro/i.test(modelName);
-                            const g3Level = level === "high" ? "high" : level === "middle" ? "medium" : "low";
+                            const g3Level = isG3Pro
+                              ? level === "zero"
+                                ? "OFF (thinkingBudget 0)"
+                                : level === "high"
+                                  ? "medium"
+                                  : level === "middle"
+                                    ? "low"
+                                    : "minimal"
+                              : level === "high"
+                                ? "high"
+                                : level === "middle"
+                                  ? "medium"
+                                  : "minimal";
                             const actualReasoning = Number(settings.maxReasoningTokens || presets[level]);
                             return `현재: ${label[level]}${
-                              isG3 ? (isG3Pro ? ` (thinkingLevel: ${g3Level})` : ` (thinkingLevel: ${g3Level})`) : ` (${actualReasoning} tokens)`
+                              isG3 ? ` (thinking: ${g3Level})` : ` (${actualReasoning} tokens)`
                             }`;
                           })()}
                         </div>

@@ -221,12 +221,19 @@ function buildThinkingConfig(model: string, maxReasoningTokens: number, maxOutpu
     //
     // (보수적 매핑, 2026-05) thinkingLevel은 hard cap이 아니라 강도 힌트라서
     // "medium"으로 보내면 실제 reasoning이 2000~3500 토큰까지 쉽게 튀어오른다.
-    // UX 의도("MID=중간 정도만 쓰기")를 그대로 LLM에 반영하려면 임계점을 올려야 한다.
-    //  - LOW(<=384)  → "low"  (≈ 평균 500~1500 사용)
-    //  - MID(768)    → "low"  (체감상 MID도 폭주 방지 우선)
+    // ZERO uses the numeric OFF switch. A thinking level is only a hint and may still
+    // spend hidden tokens on a large prompt.
+    if (t <= 0) {
+      const zeroMode = String(process.env.AI_G3PRO_ZERO_MODE || "budget0").trim().toLowerCase();
+      return zeroMode === "minimal" ? { thinkingLevel: "minimal" } : { thinkingBudget: 0 };
+    }
+
+    // LOW uses minimal for latency; MID and HIGH deliberately step upward.
     //  - HIGH(>=1280) → "medium" (필요할 때만)
     //  - high 레벨은 사실상 봉인 (사용자가 매우 큰 값을 직접 넣을 때만)
-    const level = t >= 2048 ? "high" : t >= 1280 ? "medium" : "low";
+    const lowLevelRaw = String(process.env.AI_G3PRO_LOW_LEVEL || "minimal").trim().toLowerCase();
+    const lowLevel = lowLevelRaw === "low" ? "low" : "minimal";
+    const level = t >= 2048 ? "high" : t >= 1280 ? "medium" : t >= 640 ? "low" : lowLevel;
     return { thinkingLevel: level };
   }
   if (isGemini3Flash(model)) {

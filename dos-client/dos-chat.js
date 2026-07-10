@@ -22,8 +22,9 @@ const MODEL_OPTIONS = [
 // 출력길이는 모델 무관, 추론은 모델별로 다르게.
 // ────────────────────────────────────────────────────────────────────
 const OUTPUT_PRESETS = { low: 1200, middle: 1700, high: 2500 };
-const LEVEL_LABEL = { low: "LOW", middle: "MID", high: "HIGH" };
+const LEVEL_LABEL = { zero: "ZERO", low: "LOW", middle: "MID", high: "HIGH" };
 const LEVEL_ALIASES = {
+  zero: "zero", off: "zero", z: "zero", 0: "zero",
   low: "low", l: "low",
   middle: "middle", mid: "middle", m: "middle",
   high: "high", h: "high",
@@ -36,7 +37,7 @@ function isGemini3FlashModel(model) {
   return /^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(String(model || ""));
 }
 function getReasoningPresets(model) {
-  if (isGemini3ProFamilyModel(model)) return { low: 384, middle: 768, high: 1536 };
+  if (isGemini3ProFamilyModel(model)) return { zero: 0, low: 384, middle: 768, high: 1536 };
   if (isGemini3FlashModel(model))     return { low: 0, middle: 640, high: 1024 };
   return { low: 384, middle: 768, high: 2048 }; // gemini-2.5-pro 등
 }
@@ -44,16 +45,17 @@ function inferLevel(presets, tokens) {
   const t = Number(tokens) || 0;
   let best = "low";
   let bestDist = Infinity;
-  for (const k of ["low", "middle", "high"]) {
+  for (const k of Object.keys(presets)) {
     const d = Math.abs(presets[k] - t);
     if (d < bestDist) { bestDist = d; best = k; }
   }
   return best;
 }
-function parseLevelArg(arg) {
+function parseLevelArg(arg, allowZero = false) {
   const s = String(arg || "").trim().toLowerCase();
   if (!s) return null;
-  return LEVEL_ALIASES[s] || null;
+  const level = LEVEL_ALIASES[s] || null;
+  return level === "zero" && !allowZero ? null : level;
 }
 
 loadEnv(path.join(ROOT, ".env"), false);
@@ -1777,17 +1779,19 @@ async function updateSetting(field, value) {
     next.maxOutputTokens = OUTPUT_PRESETS[lv];
   } else if (field === "maxReasoningTokens") {
     const presets = getReasoningPresets(next.model || st.model);
+    const zeroAvailable = Object.prototype.hasOwnProperty.call(presets, "zero");
     if (!v) {
       const cur = inferLevel(presets, st.maxReasoningTokens);
       hr("추론 토큰");
       console.log(`현재: ${LEVEL_LABEL[cur]} (${presets[cur]} 토큰)`);
       console.log("");
       console.log(`모델 '${next.model || st.model}' 단계별 토큰:`);
+      if (zeroAvailable) console.log("  ZERO → 0 토큰 (추론 완전 OFF)");
       console.log(`  LOW  → ${presets.low} 토큰`);
       console.log(`  MID  → ${presets.middle} 토큰`);
       console.log(`  HIGH → ${presets.high} 토큰`);
       console.log("");
-      console.log("변경: /reason low   |   /reason mid   |   /reason high");
+      console.log(`변경: /reason ${zeroAvailable ? "zero | " : ""}low | mid | high`);
       const isGemini3Pro = isGemini3ProFamilyModel(next.model || st.model);
       if (isGemini3Pro) {
         console.log("");
@@ -1795,9 +1799,9 @@ async function updateSetting(field, value) {
       }
       return;
     }
-    const lv = parseLevelArg(v);
+    const lv = parseLevelArg(v, zeroAvailable);
     if (!lv) {
-      console.log("/reason low | mid | high  중 하나로 입력하세요.");
+      console.log(`/reason ${zeroAvailable ? "zero | " : ""}low | mid | high  중 하나로 입력하세요.`);
       return;
     }
     next.maxReasoningTokens = presets[lv];
@@ -2343,7 +2347,7 @@ function help() {
   console.log("  /settings     모델/출력/추론 한눈에 보기");
   console.log("  /model        모델 선택");
   console.log("  /output       출력 길이 (LOW/MID/HIGH)");
-  console.log("  /reason       추론 토큰 (LOW/MID/HIGH)");
+  console.log("  /reason       추론 토큰 (3.1 Pro: ZERO/LOW/MID/HIGH)");
   console.log("  /persona      페르소나(주인공) 보기/설정");
   console.log("");
   console.log(`${ANSI.bold}${ANSI.title}■ 기억 / 캐릭터${ANSI.reset}`);

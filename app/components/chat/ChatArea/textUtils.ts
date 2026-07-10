@@ -372,31 +372,30 @@ export function toPromptRole(role: unknown): "user" | "assistant" {
   return role === "user" ? "user" : "assistant";
 }
 
-export type ReasoningLevel = "low" | "middle" | "high";
+export type ReasoningLevel = "zero" | "low" | "middle" | "high";
 
 function isGemini3ProFamily(model: string): boolean {
   return /gemini-3(?:\.\d+)?-pro/i.test(String(model || ""));
 }
 
 export function getReasoningLevelOptions(model: string): ReasoningLevel[] {
-  // Gemini 3 Pro: LOW/MID/HIGH 모두 노출
-  if (isGemini3ProFamily(model)) return ["low", "middle", "high"];
+  if (isGemini3ProFamily(model)) return ["zero", "low", "middle", "high"];
   return ["low", "middle", "high"];
 }
 
 export function getReasoningPresets(model: string): Record<ReasoningLevel, number> {
-  // UI는 low/middle/high로만 노출하고, 실제 저장/전송은 숫자(maxReasoningTokens)로 유지한다.
+  // UI choices are stored as the numeric maxReasoningTokens setting.
   // UX 기준: 모두 LOW가 기본이며, 모델별로 기본 LOW 토큰만 다르게 둔다.
   if (isGemini3ProFamily(model)) {
-    // Gemini 3 Pro: MID/HIGH를 더 높은 추론 예산으로 사용
-    return { low: 384, middle: 768, high: 1536 };
+    // ZERO is sent as thinkingBudget=0; the remaining values map to thinkingLevel.
+    return { zero: 0, low: 384, middle: 768, high: 1536 };
   }
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(model)) {
     // Gemini 3 Flash: LOW는 latency 우선 minimal, MID/HIGH는 thinkingLevel로 매핑한다.
-    return { low: 0, middle: 640, high: 1024 };
+    return { zero: 0, low: 0, middle: 640, high: 1024 };
   }
   // gemini-2.5-pro
-  return { low: 384, middle: 768, high: 2048 };
+  return { zero: 0, low: 384, middle: 768, high: 2048 };
 }
 
 export function inferReasoningLevel(model: string, tokens: number): ReasoningLevel {
