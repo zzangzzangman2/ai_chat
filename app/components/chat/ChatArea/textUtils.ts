@@ -379,7 +379,7 @@ function isGemini3ProFamily(model: string): boolean {
 }
 
 export function getReasoningLevelOptions(model: string): ReasoningLevel[] {
-  if (isGemini3ProFamily(model)) return ["zero", "low", "middle", "high"];
+  if (isGemini3ProFamily(model)) return ["zero", "middle", "high"];
   return ["low", "middle", "high"];
 }
 
@@ -387,7 +387,7 @@ export function getReasoningPresets(model: string): Record<ReasoningLevel, numbe
   // UI choices are stored as the numeric maxReasoningTokens setting.
   // UX 기준: 모두 LOW가 기본이며, 모델별로 기본 LOW 토큰만 다르게 둔다.
   if (isGemini3ProFamily(model)) {
-    // ZERO is sent as thinkingBudget=0; the remaining values map to thinkingLevel.
+    // The zero slot is shown as FAST and maps to the officially supported low level.
     return { zero: 0, low: 384, middle: 768, high: 1536 };
   }
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(model)) {

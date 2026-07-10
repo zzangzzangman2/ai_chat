@@ -221,19 +221,16 @@ function buildThinkingConfig(model: string, maxReasoningTokens: number, maxOutpu
     //
     // (보수적 매핑, 2026-05) thinkingLevel은 hard cap이 아니라 강도 힌트라서
     // "medium"으로 보내면 실제 reasoning이 2000~3500 토큰까지 쉽게 튀어오른다.
-    // ZERO uses the numeric OFF switch. A thinking level is only a hint and may still
-    // spend hidden tokens on a large prompt.
+    // Gemini 3.1 Pro cannot disable thinking. The fastest supported setting is low.
     if (t <= 0) {
-      const zeroMode = String(process.env.AI_G3PRO_ZERO_MODE || "budget0").trim().toLowerCase();
-      return zeroMode === "minimal" ? { thinkingLevel: "minimal" } : { thinkingBudget: 0 };
+      return { thinkingLevel: "low" };
     }
 
-    // LOW uses minimal for latency; MID and HIGH deliberately step upward.
-    //  - HIGH(>=1280) → "medium" (필요할 때만)
-    //  - high 레벨은 사실상 봉인 (사용자가 매우 큰 값을 직접 넣을 때만)
-    const lowLevelRaw = String(process.env.AI_G3PRO_LOW_LEVEL || "minimal").trim().toLowerCase();
-    const lowLevel = lowLevelRaw === "low" ? "low" : "minimal";
-    const level = t >= 2048 ? "high" : t >= 1280 ? "medium" : t >= 640 ? "low" : lowLevel;
+    // Numeric UI presets are local intent; the provider receives supported levels only.
+    //  - FAST/legacy LOW (<640) → low
+    //  - MID (>=640) → medium
+    //  - HIGH (>=1280) → high
+    const level = t >= 1280 ? "high" : t >= 640 ? "medium" : "low";
     return { thinkingLevel: level };
   }
   if (isGemini3Flash(model)) {

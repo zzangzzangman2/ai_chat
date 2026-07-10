@@ -24,7 +24,7 @@ const MODEL_OPTIONS = [
 const OUTPUT_PRESETS = { low: 1200, middle: 1700, high: 2500 };
 const LEVEL_LABEL = { zero: "ZERO", low: "LOW", middle: "MID", high: "HIGH" };
 const LEVEL_ALIASES = {
-  zero: "zero", off: "zero", z: "zero", 0: "zero",
+  zero: "zero", off: "zero", fast: "zero", z: "zero", f: "zero", 0: "zero",
   low: "low", l: "low",
   middle: "middle", mid: "middle", m: "middle",
   high: "high", h: "high",
@@ -37,9 +37,12 @@ function isGemini3FlashModel(model) {
   return /^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(String(model || ""));
 }
 function getReasoningPresets(model) {
-  if (isGemini3ProFamilyModel(model)) return { zero: 0, low: 384, middle: 768, high: 1536 };
+  if (isGemini3ProFamilyModel(model)) return { zero: 0, middle: 768, high: 1536 };
   if (isGemini3FlashModel(model))     return { low: 0, middle: 640, high: 1024 };
   return { low: 384, middle: 768, high: 2048 }; // gemini-2.5-pro 등
+}
+function reasoningLevelLabel(model, level) {
+  return level === "zero" && isGemini3ProFamilyModel(model) ? "FAST" : LEVEL_LABEL[level];
 }
 function inferLevel(presets, tokens) {
   const t = Number(tokens) || 0;
@@ -1082,12 +1085,12 @@ async function showSettings() {
     const lvl = lastUsage ? lastUsage.thinkingLevel : "";
     const actualStr = actual != null ? `${actual} 토큰` : "기록 없음";
     const lvlStr = lvl ? ` / 단계="${lvl}"` : "";
-    console.log(`추론 토큰   : ${LEVEL_LABEL[rLevel]} (설정 힌트 ${rPresets[rLevel]} / 마지막 실측 ${actualStr}${lvlStr})`);
+    console.log(`추론 토큰   : ${reasoningLevelLabel(st.model, rLevel)} (설정 힌트 ${rPresets[rLevel]} / 마지막 실측 ${actualStr}${lvlStr})`);
     console.log(`            ※ Gemini 3 Pro는 'low/medium/high' 단계만 받고 실제 사용량은 모델이 결정함`);
   } else {
     const actual = lastUsage ? lastUsage.reasoningTokens : null;
     const actualStr = actual != null ? `${actual} 토큰` : "기록 없음";
-    console.log(`추론 토큰   : ${LEVEL_LABEL[rLevel]} (${rPresets[rLevel]} 토큰 / 현재 ${st.maxReasoningTokens || "-"} / 마지막 실측 ${actualStr})`);
+    console.log(`추론 토큰   : ${reasoningLevelLabel(st.model, rLevel)} (${rPresets[rLevel]} 토큰 / 현재 ${st.maxReasoningTokens ?? "-"} / 마지막 실측 ${actualStr})`);
   }
 
   console.log(`최근 원문   : ${st.memoryFrom || 7}턴`);
@@ -1783,15 +1786,16 @@ async function updateSetting(field, value) {
     if (!v) {
       const cur = inferLevel(presets, st.maxReasoningTokens);
       hr("추론 토큰");
-      console.log(`현재: ${LEVEL_LABEL[cur]} (${presets[cur]} 토큰)`);
+      console.log(`현재: ${reasoningLevelLabel(next.model || st.model, cur)} (${presets[cur]} 토큰)`);
       console.log("");
       console.log(`모델 '${next.model || st.model}' 단계별 토큰:`);
-      if (zeroAvailable) console.log("  ZERO → 0 토큰 (추론 완전 OFF)");
-      console.log(`  LOW  → ${presets.low} 토큰`);
-      console.log(`  MID  → ${presets.middle} 토큰`);
-      console.log(`  HIGH → ${presets.high} 토큰`);
+      for (const [key, tokens] of Object.entries(presets)) {
+        const label = reasoningLevelLabel(next.model || st.model, key).padEnd(4, " ");
+        const detail = key === "zero" ? "공식 최저 low" : `${tokens} 토큰`;
+        console.log(`  ${label} → ${detail}`);
+      }
       console.log("");
-      console.log(`변경: /reason ${zeroAvailable ? "zero | " : ""}low | mid | high`);
+      console.log(`변경: /reason ${zeroAvailable ? "fast | mid | high" : "low | mid | high"}`);
       const isGemini3Pro = isGemini3ProFamilyModel(next.model || st.model);
       if (isGemini3Pro) {
         console.log("");
@@ -1800,8 +1804,8 @@ async function updateSetting(field, value) {
       return;
     }
     const lv = parseLevelArg(v, zeroAvailable);
-    if (!lv) {
-      console.log(`/reason ${zeroAvailable ? "zero | " : ""}low | mid | high  중 하나로 입력하세요.`);
+    if (!lv || !Object.prototype.hasOwnProperty.call(presets, lv)) {
+      console.log(`/reason ${zeroAvailable ? "fast | mid | high" : "low | mid | high"} 중 하나로 입력하세요.`);
       return;
     }
     next.maxReasoningTokens = presets[lv];
@@ -2347,7 +2351,7 @@ function help() {
   console.log("  /settings     모델/출력/추론 한눈에 보기");
   console.log("  /model        모델 선택");
   console.log("  /output       출력 길이 (LOW/MID/HIGH)");
-  console.log("  /reason       추론 토큰 (3.1 Pro: ZERO/LOW/MID/HIGH)");
+  console.log("  /reason       추론 설정 (3.1 Pro: FAST/MID/HIGH)");
   console.log("  /persona      페르소나(주인공) 보기/설정");
   console.log("");
   console.log(`${ANSI.bold}${ANSI.title}■ 기억 / 캐릭터${ANSI.reset}`);

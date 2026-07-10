@@ -6334,7 +6334,13 @@ const insertNarrationMarkers = useCallback(() => {
                       cursor: "pointer",
                       fontWeight: 900,
                     });
-                    const label: Record<ReasoningLevel, string> = { zero: "ZERO", low: "LOW", middle: "MID", high: "HIGH" };
+                    const isG3ProModel = /gemini-3(?:\.\d+)?-pro/i.test(String(settings.model || ""));
+                    const label: Record<ReasoningLevel, string> = {
+                      zero: isG3ProModel ? "FAST" : "ZERO",
+                      low: "LOW",
+                      middle: "MID",
+                      high: "HIGH",
+                    };
                     return (
                       <>
                         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
@@ -6356,12 +6362,12 @@ const insertNarrationMarkers = useCallback(() => {
                             const isG3Pro = /gemini-3(?:\.\d+)?-pro/i.test(modelName);
                             const g3Level = isG3Pro
                               ? level === "zero"
-                                ? "OFF (thinkingBudget 0)"
+                                ? "low"
                                 : level === "high"
-                                  ? "medium"
+                                  ? "high"
                                   : level === "middle"
-                                    ? "low"
-                                    : "minimal"
+                                    ? "medium"
+                                    : "low"
                               : level === "high"
                                 ? "high"
                                 : level === "middle"
