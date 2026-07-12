@@ -2538,7 +2538,12 @@ if (!TRANSPORT_STREAMING) {
 }
 
 if (!TRANSPORT_STREAMING) {
-            assistantText = stripNamePrefixFromNarration(assistantText);
+            // 줄 단위로 적용해야 첫 줄의 `작품 제목 | 지문`도 정상 정리된다.
+            // 전체 응답을 한 번에 넘기면 정규식의 `.`이 개행을 넘지 못해 접두가 남는다.
+            assistantText = assistantText
+              .split(/\r?\n/)
+              .map((line) => stripNamePrefixFromNarration(line))
+              .join("\n");
             assistantText = stripDialogueWrappedNarration(assistantText);
 
             // In novel mode, avoid aggressive trimming that can drop early scene setup.

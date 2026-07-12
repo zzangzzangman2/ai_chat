@@ -220,6 +220,31 @@ if (!hasColumn("messages", "updatedAt")) {
     db.exec(`UPDATE messages SET updatedAt = createdAt WHERE updatedAt = 0 OR updatedAt IS NULL`);
   } catch {}
 }
+
+// These profile tables must exist before the userEmail column migrations and
+// indexes below run. On a brand-new database they used to be created later in
+// this function, so the first startup failed with "no such table".
+db.exec(`
+  CREATE TABLE IF NOT EXISTS user_profile (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    personaName TEXT NOT NULL DEFAULT '',
+    personaAge INTEGER NOT NULL DEFAULT 0,
+    personaGender TEXT NOT NULL DEFAULT '',
+    personaInfo TEXT NOT NULL DEFAULT '',
+    updatedAt INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS persona_profiles (
+    id TEXT PRIMARY KEY,
+    personaName TEXT NOT NULL DEFAULT '',
+    personaAge INTEGER NOT NULL DEFAULT 0,
+    personaGender TEXT NOT NULL DEFAULT '',
+    personaInfo TEXT NOT NULL DEFAULT '',
+    createdAt INTEGER NOT NULL,
+    updatedAt INTEGER NOT NULL
+  );
+`);
+
 if (!hasColumn("persona_profiles", "userEmail")) {
   db.exec(`ALTER TABLE persona_profiles ADD COLUMN userEmail TEXT NOT NULL DEFAULT ''`);
 }

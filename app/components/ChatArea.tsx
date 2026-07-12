@@ -2922,7 +2922,23 @@ const normalizeNovelLine = (lineRaw: string) => {
             // 예: 임서원 | "..."  -> "..."  /  임서원 | 네, ... -> "네, ..."
             const pipe = raw.match(/^(.+?)\s*\|\s*(.+)$/);
             if (pipe) {
+              const lhs = String(pipe[1] || "").trim();
               let rhs = (pipe[2] || "").trim();
+
+              // 작품 제목 뒤에 같은 줄로 지문이 이어진 출력은 화자 대사가 아니다.
+              // 예: "아일릿 신입 매니저 데뷔일지 | 2024년 3월 25일 ..."
+              // 기존 로직은 모든 pipe 라인을 무조건 대사로 바꾸면서 지문 전체에
+              // 따옴표와 대사 색상을 붙였다. 실제 따옴표 대사는 계속 허용하되,
+              // 현재 작품 제목 또는 명백한 다단어 헤더 뒤의 긴 평문은 지문으로 유지한다.
+              const normalizedLhs = lhs.replace(/^(?:\*{1,3}|_{1,3}|`{1,3})|(?:\*{1,3}|_{1,3}|`{1,3})$/g, "").trim();
+              const currentPresetTitle = String(selectedPreset?.name || "").trim();
+              const rhsStartsWithQuote = /^["“”＂'‘’「『]/.test(rhs);
+              const lhsWordCount = normalizedLhs.split(/\s+/).filter(Boolean).length;
+              const isPresetTitlePrefix = Boolean(currentPresetTitle && normalizedLhs === currentPresetTitle);
+              const isObviousNarrationHeader = !rhsStartsWithQuote && lhsWordCount >= 4 && rhs.length >= 80;
+              if (isPresetTitlePrefix || isObviousNarrationHeader) {
+                return { kind: "narration" as const, text: rhs };
+              }
 
               // (fix) **|** 처럼 구분자(|) 자체가 마크다운 강조로 감싸져 있으면,
 
@@ -3844,7 +3860,7 @@ return (
         </div>
       );
     },
-	    [CHAT_THEME, galleryMap, renderInline, renderNovelInlineColored, renderNovel, renderMarkdownLite, buildInputPreviewNodes, (settings as any)?.renderMode, selectedProfile, showImages, firstAssistantId, messages, chatFontSizePx, paraSpacing, paraGapPx]
+	    [CHAT_THEME, galleryMap, renderInline, renderNovelInlineColored, renderNovel, renderMarkdownLite, buildInputPreviewNodes, (settings as any)?.renderMode, selectedProfile, selectedPreset?.name, showImages, firstAssistantId, messages, chatFontSizePx, paraSpacing, paraGapPx]
   );
 
   // (성능) 토큰 팝업 오픈 핸들러를 안정화해서, 입력창 타이핑마다 MessageList가 재렌더되는 것을 줄인다.
