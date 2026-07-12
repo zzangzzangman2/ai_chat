@@ -4282,22 +4282,41 @@ const lastAssistantSuggestSummaryRef = useRef<string>("");
 
         const mode = String(memoryRefresh?.mode || "all");
         const refreshChatId = String(chatId);
+        const runtimeForRefresh = memoryRefresh?.runtime || null;
 
-        fetch("/api/chat/memory/refresh", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chatId: refreshChatId,
-            runtime: memoryRefresh?.runtime || null,
-            mode,
-            allowBadOutputSave: true,
-          }),
-          keepalive: true,
-        })
-          .then(async (res) => {
-            if (!res.ok) return;
-            const body = (await res.json().catch(() => null)) as any;
-            if (body && body.ok === false) return;
+        // 한 번에 3턴 블록 하나만 처리하는 API이므로 밀린 블록을 순서대로 따라잡는다.
+        // 탭 전환이나 일시적인 네트워크 오류로 요청 하나가 빠져도 최대 3회 재시도한다.
+        void (async () => {
+          const wait = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+          const refreshOnce = async () => {
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              try {
+                const res = await fetch("/api/chat/memory/refresh", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    chatId: refreshChatId,
+                    runtime: runtimeForRefresh,
+                    mode,
+                    allowBadOutputSave: false,
+                  }),
+                  keepalive: true,
+                });
+                if (!res.ok) throw new Error(`memory_refresh_http_${res.status}`);
+                const body = (await res.json().catch(() => null)) as any;
+                if (!body || body.ok === false) throw new Error("memory_refresh_invalid_response");
+                return body;
+              } catch {
+                if (attempt >= 2) return null;
+                await wait(600 * (attempt + 1));
+              }
+            }
+            return null;
+          };
+
+          for (let windowIndex = 0; windowIndex < 8; windowIndex += 1) {
+            const body = await refreshOnce();
+            if (!body) break;
             try {
               window.dispatchEvent(
                 new CustomEvent("mate:memory-refreshed", {
@@ -4310,8 +4329,10 @@ const lastAssistantSuggestSummaryRef = useRef<string>("");
                 })
               );
             } catch {}
-          })
-          .catch(() => {});
+            if (!body?.morePending) break;
+            await wait(80);
+          }
+        })();
       } catch {}
     },
     [chatId]

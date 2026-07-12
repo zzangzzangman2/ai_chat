@@ -51,6 +51,7 @@ import {
 import { sanitizePromptCached } from "./_server/promptCache";
 import { buildFormatGuide } from "./_server/formatGuide";
 import { normalizeSummaryTail, sanitizeLongMemorySummary, upsertSummaryRangeBlock } from "./_server/memory";
+import { selectHybridMemory } from "./_server/memorySelection";
 import {
   _reEsc,
   applyPromptPlaceholders,
@@ -510,7 +511,8 @@ function buildManualCharacterRosterBlock(chatIdRaw: string) {
     .all(chatId) as any[];
 
   // (최적화) 기존엔 캐릭터마다 chat_character_turn_memories를 따로 조회하던 N+1을
-  // 하나의 IN 쿼리로 합친다. 결과는 rosterId 기준으로 그룹핑해 캐릭터당 80개로 컷.
+  // 하나의 IN 쿼리로 합친다. 각 캐릭터의 첫 만남 1개와 최신 기억 12개만 유지한다.
+  // 오래 대화한 캐릭터가 과거 80개에 잘려 최근 일을 전혀 기억하지 못하던 문제를 막는다.
   const memoriesByRoster = new Map<string, any[]>();
   {
     const rosterIds: string[] = [];
@@ -522,9 +524,16 @@ function buildManualCharacterRosterBlock(chatIdRaw: string) {
       const placeholders = rosterIds.map(() => "?").join(",");
       const memRows = db
         .prepare(
-          `SELECT rosterId, turnNo, summary
-           FROM chat_character_turn_memories
-           WHERE chatId=? AND rosterId IN (${placeholders})
+          `WITH ranked AS (
+             SELECT rosterId, turnNo, summary,
+                    ROW_NUMBER() OVER (PARTITION BY rosterId ORDER BY turnNo ASC) AS firstRank,
+                    ROW_NUMBER() OVER (PARTITION BY rosterId ORDER BY turnNo DESC) AS recentRank
+             FROM chat_character_turn_memories
+             WHERE chatId=? AND rosterId IN (${placeholders})
+           )
+           SELECT rosterId, turnNo, summary
+           FROM ranked
+           WHERE firstRank=1 OR recentRank<=12
            ORDER BY rosterId ASC, turnNo ASC`
         )
         .all(chatId, ...rosterIds) as any[];
@@ -536,7 +545,7 @@ function buildManualCharacterRosterBlock(chatIdRaw: string) {
           arr = [];
           memoriesByRoster.set(k, arr);
         }
-        if (arr.length < 80) arr.push(m);
+        if (arr.length < 13) arr.push(m);
       }
     }
   }
@@ -1543,36 +1552,59 @@ ${body}`.trim();
     tEnd(tUserNote);
 
     const tLongMemoryBlock = tStart("장기기억");
-    const relatedMemory = buildRelatedMemoryBlocks({
-      chatId: cid,
-      queryText: [
-        userText,
-        tail
-          .slice(-8)
-          .map((m: any) => String(m?.content || ""))
-          .join("\n"),
-      ].join("\n"),
+    const memoryQueryText = [
+      userText,
+      tail
+        .slice(-8)
+        .map((m: any) => String(m?.content || ""))
+        .join("\n"),
+    ].join("\n");
+    const hybridMemory = selectHybridMemory({
       historySummary,
-      maxBlocks: 5,
-      maxChars: 1800,
+      queryText: memoryQueryText,
+      currentArcTurns: 15,
+      currentArcMaxChars: 3200,
+      maxRelatedSections: 6,
+      maxRelatedChars: 2400,
+      fallbackSections: 2,
     });
-    const relatedMemoryBlock = relatedMemory.blockText;
+    // 헤더가 없는 구형 요약은 섹션 검색이 불가능하므로 기존 검색 블록을 보조 경로로 쓴다.
+    const legacyRelatedMemory =
+      hybridMemory.totalSections === 0
+        ? buildRelatedMemoryBlocks({
+            chatId: cid,
+            queryText: memoryQueryText,
+            historySummary,
+            maxBlocks: 5,
+            maxChars: 1800,
+          })
+        : null;
+    const relatedArchiveText =
+      hybridMemory.relatedArchiveText || String(legacyRelatedMemory?.blockText || "").trim();
     const manualCharacterRosterBlock = buildManualCharacterRosterBlock(cid);
-    const historySummaryForPrompt = [historySummary, relatedMemoryBlock, manualCharacterRosterBlock]
+    const historySummaryForPrompt = [
+      hybridMemory.currentArcText,
+      relatedArchiveText,
+      manualCharacterRosterBlock,
+    ]
       .filter((x) => String(x || "").trim())
       .join("\n\n");
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
       reqId,
-      pickedBlocks: relatedMemory.blocks.map((b) => ({ startTurn: b.startTurn, endTurn: b.endTurn, score: b.score })),
-      pickedChars: strlen(relatedMemoryBlock),
+      totalArchiveSections: hybridMemory.totalSections,
+      currentRanges: hybridMemory.currentRanges,
+      pickedBlocks: hybridMemory.relatedRanges,
+      currentArcChars: strlen(hybridMemory.currentArcText),
+      pickedChars: strlen(relatedArchiveText),
       manualCharacterRosterChars: strlen(manualCharacterRosterBlock),
     });
     const memoryBlock = [
-      `# (2) 장기기억 요약(최근 원문 ${keepUserTurns}턴 제외, ${summaryEveryVal}턴마다 갱신)`,
-      `- 아래 요약 섹션(### a-b턴)은 위에서 아래로 시간순(과거→현재)이다.`,
-      `- 해석 규칙: 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
+      `# (2) 혼합형 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
+      `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
+      `- 과거 사건은 현재 입력과 관련된 구간만 보강하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
+      `- 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
       historySummaryForPrompt || "(없음)",
     ].join("\n");
     tEnd(tLongMemoryBlock);
