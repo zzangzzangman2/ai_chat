@@ -2195,6 +2195,8 @@ const systemRaw = [
       `- 주인공의 다음 행동/대사는 대신 쓰지 말고, NPC 반응과 현재 장면만 충분히 전개한다.`,
     ].join("\n");
 
+    const latestInputNoEchoRule = `사용자의 최신 입력은 이미 화면에 표시되고 끝난 사건이다. 절대 다시 직접 인용하거나, "~라는 말/명령/요구"로 간접 인용·요약·재서술하지 마라. 입력을 내뱉는 목소리·태도·행위도 다시 묘사하지 말고, 그 직후의 NPC 반응·행동·장면 변화부터 시작하라.`;
+
     const user = continueMode
       ? [
           context ? `[최근 대화]\n${context}` : "",
@@ -2212,7 +2214,8 @@ const systemRaw = [
       : [
           context ? `[최근 대화]\n${context}` : "",
           ``,
-          `다음은 사용자의 최신 입력이다. 이 입력(주인공 발화)은 이미 화면에 표시되고 끝난 사건이다. 절대 다시 직접 인용하거나, "~라는 말/명령/요구"로 간접 인용·요약·재서술하지 마라. 입력을 내뱉는 목소리·태도·행위도 다시 묘사하지 말고, 그 직후의 NPC 반응·행동·장면 변화부터 시작하라. 상대가 입력을 들었다는 전제에서 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
+          latestInputNoEchoRule,
+          `상대가 입력을 들었다는 전제에서 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
           `사용자 최신 입력(참고용, 재출력 금지): ${userLine}`,
           ``,
           oneShotLengthContract,
@@ -3453,7 +3456,7 @@ if (metaTail) {
     const trimmed = (assistantText || "").trim();
 
     // 너무 긴 규칙을 주면 모델이 오히려 '*' 같은 잔해만 내보내는 케이스가 있어,
-    // 최소 구조(주인공 대사 + 지문 + NPC 대사)만 만족하는지 강하게 검증한다.
+    // 최소 구조(지문 + NPC 대사)를 만족하고 주인공 대사를 재출력하지 않았는지 검증한다.
     // 추가로 '길이'를 슬라이더 값(=targetChars)에 최대한 맞추기 위해
     // 너무 짧거나/너무 길면 1~2회 재작성하며 max_output_tokens를 동적으로 보정한다.
     const isTooShort = trimmed.length < minChars;
@@ -3465,7 +3468,7 @@ if (metaTail) {
     const hasNarration = /(^|\n)\*[^\n]*\*/m.test(trimmed) || /(^|\n)\*[^\n]+/m.test(trimmed);
     const hasPersonaLine = new RegExp(`(^|\\n)${esc(personaName)}\\s*\\|\\s*.+`, "m").test(trimmed);
 
-    const badShape = trimmed === "*" || trimmed === "" || !hasNpcLine || !hasPersonaLine || !hasNarration;
+    const badShape = trimmed === "*" || trimmed === "" || !hasNpcLine || hasPersonaLine || !hasNarration;
 
     // 길이 보정에 사용할 토큰 상한 계산(출력 길이와 사용 토큰/문자 비율 기반)
     const adjustMaxOutputTokens = (desiredChars: number) => {
@@ -3492,13 +3495,14 @@ if (metaTail) {
                 : `방금 답변이 너무 짧습니다. 같은 장면을 유지하되 묘사/상황/심리를 더 추가하여 최소 ${minChars}자 이상으로 충분히 길게 쓰고, 끝까지 완결되게 다시 작성하세요.`,
           "- 반드시 한국어",
           `- 글자수 목표: 약 ${targetChars}자(±10%), 가능하면 ${maxChars}자 이내`,
-      `  1) 지문 1~3문장: *...* (행동/표정/상황/심리)`,
-      `  2) 주인공 대사 1줄: ${personaNameFinal} | "..." (반드시 큰따옴표로 감싼다)`,
-      `  3) 상대 대사 1~3줄: ${preset.characterName || "상대"} | "..." (반드시 큰따옴표로 감싼다)`,
+          `  1) 지문 1~3문장: *...* (NPC 행동/표정/상황)`,
+          `  2) 상대 대사 1~3줄: ${preset.characterName || "상대"} | "..." (반드시 큰따옴표로 감싼다)`,
+          "- 주인공 대사는 출력하지 말 것",
           "- 지문 줄에는 이름 접두를 붙이지 말 것",
           "- 마지막은 마침표/물음표/느낌표/따옴표 중 하나로 문장을 완결하고 종료한다. ([END] 금지)",
-          "[주인공 대사(그대로)]",
+          "[사용자 최신 입력(의미 참고용, 재출력 금지)]",
           userLine,
+          latestInputNoEchoRule,
           "[이전 답변(참고용, 그대로 복붙 금지)]",
           assistantText,
         ].join("\n");
@@ -3660,8 +3664,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           "- 첫 줄은 지문으로 시작(대사로 시작 금지)",
           "- 지문(*...*)에는 이름 접두를 붙이지 말 것",
           "- 마지막은 완결된 문장/문단으로 종료. ([END] 금지)",
-          "[주인공 대사(그대로)]",
+          "[사용자 최신 입력(의미 참고용, 재출력 금지)]",
           userLine,
+          latestInputNoEchoRule,
         ].join("\n");
         const rewritten3 = await generateText({
           system: systemMain,
