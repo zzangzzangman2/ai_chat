@@ -103,6 +103,8 @@ const ANSI = {
   showCursor: "\x1b[?25h",
   mouseOn: "\x1b[?1000h\x1b[?1006h",
   mouseOff: "\x1b[?1000l\x1b[?1006l",
+  alternateOn: "\x1b[?1049h",
+  alternateOff: "\x1b[?1049l",
 };
 
 const state = {
@@ -120,7 +122,7 @@ const state = {
 
 function restoreTerminal() {
   try {
-    process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}`);
+    process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}${ANSI.alternateOff}`);
   } catch {}
   try {
     if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
@@ -2081,35 +2083,41 @@ async function openSettingsPanel(rl) {
   let selectedIndex = 0;
   let dirty = false;
   let notice = "";
+  let done = false;
+  let finalMessage = "";
 
-  while (true) {
-    const action = await chooseSettingsPanelAction(rl, draft, selectedIndex, dirty, notice);
-    selectedIndex = action.selectedIndex;
-    if (action.type === "cancel") {
-      clearScreen();
-      console.log(dirty ? "설정 변경을 취소했습니다." : "설정 패널을 닫았습니다.");
-      return;
-    }
-    if (action.type === "save") {
-      const json = await apiJson("/api/chat/settings", {
-        method: "POST",
-        body: JSON.stringify(draft),
-      });
-      applySettings(json && json.settings ? json.settings : null);
-      clearScreen();
-      console.log("설정을 저장했습니다.");
-      await showSettings();
-      return;
-    }
-    if (action.type === "edit" && action.row) {
-      if (action.row.kind === "choice") {
-        notice = cycleSettingsPanelValue(draft, action.row, action.direction);
-      } else {
-        notice = await editSettingsPanelValue(rl, draft, action.row);
+  process.stdout.write(ANSI.alternateOn);
+  try {
+    while (!done) {
+      const action = await chooseSettingsPanelAction(rl, draft, selectedIndex, dirty, notice);
+      selectedIndex = action.selectedIndex;
+      if (action.type === "cancel") {
+        done = true;
+        break;
       }
-      dirty = true;
+      if (action.type === "save") {
+        const json = await apiJson("/api/chat/settings", {
+          method: "POST",
+          body: JSON.stringify(draft),
+        });
+        applySettings(json && json.settings ? json.settings : null);
+        finalMessage = "설정 저장됨.";
+        done = true;
+        break;
+      }
+      if (action.type === "edit" && action.row) {
+        if (action.row.kind === "choice") {
+          notice = cycleSettingsPanelValue(draft, action.row, action.direction);
+        } else {
+          notice = await editSettingsPanelValue(rl, draft, action.row);
+        }
+        dirty = true;
+      }
     }
+  } finally {
+    process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}${ANSI.alternateOff}\r\x1b[2K`);
   }
+  if (finalMessage) console.log(finalMessage);
 }
 
 async function startupPresetLauncher() {
@@ -2203,6 +2211,7 @@ async function createChat(indexOrId) {
   await loadSettings().catch(() => null);
   console.log(`새 채팅을 열었습니다: ${state.chatId}`);
   await showHistory(8);
+  console.log(`${ANSI.gray}F2 : 설정 패널${ANSI.reset}`);
 }
 
 async function openChat(indexOrId) {
@@ -2247,6 +2256,7 @@ async function openChat(indexOrId) {
   // (수정) 이전 12개만 보여줘서 "방금 한 메시지가 안 보인다"는 혼란이 있었음 → 40개로 늘림.
   // 더 보고 싶으면 /history 200 까지 확장 가능.
   await showHistory(40);
+  console.log(`${ANSI.gray}F2 : 설정 패널${ANSI.reset}`);
 }
 
 async function updateSetting(field, value) {
@@ -2964,7 +2974,6 @@ async function main() {
     console.log("열린 채팅이 없습니다. /presets 후 /new 번호 로 시작하세요.");
   }
   console.log("");
-  console.log("F2를 누르면 설정 패널이 열립니다. 명령어는 /help로 볼 수 있습니다.");
 
   const rl = readline.createInterface({
     input: process.stdin,
