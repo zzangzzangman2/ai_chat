@@ -1837,7 +1837,8 @@ const loadOlder = useCallback(async () => {
           let end = seg.indexOf("'", hit.pos + 1);
           if (end === -1) {
             const tail = seg.slice(hit.pos);
-            if (tail) nodes.push(tail);
+            // 스트리밍 중 닫는 따옴표가 아직 오지 않았어도 속마음 색을 유지한다.
+            pushColored(tail, NOVEL_THOUGHT_COLOR);
             break;
           }
           // 연속된 '' 같은 중복 닫기까지 포함
@@ -1854,7 +1855,8 @@ const loadOlder = useCallback(async () => {
           let end = seg.indexOf('＂', hit.pos + 1);
           if (end === -1) {
             const tail = seg.slice(hit.pos);
-            if (tail) nodes.push(tail);
+            // 닫힘 전 스트리밍 조각도 대사로 보이게 한다.
+            pushColored(tail, NOVEL_DIALOGUE_COLOR);
             break;
           }
           // 연속된 닫기 따옴표까지 포함
@@ -1875,7 +1877,7 @@ const loadOlder = useCallback(async () => {
           }
           if (end === -1) {
             const tail = seg.slice(hit.pos);
-            if (tail) nodes.push(tail);
+            pushColored(tail, NOVEL_DIALOGUE_COLOR);
             break;
           }
           while (end + 1 < seg.length && seg[end + 1] === closeChar) end++;
@@ -1895,7 +1897,7 @@ const loadOlder = useCallback(async () => {
           }
           if (end === -1) {
             const tail = seg.slice(hit.pos);
-            if (tail) nodes.push(tail);
+            pushColored(tail, NOVEL_DIALOGUE_COLOR);
             break;
           }
           // 연속된 닫기 따옴표까지 포함
@@ -1910,7 +1912,7 @@ const loadOlder = useCallback(async () => {
         let end = seg.indexOf('"', hit.pos + 1);
         if (end === -1) {
           const tail = seg.slice(hit.pos);
-          if (tail) nodes.push(tail);
+          pushColored(tail, NOVEL_DIALOGUE_COLOR);
           break;
         }
         // 연속된 "" 같은 중복 닫기까지 포함
@@ -3600,7 +3602,12 @@ const renderGrouped = (grouped: ReturnType<typeof groupNovelLines>, suffix: stri
 
       if (isDialogue) {
         return (
-          <div key={j} style={{ color: NOVEL_DIALOGUE_COLOR, lineHeight: NOVEL_LINE_HEIGHT }}>
+          <div
+            key={j}
+            // 한 줄이 대사로 시작해도 닫는 따옴표 뒤의 지문은 기본 지문색을 상속해야 한다.
+            // 실제 대사 구간만 renderNovelInlineColored의 span이 주황색으로 덮는다.
+            style={{ color: NOVEL_NARRATION, lineHeight: NOVEL_LINE_HEIGHT }}
+          >
             {renderNovelInlineColored(stripSpeakerMarks(textLine))}
           </div>
         );
