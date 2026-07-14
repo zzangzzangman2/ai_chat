@@ -1959,13 +1959,13 @@ function terminalCharWidth(ch) {
   return 1;
 }
 
-function displayWidth(value) {
+function panelDisplayWidth(value) {
   return Array.from(String(value || "")).reduce((sum, ch) => sum + terminalCharWidth(ch), 0);
 }
 
 function fitDisplay(value, maxWidth) {
   const text = String(value || "");
-  if (displayWidth(text) <= maxWidth) return text;
+  if (panelDisplayWidth(text) <= maxWidth) return text;
   const suffix = "...";
   const target = Math.max(0, maxWidth - suffix.length);
   let out = "";
@@ -1979,9 +1979,9 @@ function fitDisplay(value, maxWidth) {
   return `${out}${suffix}`;
 }
 
-function padDisplay(value, width) {
+function padPanelDisplay(value, width) {
   const fitted = fitDisplay(value, width);
-  return `${fitted}${" ".repeat(Math.max(0, width - displayWidth(fitted)))}`;
+  return `${fitted}${" ".repeat(Math.max(0, width - panelDisplayWidth(fitted)))}`;
 }
 
 function settingsPanelRows(draft) {
@@ -2011,7 +2011,7 @@ function renderSettingsPanel(draft, selectedIndex, dirty, notice) {
   const lines = [];
   const hitRows = [];
   const rows = settingsPanelRows(draft);
-  const inside = (text, style = "") => `${style}|${padDisplay(text, innerWidth)}|${ANSI.reset}`;
+  const inside = (text, style = "") => `${style}|${padPanelDisplay(text, innerWidth)}|${ANSI.reset}`;
 
   lines.push(`${ANSI.bold}${ANSI.title}${border}${ANSI.reset}`);
   lines.push(inside(`  ARCA DOS 설정 패널${dirty ? "  * 저장 안 됨" : ""}`, ANSI.bold + ANSI.title));
