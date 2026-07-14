@@ -233,7 +233,17 @@ export default function ChatArea(props: {
 
   const settingsUiMode = props.settingsUiMode ?? "inline";
 
-  const [chatId, setChatId] = useState<string>("");
+  const [chatId, setChatIdState] = useState<string>("");
+  // 채팅 전환 직전에 이전 히스토리 요청이 늦게 끝나더라도 새 채팅 화면을 덮어쓰지 못하게 한다.
+  // state 반영을 기다리지 않고 즉시 세대를 올려, 같은 이벤트 루프에서 완료되는 이전 요청도 차단한다.
+  const activeChatIdRef = useRef<string>("");
+  const chatContextGenerationRef = useRef(0);
+  const setChatId = useCallback((nextChatId: string) => {
+    const next = String(nextChatId || "");
+    activeChatIdRef.current = next;
+    chatContextGenerationRef.current += 1;
+    setChatIdState(next);
+  }, []);
   useEffect(() => {
     if (props.onChatIdChange) props.onChatIdChange(chatId);
   }, [chatId, props.onChatIdChange]);
@@ -1003,6 +1013,9 @@ const loadOlder = useCallback(async () => {
     if (loadingOlder) return;
     if (!hasMoreOlder) return;
 
+    const targetChatId = chatId;
+    const targetGeneration = chatContextGenerationRef.current;
+
     const before = oldestCreatedAtRef.current;
     if (before == null) return;
 
@@ -1019,6 +1032,10 @@ const loadOlder = useCallback(async () => {
       );
       const json = await safeJson(res);
       if (!res.ok) throw new Error(json?.error || "이전 내용 불러오기 실패");
+      if (
+        activeChatIdRef.current !== targetChatId ||
+        chatContextGenerationRef.current !== targetGeneration
+      ) return;
 
       const page: Msg[] = Array.isArray(json?.messages) ? (json.messages as Msg[]) : [];
       const nextHasMore = !!json?.hasMoreOlder;
@@ -1078,6 +1095,9 @@ const loadOlder = useCallback(async () => {
     if (loadingNewer) return;
     if (!hasMoreNewer) return;
 
+    const targetChatId = chatId;
+    const targetGeneration = chatContextGenerationRef.current;
+
     const after = newestCreatedAtRef.current;
     if (after == null) return;
 
@@ -1090,6 +1110,10 @@ const loadOlder = useCallback(async () => {
       );
       const json = await safeJson(res);
       if (!res.ok) throw new Error(json?.error || "다음 내용 불러오기 실패");
+      if (
+        activeChatIdRef.current !== targetChatId ||
+        chatContextGenerationRef.current !== targetGeneration
+      ) return;
 
       const page: Msg[] = Array.isArray(json?.messages) ? (json.messages as Msg[]) : [];
       const nextHasMore = !!json?.hasMoreNewer;
@@ -4032,11 +4056,16 @@ return (
   }
 
   async function loadHistory(targetChatId: string) {
+    const targetGeneration = chatContextGenerationRef.current;
     const res = await fetch(
       `/api/chat/history?chatId=${encodeURIComponent(targetChatId)}&limit=${HISTORY_INITIAL_PAGE_SIZE}&includeUsage=0`
     );
     const json = await safeJson(res);
     if (!res.ok) throw new Error(json?.error || "히스토리 불러오기 실패");
+    if (
+      activeChatIdRef.current !== targetChatId ||
+      chatContextGenerationRef.current !== targetGeneration
+    ) return;
     const msgs: Msg[] = Array.isArray(json?.messages) ? (json.messages as Msg[]) : [];
     setMessages(msgs);
     oldestCreatedAtRef.current = (msgs[0] as any)?.createdAt ?? null;
@@ -4052,9 +4081,14 @@ return (
 
 
   async function loadSettings(targetChatId: string) {
+    const targetGeneration = chatContextGenerationRef.current;
     const res = await fetch(`/api/chat/settings?chatId=${encodeURIComponent(targetChatId)}`);
     const json = await safeJson(res);
     if (!res.ok) throw new Error(json?.error || "설정 불러오기 실패");
+    if (
+      activeChatIdRef.current !== targetChatId ||
+      chatContextGenerationRef.current !== targetGeneration
+    ) return;
     const s = json.settings as any;
     s.model = coerceChatModelId(String(s?.model || ""));
     // 기본 모드: 소설 (채팅 모드 임시 비활성화)
@@ -5560,6 +5594,7 @@ const insertNarrationMarkers = useCallback(() => {
 
   // 프리셋 변경되면: 채팅 컨텍스트 초기화(고정 문제 방지)
   useEffect(() => {
+    let cancelled = false;
     // 프리셋 바뀌면: 해당 프리셋의 최근 채팅을 자동으로 불러오고(이어하기),
     // 없으면 새로 만들기 상태로 둔다.
     setMessages([]);
@@ -5599,15 +5634,20 @@ const insertNarrationMarkers = useCallback(() => {
         const res = await fetch(`/api/chat/latest?presetId=${encodeURIComponent(presetId)}`);
         const json = await safeJson(res);
         if (!res.ok) throw new Error(json?.error || "최근 채팅 조회 실패");
+        if (cancelled) return;
         if (json?.chat) {
           setChatId(json.chat.id);
         } else {
           setChatId("");
         }
       } catch {
+        if (cancelled) return;
         setChatId("");
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [presetId, consumeForceNewChatFlag, consumeForceOpenChatId]);
 
   const rootViewportHeight = isMobile && viewportHeightPx > 0 ? `${viewportHeightPx}px` : "100dvh";
