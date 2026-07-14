@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { generateText } from "@/lib/ai";
+import {
+  analyzeRelationshipCorrectionDrift,
+  buildRelationshipCorrectionGuidance,
+} from "@/lib/relationship_memory";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
 type MsgRow = {
@@ -309,6 +313,9 @@ export async function POST(req: Request) {
       "Registered characters are memory targets, but a name mention, presence, action, or reaction alone is not a saved encounter.",
       "Save a character only when the persona and that character directly exchange dialogue in this exact turn.",
       "The ledger is chronological. Each saved item describes only the current turn and must not mix events from other turns.",
+      "Every registered character is an isolated memory owner. Never copy a relationship, title, promise, emotion, or dialogue style from another character.",
+      "A title used by one character never becomes a title that another character may use.",
+      "If the persona corrects or denies a relationship/title, that correction overrides the assistant response and must remain negated.",
       "Write summaries in Korean casual banmal ending with forms like ~했어, ~하고 있어, ~보였어. Do not use formal endings like ~합니다, ~했습니다, ~습니다.",
       `The persona/user/player name is "${personaName}". Always refer to the persona as "${personaName}", never as 사용자, 주인공, or 플레이어.`,
       `Focus only on direct conversation between ${personaName} and the character, because this memory will be used later to remember their shared history.`,
@@ -332,6 +339,9 @@ export async function POST(req: Request) {
       "- For saved characters, summarize THIS TURN ONLY and focus on the direct dialogue exchange with the user/player.",
       `- In summary/evidence, write the persona as "${personaName}". Do not write 사용자, 주인공, or 플레이어.`,
       `- Prioritize: what ${personaName} did to or with the character, what the character said/did back, emotional residue toward ${personaName}, relationship change, unresolved tension.`,
+      "- Keep each character's relationship and titles local to that character's JSON item; never borrow them from another registered character.",
+      "- A latest persona correction outranks contradictory wording in the assistant response.",
+      buildRelationshipCorrectionGuidance(sceneText),
       "- Include the turn's order implicitly by writing it as a result of this exact turn; do not imply a later turn happened before an earlier turn.",
       "- The summary must be exactly ONE Korean casual banmal sentence, no second sentence, and should naturally end in banmal such as ~했어/~있어/~보였어.",
       "- Avoid formal endings like 합니다/했습니다/습니다 and avoid detached report endings like 함/했다 when possible.",
@@ -386,6 +396,8 @@ export async function POST(req: Request) {
 
         const summary = oneSentenceSummary(item?.summary, personaName);
         if (!summary) continue;
+        const relationshipDrift = analyzeRelationshipCorrectionDrift(sceneText, summary);
+        if (!relationshipDrift.ok) continue;
         const evidence = cleanText(replaceGenericPersonaRefs(item?.evidence, personaName), 500);
         const name = String(row?.name || "").trim();
 

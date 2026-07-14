@@ -8,6 +8,10 @@ import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { DEFAULT_CHAT_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
 
 import { stripUrlsAndMediaMarkdown } from "@/lib/memory_sanitize";
+import {
+  buildRelationshipCorrectionGuidance,
+  findFocusedCharacterIds,
+} from "@/lib/relationship_memory";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -487,7 +491,7 @@ function parseLorebooksCached(raw: string): any[] {
   return arr;
 }
 
-function buildManualCharacterRosterBlock(chatIdRaw: string) {
+function buildManualCharacterRosterBlock(chatIdRaw: string, focusTextRaw = "") {
   const chatId = String(chatIdRaw || "").trim();
   if (!chatId) return "";
 
@@ -511,13 +515,42 @@ function buildManualCharacterRosterBlock(chatIdRaw: string) {
     )
     .all(chatId) as any[];
 
+  const scopeRows = rows.map((row) => ({
+    id: String(row?.id || ""),
+    name: String(row?.name || ""),
+    aliases: decryptIfPossible(String(row?.aliases || "")),
+  }));
+  const focusedIds = findFocusedCharacterIds(scopeRows, focusTextRaw);
+
+  // 이름이 생략된 턴은 가장 최근에 실제 대화를 나눈 캐릭터를 장면 인물로 본다.
+  // 모든 캐릭터의 상세 로그를 한꺼번에 넣으면 한 인물의 관계/호칭이 다른 인물로 번지기 쉽다.
+  if (focusedIds.size === 0) {
+    const latestRows = db
+      .prepare(
+        `SELECT rosterId, MAX(turnNo) AS latestTurn
+         FROM chat_character_turn_memories
+         WHERE chatId=?
+         GROUP BY rosterId
+         ORDER BY latestTurn DESC`
+      )
+      .all(chatId) as Array<{ rosterId: string; latestTurn: number }>;
+    const latestTurn = Math.max(0, Number(latestRows[0]?.latestTurn || 0));
+    for (const row of latestRows) {
+      if (Number(row?.latestTurn || 0) !== latestTurn) break;
+      if (latestTurn > 0) focusedIds.add(String(row?.rosterId || ""));
+    }
+  }
+  if (focusedIds.size === 0 && rows.length === 1) focusedIds.add(String(rows[0]?.id || ""));
+
+  const detailedRows = rows.filter((row) => focusedIds.has(String(row?.id || "")));
+
   // (최적화) 기존엔 캐릭터마다 chat_character_turn_memories를 따로 조회하던 N+1을
   // 하나의 IN 쿼리로 합친다. 각 캐릭터의 첫 만남 1개와 최신 기억 12개만 유지한다.
   // 오래 대화한 캐릭터가 과거 80개에 잘려 최근 일을 전혀 기억하지 못하던 문제를 막는다.
   const memoriesByRoster = new Map<string, any[]>();
   {
     const rosterIds: string[] = [];
-    for (const r of rows) {
+    for (const r of detailedRows) {
       const rid = String(r?.id || "").trim();
       if (rid) rosterIds.push(rid);
     }
@@ -552,7 +585,7 @@ function buildManualCharacterRosterBlock(chatIdRaw: string) {
   }
 
   const lines: string[] = [];
-  for (const row of rows) {
+  for (const row of detailedRows) {
     const name = String(row?.name || "").trim();
     if (!name) continue;
     const aliases = decryptIfPossible(String(row?.aliases || "")).trim();
@@ -585,17 +618,25 @@ function buildManualCharacterRosterBlock(chatIdRaw: string) {
     lines.push(item.join("\n"));
   }
 
-  if (!lines.length) return "";
+  const inactiveNames = rows
+    .filter((row) => !focusedIds.has(String(row?.id || "")))
+    .map((row) => String(row?.name || "").trim())
+    .filter(Boolean);
+  if (!lines.length && !inactiveNames.length) return "";
   const body = lines.join("\n\n").slice(0, 6000);
   return [
     "# (2-C) manual character registry",
     "- These are user-pinned characters to remember across the chat.",
-    "- Do not treat registered characters as strangers unless their note says so.",
-    "- Preserve relationship, dialogue distance, emotional residue, unresolved conflicts, promises, and aliases.",
+    "- Detailed encounter logs below belong only to the character under the same ## heading.",
+    "- Never transfer a relationship, title, promise, emotion, or dialogue style from one character heading to another.",
+    "- A title used by one character does not authorize any other character to use it.",
+    "- Preserve relationship, dialogue distance, emotional residue, unresolved conflicts, promises, and aliases only for that same character.",
     "- Encounter logs are ordered by turn number from oldest to newest; treat later turn numbers as happening after earlier turn numbers.",
     `- The persona name is "${personaName}". Do not refer to the persona as 사용자, 주인공, or 플레이어 in character memory.`,
     `- Use the encounter logs mainly to remember what happened between ${personaName} and each character.`,
+    detailedRows.length ? `- Current-scene detailed characters: ${detailedRows.map((row) => row.name).join(", ")}` : "",
     body,
+    inactiveNames.length ? `- Other registered but currently inactive characters (names only): ${inactiveNames.join(", ")}` : "",
   ].join("\n");
 }
 
@@ -1582,7 +1623,11 @@ ${body}`.trim();
         : null;
     const relatedArchiveText =
       hybridMemory.relatedArchiveText || String(legacyRelatedMemory?.blockText || "").trim();
-    const manualCharacterRosterBlock = buildManualCharacterRosterBlock(cid);
+    const characterFocusText = [
+      userText,
+      ...tail.slice(-4).map((m: any) => String(m?.content || "")),
+    ].join("\n");
+    const manualCharacterRosterBlock = buildManualCharacterRosterBlock(cid, characterFocusText);
     const historySummaryForPrompt = [
       hybridMemory.currentArcText,
       relatedArchiveText,
@@ -1613,11 +1658,15 @@ ${body}`.trim();
     const relationshipConsistencyBlock = [
       `# (4) 관계/호칭 연속성(중요)`,
       `- 직전 대화와 장기기억에서 굳어진 관계/호칭/말투를 유지한다.`,
+      `- 캐릭터별 관계와 호칭은 서로 독립이다. 한 캐릭터가 쓰는 호칭을 다른 캐릭터에게 복사하지 않는다.`,
+      `- 장기기억이나 캐릭터 기록의 ## 이름 경계를 절대 넘지 않는다. 각 항목은 해당 이름의 인물에게만 적용한다.`,
       `- 같은 인물을 한 답변 안에서 서로 다른 호칭으로 섞지 않는다. (예: "오빠/선배/야" 혼용 금지)`,
       `- 사용자가 "앞으로 ~라고 불러"처럼 명시적으로 바꾸기 전에는 호칭을 임의 변경하지 않는다.`,
+      `- 사용자가 관계나 호칭을 부정·정정하면 그 최신 정정이 이전 어시스턴트 대사와 모든 기억보다 우선한다.`,
       `- 호칭이 불확실하면 새 호칭을 만들지 말고, 호칭 없이 자연스럽게 반응한다.`,
       `- 존댓말/반말 톤은 한 답변 안에서 흔들지 말고 일관되게 유지한다.`,
-    ].join("\n");
+      buildRelationshipCorrectionGuidance(userText),
+    ].filter(Boolean).join("\n");
 
     // NOTE: 출력길이 슬라이더(런타임)가 즉시 반영되도록 opts(maxOutputTokens)를 우선 사용한다.
     // (DB settings.maxOutputTokens는 '저장'된 값이고, 런타임 슬라이더는 body.runtime으로 넘어옴)

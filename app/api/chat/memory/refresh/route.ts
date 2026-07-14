@@ -5,6 +5,10 @@ import { db } from "@/lib/db";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { generateText, summarizeLongMemoryKorean, summarizeLongMemorySectionKorean } from "@/lib/ai";
 import { LONG_MEMORY_SUMMARY_RULES, stripUrlsAndMediaMarkdown } from "@/lib/memory_sanitize";
+import {
+  analyzeRelationshipCorrectionDrift,
+  buildRelationshipCorrectionGuidance,
+} from "@/lib/relationship_memory";
 
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
@@ -782,7 +786,10 @@ export async function POST(req: Request) {
       ? `- (필수) 인명은 [${sourceNameList.join(", ")}] 목록에서만 사용. 목록에 없는 새 인명 생성 금지.`
       : "- (필수) 대화에 없는 새 인명 생성 금지.";
 
-    const baseGuidance = [LONG_MEMORY_SUMMARY_RULES, nameLockGuidance].join("\n");
+    const relationshipCorrectionGuidance = buildRelationshipCorrectionGuidance(cleanedText);
+    const baseGuidance = [LONG_MEMORY_SUMMARY_RULES, relationshipCorrectionGuidance, nameLockGuidance]
+      .filter(Boolean)
+      .join("\n");
     const strictGuidance = [
       baseGuidance,
       "- (필수) 본문에 영어(알파벳 A-Z,a-z) 사용 금지. 'thought', 'Characters:', 'Setting:' 같은 영어 라벨 금지.",
@@ -816,9 +823,10 @@ export async function POST(req: Request) {
     let norm = normalizeSection(sectionRaw);
     let q = analyzeLongMemoryBody(norm.body);
     let ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
+    let relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
 
     // 2) retry with stricter prompt and without model downshift (more reliable, higher cost, rare)
-    if (!q.ok || !ndrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -837,10 +845,11 @@ export async function POST(req: Request) {
       norm = normalizeSection(sectionRaw);
       q = analyzeLongMemoryBody(norm.body);
       ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
+      relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
     }
 
     // 3) last-resort: fallback summarizer (body-only) then wrap into a section.
-    if (!q.ok || !ndrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -858,11 +867,12 @@ export async function POST(req: Request) {
       norm = normalizeSection(sectionRaw);
       q = analyzeLongMemoryBody(norm.body);
       ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
+      relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
     }
 
     // 4) optional rescue pass: only when LONG_MEMORY_SUMMARY_FALLBACK_MODEL is explicitly set.
     // Default policy is flash-only (no automatic model bounce).
-    if (!q.ok || !ndrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok) {
       const fallbackModel = pickLongMemorySummaryFallbackModel();
       if (fallbackModel) {
         try {
@@ -885,6 +895,7 @@ export async function POST(req: Request) {
           norm = normalizeSection(sectionRaw);
           q = analyzeLongMemoryBody(norm.body);
           ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
+          relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
         } catch {
           // Keep original failure reasons and let bad_output path handle.
         }
@@ -893,6 +904,20 @@ export async function POST(req: Request) {
 
     let forcedBadOutputSaved = false;
     let sectionRawForStore = String(sectionRaw || "");
+
+    // A relationship correction conflict is semantic corruption, not a formatting defect.
+    // Never save it even when the debug-only bad-output override is enabled.
+    if (!relationshipDrift.ok) {
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: "relationship_correction_conflict",
+        windowStartTurn,
+        windowEndTurn,
+        boundaryEndTurn,
+        relationshipDrift,
+      });
+    }
 
     if (!q.ok || !ndrift.ok) {
       if (!allowBadOutputSave) {
@@ -906,6 +931,7 @@ export async function POST(req: Request) {
           boundaryEndTurn,
           quality: q,
           nameDrift: ndrift,
+          relationshipDrift,
           repairing: Boolean(repair),
           repairRange: repair ? { startTurn: repair.startTurn, endTurn: repair.endTurn, title: repair.title } : null,
         });
@@ -1064,6 +1090,7 @@ export async function POST(req: Request) {
         forcedBadOutputSaved,
         quality: q,
         nameDrift: ndrift,
+        relationshipDrift,
         sourceSig: sourceSig1,
       },
       now,
@@ -1200,6 +1227,7 @@ export async function POST(req: Request) {
       forcedBadOutputSaved,
       quality: q,
       nameDrift: ndrift,
+      relationshipDrift,
       memoryBlocksBackfilled,
       autoCharactersAdded,
       autoCharactersBackfilled,
