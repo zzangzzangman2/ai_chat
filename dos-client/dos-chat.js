@@ -189,6 +189,8 @@ function installPromptShortcuts(rl) {
       requestPromptShortcut("delete");
     } else if (key && key.ctrl && key.name === "c") {
       requestPromptShortcut("back");
+    } else if ((key && key.name === "f2") || str === "\x1bOQ" || str === "\x1b[12~") {
+      requestPromptShortcut("settings");
     }
   };
   process.stdin.on("keypress", onKeypress);
@@ -643,7 +645,10 @@ function colorNovelText(text, options = {}) {
   const src = String(text || "");
   if (!src) return "";
   const lines = src.split("\n");
-  let inMetaBlock = false;
+  // (스트리밍 2026-07) options.state = { narr: {inNarration}, inMetaBlock } 를 넘기면
+  // 여러 번 나눠 호출해도(델타 flush 단위) 색상 상태가 이어진다. 미전달 시 기존과 동일.
+  const externalState = options.state && typeof options.state === "object" ? options.state : null;
+  let inMetaBlock = externalState ? Boolean(externalState.inMetaBlock) : false;
   const defaultPlainNarration = options.defaultPlainNarration !== false;
   // Windows Terminal (cmd profile, conhost ConPTY) + 와이드 이모지(💖 등)가 인접 줄에 연속으로 오면
   // cursor advance 계산이 어긋나 다음 줄 첫 셀이 클리핑되는 알려진 버그가 있다.
@@ -655,7 +660,8 @@ function colorNovelText(text, options = {}) {
   // 기존엔 colorNovelInline이 라인별로 호출되며 inNarration이 라인 내부에서만 유지돼,
   // *...로 열고 다음 줄에서 *로 닫는 지문은 첫 줄만 회색, 다음 줄은 흰색으로 나왔음.
   // → narrState 객체를 라인 간 공유해서 *가 줄을 가로질러도 narration 색이 유지되게 함.
-  const narrState = { inNarration: false };
+  // (스트리밍) externalState.narr가 있으면 그것을 그대로 써서 호출 간에도 유지.
+  const narrState = externalState && externalState.narr ? externalState.narr : { inNarration: false };
   const looksLikeDialogueLine = (line) => {
     const s = String(line || "").trimStart();
     if (!s) return false;
@@ -692,7 +698,7 @@ function colorNovelText(text, options = {}) {
     if (/^[!/][^\s]+/.test(s)) return false;
     return true;
   };
-  return lines
+  const renderedLines = lines
     .map((line) => {
       if (/^ㅁ(?:\s|$)/.test(line)) {
         inMetaBlock = true;
@@ -725,6 +731,8 @@ function colorNovelText(text, options = {}) {
       return colorNovelInline(line, narrState);
     })
     .join("\n");
+  if (externalState) externalState.inMetaBlock = inMetaBlock;
+  return renderedLines;
 }
 
 function colorNovelInline(text, state) {
@@ -778,6 +786,200 @@ function colorNovelInline(text, state) {
   flush();
   if (state) state.inNarration = inNarration;
   return out;
+}
+
+// ── 스트리밍 렌더러 (2026-07, gemini-3-pro 실시간 delta 복구 대응) ──────────────
+// textOnly()의 fence(```)→"ㅁ 라벨" 변환과 colorNovelText()의 색상 상태는
+// "완결된 블록/줄" 전제라서, 델타 조각을 그대로 넘기면 화면이 깨진다.
+// 원칙:
+//  - 완결된 줄 단위로만 출력한다 (마지막 미완 줄은 다음 델타까지 보류)
+//  - 여는 fence(```)를 만나면 닫힐 때까지 블록 전체를 보류했다가 한 번에 출력한다
+//    (서버가 metaFenceMaxChars로 fence 크기를 캡하므로 보류량은 유한)
+//  - 색상 상태(지문 * / 메타 블록)는 colorState로 flush 간 유지한다
+//  - finish() 시 남은 보류분을 전부 출력한다 (미닫힘 fence는 textOnly 안전망이 정리)
+function createStreamRenderer(write) {
+  const colorState = { narr: { inNarration: false }, inMetaBlock: false };
+  let pending = "";
+  let printed = "";
+
+  const isFenceLine = (line) => /^[ \t]*```/.test(line);
+
+  // pending 중 "지금 안전하게 렌더링 가능한 프리픽스 길이"를 구한다.
+  const flushableLen = () => {
+    const lastNl = pending.lastIndexOf("\n");
+    if (lastNl < 0) return 0; // 완결된 줄이 아직 없음
+    const complete = pending.slice(0, lastNl + 1);
+    const lines = complete.split("\n"); // 마지막 원소는 "" (trailing \n)
+    let offset = 0;
+    let open = false;
+    let fenceOpenAt = -1;
+    for (let i = 0; i < lines.length - 1; i += 1) {
+      const line = lines[i];
+      if (isFenceLine(line)) {
+        if (!open) {
+          open = true;
+          fenceOpenAt = offset;
+        } else {
+          open = false;
+          fenceOpenAt = -1;
+        }
+      }
+      offset += line.length + 1;
+    }
+    return open ? fenceOpenAt : complete.length;
+  };
+
+  const emit = (chunk) => {
+    if (!chunk) return;
+    const cleaned = textOnly(chunk, { trim: false });
+    if (!cleaned) return;
+    const rendered = colorNovelText(cleaned, { state: colorState });
+    if (!rendered) return;
+    printed += cleaned;
+    write(rendered);
+  };
+
+  return {
+    push(text) {
+      pending += String(text || "");
+      const n = flushableLen();
+      if (n > 0) {
+        const chunk = pending.slice(0, n);
+        pending = pending.slice(n);
+        emit(chunk);
+      }
+    },
+    finish() {
+      if (!pending) return;
+      const chunk = pending;
+      pending = "";
+      emit(chunk);
+    },
+    printedText() {
+      return printed;
+    },
+  };
+}
+
+// ── 터미널 페이서 (2026-07) ──────────────────────────────────────────────
+// 웹 UI의 stream pacer와 동일 컨셉: 모델/서버가 델타를 묶음(문단)으로 뱉어도
+// 화면엔 일정 속도(≈초당 375자)로 몇 글자씩 흘려보내 자연스러운 타이핑 체감을 만든다.
+// - ANSI 이스케이프 시퀀스는 통짜 1유닛(가시 폭 0)으로 취급해 중간에서 쪼개지 않는다
+// - 스트리밍 중엔 약간의 잔량(backlog)을 유지해 "멈췄다 쏟아짐"을 완화
+// - 델타가 IDLE_FLUSH_MS 이상 끊기면 잔량 제한을 풀고 빠르게 소진
+function createTerminalPacer(writeOut) {
+  const PACE_MS = 16; // ≈60fps
+  const CHARS_PER_TICK = 6; // 6ch/16ms ≈ 375 chars/sec (웹 pacer와 동일 체감)
+  const TARGET_BACKLOG = 120; // 스트리밍 중 버퍼 고갈(뚝뚝 끊김) 방지용 최소 잔량
+  const IDLE_FLUSH_MS = 300;
+
+  const units = []; // 각 원소 = 가시 문자 1개 또는 ANSI 시퀀스 1개
+  let timer = null;
+  let lastPushAt = 0;
+  let emittedAny = false;
+  let firstEmitCb = null;
+
+  const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
+  const tokenize = (s) => {
+    let i = 0;
+    let m;
+    ANSI_RE.lastIndex = 0;
+    while ((m = ANSI_RE.exec(s))) {
+      for (const ch of s.slice(i, m.index)) units.push(ch);
+      units.push(m[0]);
+      i = m.index + m[0].length;
+    }
+    for (const ch of s.slice(i)) units.push(ch);
+  };
+
+  const visibleCount = () => {
+    let n = 0;
+    for (const u of units) if (!(u.length > 1 && u.charCodeAt(0) === 27)) n += 1;
+    return n;
+  };
+
+  const emitUnits = (nVisible) => {
+    if (!units.length || nVisible <= 0) return;
+    let out = "";
+    let vis = 0;
+    while (units.length && vis < nVisible) {
+      const u = units.shift();
+      out += u;
+      if (!(u.length > 1 && u.charCodeAt(0) === 27)) vis += 1;
+    }
+    // 뒤따르는 이스케이프(리셋 등)는 같은 write에 실어 색이 다음 틱으로 밀리지 않게 한다
+    while (units.length && units[0].length > 1 && units[0].charCodeAt(0) === 27) out += units.shift();
+    if (out) {
+      if (!emittedAny) {
+        emittedAny = true;
+        try {
+          firstEmitCb && firstEmitCb();
+        } catch {}
+      }
+      writeOut(out);
+    }
+  };
+
+  const tick = () => {
+    if (!units.length) {
+      // 큐가 비면 타이머 정지 (push 시 재가동)
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      return;
+    }
+    const idle = lastPushAt > 0 && Date.now() - lastPushAt >= IDLE_FLUSH_MS;
+    if (idle) {
+      emitUnits(CHARS_PER_TICK * 5); // 델타 공백: 잔량 빠르게 소진 (≈1875 chars/sec)
+      return;
+    }
+    // (튜닝 2026-07) 3 Pro는 thinking 후 본문을 몰아서 뱉는다(모델 자체 ≈500자/초).
+    // 페이서가 그보다 느리면 "다 나온 걸 붙잡고 늘어지는" 체감이 되므로,
+    // 잔량이 클수록 공격적으로 따라잡아 총 표시시간이 one-shot 대비 거의 늘지 않게 한다.
+    const vis = visibleCount();
+    if (vis > TARGET_BACKLOG * 8) emitUnits(CHARS_PER_TICK * 5); // >960: ≈1875 chars/sec (폭주 따라잡기)
+    else if (vis > TARGET_BACKLOG * 4) emitUnits(CHARS_PER_TICK * 3); // >480: ≈1125 chars/sec
+    else if (vis > TARGET_BACKLOG) emitUnits(CHARS_PER_TICK * 1.5); // >120: ≈560 chars/sec (모델 생산속도와 비슷)
+    else emitUnits(3); // 잔량 적음: 아껴 쓰며 버퍼 고갈 방지 (≈190 chars/sec)
+  };
+
+  const ensureTimer = () => {
+    if (!timer) timer = setInterval(tick, PACE_MS);
+  };
+
+  return {
+    onFirstEmit(cb) {
+      firstEmitCb = cb;
+    },
+    push(s) {
+      const str = String(s || "");
+      if (!str) return;
+      tokenize(str);
+      lastPushAt = Date.now();
+      ensureTimer();
+    },
+    // done 이후: 남은 잔량을 "빠른 타이핑" 속도로 마저 흘려보낸다 (통짜 덤프 방지)
+    async drain() {
+      while (units.length) {
+        emitUnits(CHARS_PER_TICK * 6); // ≈2250 chars/sec — 완료 후 꼬리는 즉시 수준으로
+        if (!units.length) break;
+        await new Promise((r) => setTimeout(r, PACE_MS));
+      }
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+    // 취소/에러: 즉시 정지 (잔량 파기)
+    stop() {
+      units.length = 0;
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+  };
 }
 
 function colorLine(text, color) {
@@ -1631,6 +1833,285 @@ async function chooseModelSetting(arg, rl) {
   await updateSetting("model", picked);
 }
 
+function terminalCharWidth(ch) {
+  const cp = String(ch || "").codePointAt(0) || 0;
+  if (cp === 0 || cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+  if (
+    cp >= 0x1100 &&
+    (cp <= 0x115f ||
+      cp === 0x2329 ||
+      cp === 0x232a ||
+      (cp >= 0x2e80 && cp <= 0xa4cf) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xfe10 && cp <= 0xfe6f) ||
+      (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0x1f300 && cp <= 0x1faff))
+  ) return 2;
+  return 1;
+}
+
+function displayWidth(value) {
+  return Array.from(String(value || "")).reduce((sum, ch) => sum + terminalCharWidth(ch), 0);
+}
+
+function fitDisplay(value, maxWidth) {
+  const text = String(value || "");
+  if (displayWidth(text) <= maxWidth) return text;
+  const suffix = "...";
+  const target = Math.max(0, maxWidth - suffix.length);
+  let out = "";
+  let width = 0;
+  for (const ch of Array.from(text)) {
+    const next = terminalCharWidth(ch);
+    if (width + next > target) break;
+    out += ch;
+    width += next;
+  }
+  return `${out}${suffix}`;
+}
+
+function padDisplay(value, width) {
+  const fitted = fitDisplay(value, width);
+  return `${fitted}${" ".repeat(Math.max(0, width - displayWidth(fitted)))}`;
+}
+
+function settingsPanelRows(draft) {
+  const modelLabel = MODEL_OPTIONS.find((item) => item.id === draft.model)?.label || draft.model || "-";
+  const outputLevel = inferLevel(OUTPUT_PRESETS, draft.maxOutputTokens);
+  const reasoningPresets = getReasoningPresets(draft.model);
+  const reasoningLevel = inferLevel(reasoningPresets, draft.maxReasoningTokens);
+  return [
+    { key: "model", group: "AI 응답", label: "모델", value: modelLabel, kind: "choice" },
+    { key: "maxOutputTokens", group: "AI 응답", label: "출력 길이", value: `${LEVEL_LABEL[outputLevel]} (${OUTPUT_PRESETS[outputLevel]}자)`, kind: "choice" },
+    { key: "maxReasoningTokens", group: "AI 응답", label: "추론", value: `${reasoningLevelLabel(draft.model, reasoningLevel)} (${reasoningPresets[reasoningLevel]} 토큰)`, kind: "choice" },
+    { key: "personaName", group: "페르소나", label: "이름", value: draft.personaName || (draft._personaDisplayName ? `${draft._personaDisplayName} (기본)` : "(미지정)"), kind: "text" },
+    { key: "personaAge", group: "페르소나", label: "나이", value: Number(draft.personaAge) > 0 ? String(draft.personaAge) : "(미지정)", kind: "number" },
+    { key: "personaGender", group: "페르소나", label: "성별", value: draft.personaGender || "(미지정)", kind: "choice" },
+    { key: "personaInfo", group: "페르소나", label: "상세 정보", value: oneLine(draft.personaInfo || "(미지정)", 80), kind: "text" },
+    { key: "userNote", group: "추가 지시", label: "유저 노트", value: oneLine(draft.userNote || "(없음)", 80), kind: "text" },
+    { key: "save", group: "완료", label: "저장", value: "변경사항 적용", kind: "save" },
+    { key: "cancel", group: "완료", label: "취소", value: "변경사항 버리기", kind: "cancel" },
+  ];
+}
+
+function renderSettingsPanel(draft, selectedIndex, dirty, notice) {
+  clearScreen();
+  const width = Math.max(48, Math.min(96, Number(process.stdout.columns || 80)));
+  const innerWidth = width - 2;
+  const border = `+${"-".repeat(innerWidth)}+`;
+  const lines = [];
+  const hitRows = [];
+  const rows = settingsPanelRows(draft);
+  const inside = (text, style = "") => `${style}|${padDisplay(text, innerWidth)}|${ANSI.reset}`;
+
+  lines.push(`${ANSI.bold}${ANSI.title}${border}${ANSI.reset}`);
+  lines.push(inside(`  ARCA DOS 설정 패널${dirty ? "  * 저장 안 됨" : ""}`, ANSI.bold + ANSI.title));
+  lines.push(`${ANSI.title}${border}${ANSI.reset}`);
+
+  let lastGroup = "";
+  rows.forEach((row, index) => {
+    if (row.group !== lastGroup) {
+      if (lastGroup) lines.push(inside(""));
+      lines.push(inside(`  [${row.group}]`, ANSI.soft));
+      lastGroup = row.group;
+    }
+    const rowNo = lines.length + 1;
+    const marker = index === selectedIndex ? ">" : " ";
+    const action = row.kind === "choice" ? "[변경]" : row.kind === "save" ? "[저장]" : row.kind === "cancel" ? "[닫기]" : "[입력]";
+    const valueWidth = Math.max(16, innerWidth - 29);
+    const plain = `${marker} ${String(index + 1).padStart(2, " ")}. ${action} ${padDisplay(row.label, 11)} ${fitDisplay(row.value, valueWidth)}`;
+    const style = index === selectedIndex ? ANSI.reverse + ANSI.dialogue : ANSI.dialogue;
+    lines.push(inside(plain, style));
+    hitRows.push({ row: rowNo, index });
+  });
+
+  lines.push(`${ANSI.title}${border}${ANSI.reset}`);
+  lines.push(inside("  F2 설정  |  방향키 이동  |  Enter/클릭 수정  |  S 저장  |  Esc 닫기", ANSI.gray));
+  if (notice) lines.push(inside(`  ${fitDisplay(notice, innerWidth - 4)}`, ANSI.soft));
+  lines.push(`${ANSI.bold}${ANSI.title}${border}${ANSI.reset}`);
+  process.stdout.write(`${ANSI.hideCursor}${lines.join("\n")}\n`);
+  return { rows, hitRows };
+}
+
+async function chooseSettingsPanelAction(rl, draft, selectedIndex, dirty, notice) {
+  if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+    return { type: "cancel", selectedIndex };
+  }
+
+  return await new Promise((resolve) => {
+    const stdin = process.stdin;
+    const wasRaw = stdin.isRaw;
+    let rendered = null;
+    let currentIndex = Math.max(0, Math.min(settingsPanelRows(draft).length - 1, selectedIndex));
+    const render = () => {
+      rendered = renderSettingsPanel(draft, currentIndex, dirty, notice);
+    };
+    const cleanup = (result) => {
+      stdin.off("data", onData);
+      process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}`);
+      try { stdin.setRawMode(Boolean(wasRaw)); } catch {}
+      try { rl?.resume?.(); } catch {}
+      resolve({ ...result, selectedIndex: currentIndex });
+    };
+    const activate = (direction = 1) => {
+      const row = rendered?.rows?.[currentIndex];
+      if (!row) return;
+      if (row.kind === "save") cleanup({ type: "save" });
+      else if (row.kind === "cancel") cleanup({ type: "cancel" });
+      else cleanup({ type: "edit", row, direction });
+    };
+    const onData = (buf) => {
+      const s = buf.toString("utf8");
+      if (s === "\u0003" || s === "q" || s === "Q" || s === "\x1b") return cleanup({ type: "cancel" });
+      if (s === "s" || s === "S") return cleanup({ type: "save" });
+      const mouse = parseMouseSgr(s);
+      if (mouse) {
+        const hit = rendered?.hitRows?.find((item) => item.row === mouse.row);
+        if (hit) {
+          currentIndex = hit.index;
+          activate(1);
+        }
+        return;
+      }
+      if (s === "\x1b[A") {
+        currentIndex = (currentIndex - 1 + rendered.rows.length) % rendered.rows.length;
+        render();
+      } else if (s === "\x1b[B" || s === "\t") {
+        currentIndex = (currentIndex + 1) % rendered.rows.length;
+        render();
+      } else if (s === "\x1b[D") {
+        activate(-1);
+      } else if (s === "\x1b[C" || s === "\r" || s === "\n") {
+        activate(1);
+      }
+    };
+
+    try { rl?.pause?.(); } catch {}
+    stdin.setRawMode(true);
+    stdin.resume();
+    process.stdout.write(ANSI.mouseOn);
+    render();
+    stdin.on("data", onData);
+  });
+}
+
+function cycleSettingsPanelValue(draft, row, direction) {
+  const step = direction < 0 ? -1 : 1;
+  if (row.key === "model") {
+    const currentModel = String(draft.model || "");
+    const oldPresets = getReasoningPresets(currentModel);
+    const oldLevel = inferLevel(oldPresets, draft.maxReasoningTokens);
+    const index = Math.max(0, MODEL_OPTIONS.findIndex((item) => item.id === currentModel));
+    const nextIndex = (index + step + MODEL_OPTIONS.length) % MODEL_OPTIONS.length;
+    draft.model = MODEL_OPTIONS[nextIndex].id;
+    const nextPresets = getReasoningPresets(draft.model);
+    let nextLevel = oldLevel;
+    if (nextLevel === "zero" && !Object.prototype.hasOwnProperty.call(nextPresets, "zero")) nextLevel = "low";
+    if (nextLevel === "low" && !Object.prototype.hasOwnProperty.call(nextPresets, "low")) nextLevel = "zero";
+    draft.maxReasoningTokens = nextPresets[nextLevel] ?? Object.values(nextPresets)[0];
+    return `모델: ${MODEL_OPTIONS[nextIndex].label}`;
+  }
+  if (row.key === "maxOutputTokens") {
+    const levels = Object.keys(OUTPUT_PRESETS);
+    const current = inferLevel(OUTPUT_PRESETS, draft.maxOutputTokens);
+    const index = Math.max(0, levels.indexOf(current));
+    const next = levels[(index + step + levels.length) % levels.length];
+    draft.maxOutputTokens = OUTPUT_PRESETS[next];
+    return `출력 길이: ${LEVEL_LABEL[next]}`;
+  }
+  if (row.key === "maxReasoningTokens") {
+    const presets = getReasoningPresets(draft.model);
+    const levels = Object.keys(presets);
+    const current = inferLevel(presets, draft.maxReasoningTokens);
+    const index = Math.max(0, levels.indexOf(current));
+    const next = levels[(index + step + levels.length) % levels.length];
+    draft.maxReasoningTokens = presets[next];
+    return `추론: ${reasoningLevelLabel(draft.model, next)}`;
+  }
+  if (row.key === "personaGender") {
+    const values = ["", "남", "여"];
+    const index = Math.max(0, values.indexOf(String(draft.personaGender || "")));
+    draft.personaGender = values[(index + step + values.length) % values.length];
+    return `성별: ${draft.personaGender || "미지정"}`;
+  }
+  return "";
+}
+
+async function editSettingsPanelValue(rl, draft, row) {
+  const labels = {
+    personaName: "페르소나 이름",
+    personaAge: "나이",
+    personaInfo: "페르소나 상세 정보",
+    userNote: "유저 노트",
+  };
+  const label = labels[row.key] || row.label;
+  const current = String(draft[row.key] || "");
+  clearScreen();
+  hr(`설정 입력 - ${label}`);
+  console.log(`현재 값: ${current || "(비어 있음)"}`);
+  console.log(`${ANSI.gray}Enter는 기존 값 유지, /clear는 값 비우기${ANSI.reset}`);
+  const answer = String(await rl.question(`${label}> `) || "").trim();
+  if (!answer) return `${label}: 기존 값 유지`;
+  if (answer.toLowerCase() === "/clear") {
+    draft[row.key] = row.kind === "number" ? 0 : "";
+    return `${label}: 비움`;
+  }
+  if (row.kind === "number") {
+    const value = Number(answer);
+    if (!Number.isFinite(value) || value < 0 || value > 999) return "나이는 0~999 사이 숫자로 입력하세요.";
+    draft[row.key] = Math.floor(value);
+  } else {
+    draft[row.key] = answer;
+  }
+  return `${label}: 입력 완료`;
+}
+
+async function openSettingsPanel(rl) {
+  const st = await loadSettings({ force: true });
+  if (!st) {
+    console.log("열린 채팅이 없습니다.");
+    return;
+  }
+  const draft = { ...st, chatId: state.chatId };
+  Object.defineProperty(draft, "_personaDisplayName", {
+    value: getPromptDisplayName(),
+    enumerable: false,
+  });
+  let selectedIndex = 0;
+  let dirty = false;
+  let notice = "";
+
+  while (true) {
+    const action = await chooseSettingsPanelAction(rl, draft, selectedIndex, dirty, notice);
+    selectedIndex = action.selectedIndex;
+    if (action.type === "cancel") {
+      clearScreen();
+      console.log(dirty ? "설정 변경을 취소했습니다." : "설정 패널을 닫았습니다.");
+      return;
+    }
+    if (action.type === "save") {
+      const json = await apiJson("/api/chat/settings", {
+        method: "POST",
+        body: JSON.stringify(draft),
+      });
+      applySettings(json && json.settings ? json.settings : null);
+      clearScreen();
+      console.log("설정을 저장했습니다.");
+      await showSettings();
+      return;
+    }
+    if (action.type === "edit" && action.row) {
+      if (action.row.kind === "choice") {
+        notice = cycleSettingsPanelValue(draft, action.row, action.direction);
+      } else {
+        notice = await editSettingsPanelValue(rl, draft, action.row);
+      }
+      dirty = true;
+    }
+  }
+}
+
 async function startupPresetLauncher() {
   const presets = listPresets(30);
   state.recentPresets = presets;
@@ -2234,46 +2715,61 @@ async function postSend(text) {
   let printed = "";
 
   if (ct.includes("application/x-ndjson") && res.body && typeof res.body.getReader === "function") {
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buf += dec.decode(chunk.value, { stream: true });
-      let idx = -1;
-      while ((idx = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx + 1);
-        if (!line) continue;
-        let obj = null;
-        try {
-          obj = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (!timing.firstSignalAt) timing.firstSignalAt = Date.now();
-        if (obj.type === "delta") {
-          const out = textOnly(obj.text || "", { trim: false });
-          if (out) {
-            if (!timing.firstOutputAt) timing.firstOutputAt = Date.now();
+    // (2026-07) 서버가 gemini-3-pro 실시간 델타를 다시 보내므로,
+    // fence/색상 안전을 위해 줄·펜스 단위 게이트 렌더러로 정리한 뒤,
+    // 터미널 페이서로 몇 글자씩 흘려보내 자연스러운 타이핑 체감을 만든다.
+    // (렌더러=정확성 담당, 페이서=연출 담당)
+    const pacer = createTerminalPacer((s) => process.stdout.write(s));
+    pacer.onFirstEmit(() => {
+      if (!timing.firstOutputAt) timing.firstOutputAt = Date.now();
+      status?.stop(true);
+      status = null;
+    });
+    const renderer = createStreamRenderer((s) => pacer.push(s));
+    try {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buf += dec.decode(chunk.value, { stream: true });
+        let idx = -1;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          let obj = null;
+          try {
+            obj = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (!timing.firstSignalAt) timing.firstSignalAt = Date.now();
+          if (obj.type === "delta") {
+            renderer.push(obj.text || "");
+          } else if (obj.type === "ping") {
+            // keep-alive ping: the status line already shows elapsed time.
+          } else if (obj.type === "done") {
+            timing.doneAt = Date.now();
+            doneObj = obj;
+          } else if (obj.type === "error") {
             status?.stop(true);
             status = null;
-            process.stdout.write(colorNovelText(out));
-            printed += out;
+            throw new Error(String(obj.error || "stream error"));
           }
-        } else if (obj.type === "ping") {
-          // keep-alive ping: the status line already shows elapsed time.
-        } else if (obj.type === "done") {
-          timing.doneAt = Date.now();
-          doneObj = obj;
-        } else if (obj.type === "error") {
-          status?.stop(true);
-          status = null;
-          throw new Error(String(obj.error || "stream error"));
         }
       }
+      // 스트림 종료: 보류분(마지막 미완 줄/미닫힘 fence)을 렌더러→페이서로 넘기고,
+      // 남은 잔량은 빠른 타이핑 속도로 마저 출력한다 (통짜 덤프 방지)
+      renderer.finish();
+      await pacer.drain();
+    } catch (e) {
+      // 취소/네트워크 오류: 페이서 즉시 정지 (잔량 파기 후 상위에서 오류 처리)
+      pacer.stop();
+      throw e;
     }
+    printed = renderer.printedText();
   } else {
     doneObj = await res.json();
     timing.firstSignalAt = timing.firstSignalAt || Date.now();
@@ -2381,6 +2877,7 @@ function help() {
   console.log("  /delete       최근 user+assistant 한 쌍 삭제");
   console.log("");
   console.log(`${ANSI.bold}${ANSI.title}■ 설정${ANSI.reset}`);
+  console.log("  /panel        클릭 가능한 통합 설정 패널 (F2)");
   console.log("  /settings     모델/출력/추론 한눈에 보기");
   console.log("  /model        모델 선택");
   console.log("  /output       출력 길이 (LOW/MID/HIGH)");
@@ -2403,6 +2900,7 @@ function help() {
   console.log(`${ANSI.gray}줄임말: /cs /o /p /n /hi /set /md /out /rs /per /mem /ref /ch /ac /bf /cls /q${ANSI.reset}`);
   console.log(`${ANSI.gray}Ctrl+Z : 방금 user+assistant 한 쌍 삭제${ANSI.reset}`);
   console.log(`${ANSI.gray}Ctrl+C : 진행 중이면 취소, 입력 대기 중이면 이전 화면${ANSI.reset}`);
+  console.log(`${ANSI.gray}F2     : 통합 설정 패널 열기${ANSI.reset}`);
 }
 
 async function handleCommand(line, rl) {
@@ -2416,6 +2914,7 @@ async function handleCommand(line, rl) {
   else if (cmd === "/presets" || cmd === "/p") printPresets(listPresets(30));
   else if (cmd === "/new" || cmd === "/n") await createChat(arg);
   else if (cmd === "/history" || cmd === "/hi" || cmd === "/hist") await showHistory(Number(arg) || 20);
+  else if (cmd === "/panel" || cmd === "/ui" || cmd === "/config") await openSettingsPanel(rl);
   else if (cmd === "/settings" || cmd === "/set" || cmd === "/s") await showSettings();
   else if (cmd === "/model" || cmd === "/md") await chooseModelSetting(arg, rl);
   else if (cmd === "/time" || cmd === "/t") printTimingDetail();
@@ -2465,7 +2964,7 @@ async function main() {
     console.log("열린 채팅이 없습니다. /presets 후 /new 번호 로 시작하세요.");
   }
   console.log("");
-  console.log("명령어는 /help 로 볼 수 있습니다.");
+  console.log("F2를 누르면 설정 패널이 열립니다. 명령어는 /help로 볼 수 있습니다.");
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -2496,6 +2995,11 @@ async function main() {
         }
         if (err && err.name === "AbortError" && action === "back") {
           await goBackToPreviousPage(rl);
+          continue;
+        }
+        if (err && err.name === "AbortError" && action === "settings") {
+          process.stdout.write("\n");
+          await openSettingsPanel(rl);
           continue;
         }
         if (err && err.name === "AbortError") continue;
@@ -2548,7 +3052,23 @@ async function main() {
   console.log("종료했습니다.");
 }
 
-main().catch((err) => {
-  console.error(`오류: ${err && err.message ? err.message : err}`);
-  process.exit(1);
-});
+// require()로 불러오면(렌더러 단위 테스트 등) main을 자동 실행하지 않는다.
+// run-dos.ps1 → `node dos-chat.js` 직접 실행 경로는 기존과 동일하게 동작.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`오류: ${err && err.message ? err.message : err}`);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  textOnly,
+  colorNovelText,
+  colorNovelInline,
+  createStreamRenderer,
+  createTerminalPacer,
+  cycleSettingsPanelValue,
+  displayWidth,
+  fitDisplay,
+  settingsPanelRows,
+};
