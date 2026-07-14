@@ -548,11 +548,12 @@ function getPromptDisplayName() {
 }
 
 function textOnly(value, options = {}) {
-  // Keep original symbols, but request their monochrome text glyph instead of a color emoji.
-  // ANSI colors cannot recolor Windows Terminal's bitmap emoji, so VS15 is required as well.
+  // DOS is a discreet monochrome view. Hide emoji only while rendering; the API/DB keeps
+  // the original text so server-side status parsing and later prompt context remain intact.
   let s = decryptIfPossible(String(value || ""))
-    .replace(/\uFE0F/g, "")
-    .replace(/(\p{Extended_Pictographic})(?!\uFE0E)/gu, "$1\uFE0E");
+    .replace(/\p{Extended_Pictographic}/gu, "")
+    .replace(/\p{Emoji_Modifier}/gu, "")
+    .replace(/[\u200D\uFE0E\uFE0F]/g, "");
 
   // (helper) fence body를 들여쓰기 + 빈 줄 제거로 한 덩어리 만든다.
   // - 모델이 상태창 fence 안에 가독성용 빈 줄을 넣으면 "상태창이 떨어져 보이는" 문제 발생
