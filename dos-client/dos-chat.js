@@ -636,112 +636,6 @@ function hr(title = "") {
   console.log("=".repeat(Math.max(0, left)) + label + "=".repeat(right));
 }
 
-function renderedInputRows(text, displayName = "", columns = process.stdout.columns || 80) {
-  const name = cleanPromptName(displayName) || getPromptDisplayName();
-  const visibleText = textOnly(String(text || ""), { trim: false });
-  const width = Math.max(20, Number(columns || 80));
-  const lines = visibleText.split("\n");
-  let rows = 0;
-  for (let i = 0; i < lines.length; i += 1) {
-    const prefixWidth = i === 0 ? displayWidth(`${name}> `) : 0;
-    const lineWidth = displayWidth(lines[i].replace(/\*/g, ""));
-    rows += Math.max(1, Math.ceil((prefixWidth + lineWidth) / width));
-  }
-  return rows;
-}
-
-function eraseEchoedPrompt(prompt, text) {
-  if (!process.stdout.isTTY) return;
-  const promptText = String(prompt || "").replace(/^\n+/, "");
-  const width = Math.max(20, Number(process.stdout.columns || 80));
-  const rows = Math.max(1, renderedInputRows(text, promptText.replace(/>\s*$/, ""), width));
-  process.stdout.write("\r");
-  for (let i = 0; i < rows; i += 1) process.stdout.write("\x1b[1A\x1b[2K");
-  process.stdout.write("\r");
-}
-
-function colorSubmittedInput(text) {
-  return colorNovelInline(String(text || ""), undefined, ANSI.dialogue);
-}
-
-function renderSubmittedTurnAtTop(text, displayName = "", echoedPrompt = "") {
-  const name = cleanPromptName(displayName) || getPromptDisplayName();
-  const visibleText = textOnly(String(text || ""), { trim: false });
-  if (echoedPrompt) eraseEchoedPrompt(echoedPrompt, visibleText);
-  if (process.stdout.isTTY) clearScreen();
-  process.stdout.write(`${ANSI.soft}${name}> ${ANSI.reset}${colorSubmittedInput(visibleText)}\n`);
-}
-
-function sliceForDisplayWidth(value, maxWidth) {
-  let out = "";
-  let width = 0;
-  for (const ch of String(value || "")) {
-    if (ch === "*") {
-      out += ch;
-      continue;
-    }
-    const next = terminalCharWidth(ch);
-    if (width + next > maxWidth) break;
-    out += ch;
-    width += next;
-  }
-  return out;
-}
-
-function fitTextToTerminalRows(value, maxRows, columns) {
-  const text = String(value || "");
-  const lines = text.split("\n");
-  const rowLimit = Math.max(1, Number(maxRows || 1));
-  const width = Math.max(20, Number(columns || 80));
-  const out = [];
-  let used = 0;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    const visibleWidth = displayWidth(line.replace(/\*/g, ""));
-    const lineRows = Math.max(1, Math.ceil(visibleWidth / width));
-    if (used + lineRows <= rowLimit) {
-      out.push(line);
-      used += lineRows;
-      continue;
-    }
-
-    const remaining = rowLimit - used;
-    if (remaining > 0) {
-      const fitted = sliceForDisplayWidth(line, Math.max(1, remaining * width - 3)).replace(/\s+$/, "");
-      out.push(`${fitted}...`);
-    } else if (out.length) {
-      const last = out[out.length - 1];
-      const lastWidth = displayWidth(last.replace(/\*/g, ""));
-      const lastCapacity = Math.max(width, Math.ceil(lastWidth / width) * width);
-      out[out.length - 1] = `${sliceForDisplayWidth(last, Math.max(1, lastCapacity - 3)).replace(/\s+$/, "")}...`;
-    }
-    return { text: out.join("\n"), truncated: true };
-  }
-
-  return { text: out.join("\n"), truncated: false };
-}
-
-function renderCompletedTurnAtTop(inputText, responseText, elapsed, displayName = "") {
-  if (!process.stdout.isTTY) return false;
-  const name = cleanPromptName(displayName) || getPromptDisplayName();
-  const visibleInput = textOnly(String(inputText || ""), { trim: false });
-  const visibleResponse = textOnly(String(responseText || ""));
-  const columns = Math.max(20, Number(process.stdout.columns || 80));
-  const terminalRows = Math.max(12, Number(process.stdout.rows || 30));
-  const inputRows = renderedInputRows(visibleInput, name, columns);
-  // blank + response heading + completion line + the next readline prompt need room.
-  const responseRows = Math.max(1, terminalRows - inputRows - 6);
-  const preview = fitTextToTerminalRows(visibleResponse, responseRows, columns);
-
-  clearScreen();
-  process.stdout.write(`${ANSI.soft}${name}> ${ANSI.reset}${colorSubmittedInput(visibleInput)}\n\n`);
-  hr("응답");
-  if (preview.text) printWrapped(preview.text);
-  console.log(`\n[완료: ${elapsed}초]`);
-  return true;
-}
-
 function printWrapped(text, options = {}) {
   const s = textOnly(text);
   if (!s) return;
@@ -843,7 +737,7 @@ function colorNovelText(text, options = {}) {
   return renderedLines;
 }
 
-function colorNovelInline(text, state, defaultAnsi = ANSI.soft) {
+function colorNovelInline(text, state) {
   const src = String(text || "");
   if (!src) return "";
   let out = "";
@@ -854,7 +748,7 @@ function colorNovelInline(text, state, defaultAnsi = ANSI.soft) {
   const quotePairs = { '"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』" };
   const flush = () => {
     if (!buf) return;
-    out += (inDialogue ? ANSI.dialogue : inNarration ? ANSI.narration : defaultAnsi) + buf + ANSI.reset;
+    out += (inDialogue ? ANSI.dialogue : inNarration ? ANSI.narration : ANSI.soft) + buf + ANSI.reset;
     buf = "";
   };
   for (let i = 0; i < src.length; i += 1) {
@@ -1959,13 +1853,13 @@ function terminalCharWidth(ch) {
   return 1;
 }
 
-function panelDisplayWidth(value) {
+function displayWidth(value) {
   return Array.from(String(value || "")).reduce((sum, ch) => sum + terminalCharWidth(ch), 0);
 }
 
 function fitDisplay(value, maxWidth) {
   const text = String(value || "");
-  if (panelDisplayWidth(text) <= maxWidth) return text;
+  if (displayWidth(text) <= maxWidth) return text;
   const suffix = "...";
   const target = Math.max(0, maxWidth - suffix.length);
   let out = "";
@@ -1979,9 +1873,9 @@ function fitDisplay(value, maxWidth) {
   return `${out}${suffix}`;
 }
 
-function padPanelDisplay(value, width) {
+function padDisplay(value, width) {
   const fitted = fitDisplay(value, width);
-  return `${fitted}${" ".repeat(Math.max(0, width - panelDisplayWidth(fitted)))}`;
+  return `${fitted}${" ".repeat(Math.max(0, width - displayWidth(fitted)))}`;
 }
 
 function settingsPanelRows(draft) {
@@ -2011,7 +1905,7 @@ function renderSettingsPanel(draft, selectedIndex, dirty, notice) {
   const lines = [];
   const hitRows = [];
   const rows = settingsPanelRows(draft);
-  const inside = (text, style = "") => `${style}|${padPanelDisplay(text, innerWidth)}|${ANSI.reset}`;
+  const inside = (text, style = "") => `${style}|${padDisplay(text, innerWidth)}|${ANSI.reset}`;
 
   lines.push(`${ANSI.bold}${ANSI.title}${border}${ANSI.reset}`);
   lines.push(inside(`  ARCA DOS 설정 패널${dirty ? "  * 저장 안 됨" : ""}`, ANSI.bold + ANSI.title));
@@ -2764,7 +2658,7 @@ async function backfillCharacters(arg) {
   await showCharacters("");
 }
 
-async function postSend(text, displayName = "") {
+async function postSend(text) {
   if (!state.chatId) {
     throw new Error("열린 채팅이 없습니다. /chats, /open, /presets, /new 를 먼저 사용하세요.");
   }
@@ -2902,11 +2796,8 @@ async function postSend(text, displayName = "") {
     process.stdout.write("\n");
   }
   timing.responseEndAt = Date.now();
-  const elapsed = Math.round((Date.now() - started) / 1000);
-  const reviewText = finalText || printed;
-  if (!renderCompletedTurnAtTop(text, reviewText, elapsed, displayName)) {
-    console.log(`\n[완료: ${elapsed}초]`);
-  }
+const elapsed = Math.round((Date.now() - started) / 1000);
+  console.log(`\n[완료: ${elapsed}초]`);
   timing.usage = doneObj && doneObj.usage ? doneObj.usage : null;
 
   // (변경) 장기기억 갱신/캐릭터 기록 저장은 백그라운드로 분리한다.
@@ -3128,6 +3019,19 @@ async function main() {
       const line = String(lineRaw || "").trim();
       if (!line) continue;
 
+      // (요구) 입력한 줄을 narration(*...*) 회색 처리해서 다시 표시.
+      // readline은 raw line을 그대로 echo하므로, 입력 직후 그 줄을 위로 올라가 clear하고
+      // 색 적용한 버전으로 다시 출력한다.
+      if (line.includes("*") && process.stdout.isTTY) {
+        try {
+          const promptStr = prompt.replace(/^\n+/, ""); // 줄바꿈 제외한 prompt 본문
+          process.stdout.write("\x1b[1A\x1b[2K");
+          process.stdout.write(`${promptStr}${colorNovelInline(line)}\n`);
+        } catch {
+          // 일부 TTY 환경에서 ANSI 이동이 실패하면 무시 (기능 영향 없음)
+        }
+      }
+
       // 이번 명령에 대한 abort scope. Ctrl+C 시 SIGINT handler가 이 controller를 abort한다.
       state.activeController = new AbortController();
       try {
@@ -3135,8 +3039,7 @@ async function main() {
           const keep = await handleCommand(line, rl);
           if (!keep) break;
         } else {
-          renderSubmittedTurnAtTop(line, promptName, prompt);
-          await postSend(line, promptName);
+          await postSend(line);
         }
       } catch (err) {
         const msg = String(err && err.message ? err.message : err);
@@ -3171,15 +3074,10 @@ module.exports = {
   textOnly,
   colorNovelText,
   colorNovelInline,
-  colorSubmittedInput,
   createStreamRenderer,
   createTerminalPacer,
   cycleSettingsPanelValue,
   displayWidth,
-  fitTextToTerminalRows,
   fitDisplay,
-  renderedInputRows,
-  renderCompletedTurnAtTop,
-  renderSubmittedTurnAtTop,
   settingsPanelRows,
 };
