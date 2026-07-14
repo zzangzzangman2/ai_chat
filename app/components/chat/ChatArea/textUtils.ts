@@ -420,7 +420,7 @@ export function stripLeadingTitleForDisplay(text: string): string {
   if (!src) return src;
   const lines = src.split(/\r?\n/);
   // Remove up to 2 leading 'title' lines if the real content starts after a blank line
-  // and the first non-empty line does NOT look like dialogue/narration/INFO/STATUS/code fence.
+  // and the first non-empty line does NOT look like dialogue/narration/INFO/STATUS/code fence/image.
   let i = 0;
   // skip leading empties
   while (i < lines.length && lines[i].trim() === "") i++;
@@ -429,7 +429,15 @@ export function stripLeadingTitleForDisplay(text: string): string {
   const second = (lines[i + 1] ?? "").trim();
   const third = (lines[i + 2] ?? "").trim();
   const looksLikeContent = (s: string) =>
-    s.startsWith("*") || s.startsWith('"') || s.startsWith("```") || s.startsWith("INFO") || s.startsWith("STATUS") || s.startsWith("[");
+    s.startsWith("*") ||
+    s.startsWith('"') ||
+    s.startsWith("```") ||
+    s.startsWith("INFO") ||
+    s.startsWith("STATUS") ||
+    s.startsWith("[") ||
+    s.startsWith("![") ||
+    /^\{\{img:[^}]+\}\}/i.test(s) ||
+    /^(?:!!\s*)?(?:https?:\/\/|\/\/|data:image\/|blob:)/i.test(s);
   const looksLikeTitle = (s: string) => !looksLikeContent(s) && s.length <= 60 && !/[`*_]/.test(s) && !s.startsWith("-");
   // Pattern: <title> + blank line + real content
   if (looksLikeTitle(first) && second === "" && third && looksLikeContent(third)) {
