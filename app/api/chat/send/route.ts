@@ -40,6 +40,7 @@ import {
   splitTrailingFenceBlockAtEnd,
   stripEndMarker,
   normalizeNovelPlain,
+  normalizeNovelChannelLayout,
   enforceNovelOnlyOutput,
   estTokens,
   trimToComplete,
@@ -2585,6 +2586,7 @@ if (!TRANSPORT_STREAMING) {
             // (chat mode only) keep trimToComplete; in novel mode we keep append-only content.
             // Always enforce novel-only output markers (removes accidental markdown markers, keeps *...* / "..." / fenced).
             assistantText = enforceNovelOnlyOutput(assistantText);
+            assistantText = normalizeNovelChannelLayout(assistantText);
 
             // Label-agnostic fence stabilization (opening line split + unclosed fence repair + conservative loose-meta wrapping)
             assistantText = normalizeAnyFenceOpen(assistantText);
@@ -3846,6 +3848,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
 
     tEnd(tGemini);
     tStart(tPost);
+
+    assistantText = normalizeNovelChannelLayout(assistantText);
 
     // ---- Token breakdown (prompt input composition) ----
     // promptTokens(실측)을 각 구성요소에 배분한다.

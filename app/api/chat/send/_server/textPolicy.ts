@@ -217,6 +217,73 @@ export function normalizeNovelPlain(text: string): string {
   joined = joined.replace(/\n{3,}/g, "\n\n");
   return joined.trim();
 }
+
+// Keep narration and dialogue as separate, unambiguous channels for line-based clients.
+// Gemini occasionally emits `"dialogue" *narration*` on one line or nests markdown
+// emphasis (`***sound***`) inside an outer `*narration*` block.
+export function normalizeNovelChannelLayout(text: string): string {
+  const source = String(text || "").replace(/\r\n/g, "\n");
+  if (!source.trim()) return source.trim();
+
+  const out: string[] = [];
+  let inFence = false;
+
+  const splitMixedLine = (line: string) => {
+    const pending = [String(line || "").trimEnd()];
+    const parts: string[] = [];
+
+    while (pending.length > 0 && parts.length < 12) {
+      const part = String(pending.shift() || "");
+      const dialogueThenNarration = part.match(/^(\s*["“][\s\S]*["”])\s+(\*+[\s\S]+)$/);
+      if (dialogueThenNarration) {
+        pending.unshift(dialogueThenNarration[2]);
+        pending.unshift(dialogueThenNarration[1]);
+        continue;
+      }
+
+      const narrationThenDialogue = part.match(/^(\s*\*+[\s\S]*\*+)\s+(["“][\s\S]+)$/);
+      if (narrationThenDialogue) {
+        pending.unshift(narrationThenDialogue[2]);
+        pending.unshift(narrationThenDialogue[1]);
+        continue;
+      }
+
+      parts.push(part);
+    }
+
+    parts.push(...pending);
+    return parts;
+  };
+
+  const normalizePart = (part: string) => {
+    const trimmed = String(part || "").trim();
+    if (!trimmed) return "";
+    if (!trimmed.startsWith("*") || !trimmed.endsWith("*") || trimmed.length < 2) return trimmed;
+
+    // The first/last star are the narration channel. Any additional stars inside are
+    // markdown emphasis and must not become extra channel toggles in DOS/web renderers.
+    const inner = trimmed.slice(1, -1).replace(/\*+/g, "").trim();
+    return inner ? `*${inner}*` : "";
+  };
+
+  for (const line of source.split("\n")) {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      out.push(line.trimEnd());
+      continue;
+    }
+    if (inFence || !line.trim()) {
+      out.push(line.trimEnd());
+      continue;
+    }
+
+    const parts = splitMixedLine(line).map(normalizePart).filter(Boolean);
+    out.push(parts.join("\n\n"));
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 export function enforceNoPreDialogueTokenLeakForMode(text: string, mode: "chat" | "novel"): string {
   if (mode === "chat") return enforceNoPreDialogueTokenLeak(text);
   const raw = String(text || "");

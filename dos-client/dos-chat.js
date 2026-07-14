@@ -92,12 +92,12 @@ const ANSI = {
   narration: "\x1b[38;5;242m",
   dialogue: "\x1b[38;5;250m",
   meta: "\x1b[38;5;247m",
-  soft: "\x1b[38;5;250m",
-  title: "\x1b[38;5;153m",
-  accent: "\x1b[38;5;117m",
-  green: "\x1b[38;5;114m",
-  yellow: "\x1b[38;5;222m",
-  red: "\x1b[38;5;203m",
+  soft: "\x1b[38;5;248m",
+  title: "\x1b[38;5;252m",
+  accent: "\x1b[38;5;250m",
+  green: "\x1b[38;5;249m",
+  yellow: "\x1b[38;5;251m",
+  red: "\x1b[38;5;247m",
   reverse: "\x1b[7m",
   hideCursor: "\x1b[?25l",
   showCursor: "\x1b[?25h",
@@ -548,7 +548,11 @@ function getPromptDisplayName() {
 }
 
 function textOnly(value, options = {}) {
-  let s = decryptIfPossible(String(value || ""));
+  // Keep original symbols, but request their monochrome text glyph instead of a color emoji.
+  // ANSI colors cannot recolor Windows Terminal's bitmap emoji, so VS15 is required as well.
+  let s = decryptIfPossible(String(value || ""))
+    .replace(/\uFE0F/g, "")
+    .replace(/(\p{Extended_Pictographic})(?!\uFE0E)/gu, "$1\uFE0E");
 
   // (helper) fence body를 들여쓰기 + 빈 줄 제거로 한 덩어리 만든다.
   // - 모델이 상태창 fence 안에 가독성용 빈 줄을 넣으면 "상태창이 떨어져 보이는" 문제 발생
@@ -711,7 +715,7 @@ function colorNovelText(text, options = {}) {
       if (narrState.inNarration && looksLikeDialogueLine(line)) {
         narrState.inNarration = false;
       }
-      if (!narrState.inNarration && looksLikeDialogueLine(line)) {
+      if (!narrState.inNarration && looksLikeDialogueLine(line) && !line.includes("*")) {
         return `${ANSI.dialogue}${line}${ANSI.reset}`;
       }
       if (defaultPlainNarration && !narrState.inNarration && !line.includes("*") && shouldDefaultToNarration(line)) {
@@ -728,16 +732,44 @@ function colorNovelInline(text, state) {
   let out = "";
   let buf = "";
   let inNarration = state ? Boolean(state.inNarration) : false;
+  let inDialogue = false;
+  let dialogueClose = "";
+  const quotePairs = { '"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』" };
   const flush = () => {
     if (!buf) return;
-    out += (inNarration ? ANSI.narration : ANSI.soft) + buf + ANSI.reset;
+    out += (inDialogue ? ANSI.dialogue : inNarration ? ANSI.narration : ANSI.soft) + buf + ANSI.reset;
     buf = "";
   };
   for (let i = 0; i < src.length; i += 1) {
     const ch = src[i];
     if (ch === "*") {
       flush();
-      inNarration = !inNarration;
+      let end = i + 1;
+      while (end < src.length && src[end] === "*") end += 1;
+      const count = end - i;
+      if (count === 1) {
+        inNarration = !inNarration;
+      } else {
+        const atStart = src.slice(0, i).trim().length === 0;
+        const atEnd = src.slice(end).trim().length === 0;
+        if (!inNarration && atStart) inNarration = true;
+        else if (inNarration && atEnd) inNarration = false;
+      }
+      i = end - 1;
+      continue;
+    }
+    if (!inDialogue && Object.prototype.hasOwnProperty.call(quotePairs, ch)) {
+      flush();
+      inDialogue = true;
+      dialogueClose = quotePairs[ch];
+      buf += ch;
+      continue;
+    }
+    if (inDialogue && ch === dialogueClose) {
+      buf += ch;
+      flush();
+      inDialogue = false;
+      dialogueClose = "";
       continue;
     }
     buf += ch;
