@@ -636,6 +636,13 @@ function hr(title = "") {
   console.log("=".repeat(Math.max(0, left)) + label + "=".repeat(right));
 }
 
+function renderSubmittedTurnAtTop(text, displayName = "") {
+  const name = cleanPromptName(displayName) || getPromptDisplayName();
+  const visibleText = textOnly(String(text || ""), { trim: false });
+  if (process.stdout.isTTY) clearScreen();
+  process.stdout.write(`${ANSI.soft}${name}> ${ANSI.reset}${colorNovelInline(visibleText)}\n`);
+}
+
 function printWrapped(text, options = {}) {
   const s = textOnly(text);
   if (!s) return;
@@ -3039,6 +3046,7 @@ async function main() {
           const keep = await handleCommand(line, rl);
           if (!keep) break;
         } else {
+          renderSubmittedTurnAtTop(line, promptName);
           await postSend(line);
         }
       } catch (err) {
@@ -3079,5 +3087,6 @@ module.exports = {
   cycleSettingsPanelValue,
   displayWidth,
   fitDisplay,
+  renderSubmittedTurnAtTop,
   settingsPanelRows,
 };
