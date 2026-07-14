@@ -367,7 +367,20 @@ export function formatStoryTurnsForMode(msgs: any[], personaName: string, npcNam
   return parts.join("\n\n").trim();
 }
 
+export function isOocMetaInstruction(text: string): boolean {
+  // 사이트 공통 OOC 표식: 대소문자를 구분하지 않고, 단독/대괄호/이중괄호 시작형을 모두 허용한다.
+  // 일반 문장 중간의 "OOC라는 단어"까지 오탐하지 않도록 각 줄의 제어 표식 시작만 검사한다.
+  return String(text || "")
+    .split(/\r?\n/)
+    .some((line) => /^\s*(?:\[\s*|\(\(\s*)?ooc\b(?:\s*[:：]|\s|\]|\)\)|$)/i.test(line));
+}
+
 export function buildUserLineForMode(userText: string, personaName: string, mode: "chat" | "novel"): string {
+  const rawUserText = String(userText || "").trim();
+  // OOC는 캐릭터의 대사가 아니라 사이트 전역 메타 지시다.
+  // 따옴표/화자 접두를 붙이지 않아 모델이 현재 서사 밖의 최신 지시로 읽게 한다.
+  if (isOocMetaInstruction(rawUserText)) return rawUserText;
+
   if (mode === "chat") {
     // 기존 채팅모드 규칙 유지: 주인공 | "..."
     const userLineRaw = ensurePrefix(userText, personaName);
@@ -384,7 +397,7 @@ export function buildUserLineForMode(userText: string, personaName: string, mode
   // - *지문* 은 지문으로 그대로 전달
   // - ```ANY_LABEL ...``` 메타 패널은 그대로 전달
   // - 이미 따옴표로 감싼 대사는 유지(끝따옴표만 보정)
-  const stripped = String(stripSpeakerPrefixLine(String(userText || "")) || "").trim();
+  const stripped = String(stripSpeakerPrefixLine(rawUserText) || "").trim();
   if (!stripped) return '""';
 
   // fenced meta block (any label) - preserve as-is
