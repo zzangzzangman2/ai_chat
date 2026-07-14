@@ -1569,15 +1569,24 @@ const loadOlder = useCallback(async () => {
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
 
+  // React 개발 모드가 mount effect를 재실행해도 첫 번째 실행에서 소비한 진입 의도를 유지한다.
+  // 그렇지 않으면 두 번째 실행이 /latest를 불러와 방금 만든 채팅을 예전 대화로 덮을 수 있다.
+  const forceNewChatIntentRef = useRef<string>("");
+  const forceNewChatStartedRef = useRef<string>("");
+  const forceOpenChatIntentRef = useRef<{ presetId: string; chatId: string } | null>(null);
+  const forceOpenChatAppliedRef = useRef<string>("");
+
   const consumeForceNewChatFlag = useCallback(
     (pid: string) => {
       // 작품 탭에서 "새 대화 시작" 버튼을 누르면 localStorage에 presetId를 기록해둠.
       // 채팅 탭 진입 시 이 플래그가 있으면 최신 채팅을 로드하지 말고 새 채팅을 생성한다.
+      if (forceNewChatIntentRef.current === pid) return true;
       try {
         const key = "forceNewChatPresetId";
         const v = window.localStorage.getItem(key) || "";
         if (v && v === pid) {
           window.localStorage.removeItem(key);
+          forceNewChatIntentRef.current = pid;
           return true;
         }
       } catch {
@@ -1590,6 +1599,8 @@ const loadOlder = useCallback(async () => {
 
   const consumeForceOpenChatId = useCallback((pid: string) => {
     // 작품 상세에서 이어하기 목록을 선택한 경우, 지정한 chatId를 우선 열어준다.
+    const cached = forceOpenChatIntentRef.current;
+    if (cached?.presetId === pid && cached.chatId) return cached.chatId;
     try {
       const pidKey = "forceOpenChatPresetId";
       const chatKey = "forceOpenChatId";
@@ -1598,6 +1609,7 @@ const loadOlder = useCallback(async () => {
       if (targetPid && targetPid === pid && targetChatId) {
         window.localStorage.removeItem(pidKey);
         window.localStorage.removeItem(chatKey);
+        forceOpenChatIntentRef.current = { presetId: pid, chatId: targetChatId };
         return targetChatId;
       }
     } catch {
@@ -5595,6 +5607,14 @@ const insertNarrationMarkers = useCallback(() => {
   // 프리셋 변경되면: 채팅 컨텍스트 초기화(고정 문제 방지)
   useEffect(() => {
     let cancelled = false;
+    if (forceNewChatIntentRef.current && forceNewChatIntentRef.current !== presetId) {
+      forceNewChatIntentRef.current = "";
+      forceNewChatStartedRef.current = "";
+    }
+    if (forceOpenChatIntentRef.current?.presetId !== presetId) {
+      forceOpenChatIntentRef.current = null;
+      forceOpenChatAppliedRef.current = "";
+    }
     // 프리셋 바뀌면: 해당 프리셋의 최근 채팅을 자동으로 불러오고(이어하기),
     // 없으면 새로 만들기 상태로 둔다.
     setMessages([]);
@@ -5621,6 +5641,9 @@ const insertNarrationMarkers = useCallback(() => {
       try {
         // 작품 탭에서 "새 대화 시작"을 눌러 들어온 경우: 강제 새 채팅
         if (consumeForceNewChatFlag(presetId)) {
+          // Strict Mode의 두 번째 effect는 첫 요청이 끝날 때까지 /latest로 빠지지 않고 대기한다.
+          if (forceNewChatStartedRef.current === presetId) return;
+          forceNewChatStartedRef.current = presetId;
           setChatId("");
           // createChat() 내부에서 presetId 확인
           await createChat(true);
@@ -5628,6 +5651,9 @@ const insertNarrationMarkers = useCallback(() => {
         }
         const forcedChatId = consumeForceOpenChatId(presetId);
         if (forcedChatId) {
+          const forcedKey = `${presetId}:${forcedChatId}`;
+          if (forceOpenChatAppliedRef.current === forcedKey) return;
+          forceOpenChatAppliedRef.current = forcedKey;
           setChatId(forcedChatId);
           return;
         }
