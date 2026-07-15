@@ -41,6 +41,15 @@ function getReasoningPresets(model) {
   if (isGemini3FlashModel(model))     return { low: 0, middle: 640, high: 1024 };
   return { low: 384, middle: 768, high: 2048 }; // gemini-2.5-pro 등
 }
+
+function reasoningTokensForModelChange(currentModel, nextModel, currentTokens) {
+  const currentPresets = getReasoningPresets(currentModel);
+  const nextPresets = getReasoningPresets(nextModel);
+  let level = inferLevel(currentPresets, currentTokens);
+  if (level === "zero" && !Object.prototype.hasOwnProperty.call(nextPresets, "zero")) level = "low";
+  if (level === "low" && !Object.prototype.hasOwnProperty.call(nextPresets, "low")) level = "zero";
+  return nextPresets[level] ?? Object.values(nextPresets)[0];
+}
 function reasoningLevelLabel(model, level) {
   return level === "zero" && isGemini3ProFamilyModel(model) ? "FAST" : LEVEL_LABEL[level];
 }
@@ -2002,16 +2011,15 @@ function cycleSettingsPanelValue(draft, row, direction) {
   const step = direction < 0 ? -1 : 1;
   if (row.key === "model") {
     const currentModel = String(draft.model || "");
-    const oldPresets = getReasoningPresets(currentModel);
-    const oldLevel = inferLevel(oldPresets, draft.maxReasoningTokens);
     const index = Math.max(0, MODEL_OPTIONS.findIndex((item) => item.id === currentModel));
     const nextIndex = (index + step + MODEL_OPTIONS.length) % MODEL_OPTIONS.length;
-    draft.model = MODEL_OPTIONS[nextIndex].id;
-    const nextPresets = getReasoningPresets(draft.model);
-    let nextLevel = oldLevel;
-    if (nextLevel === "zero" && !Object.prototype.hasOwnProperty.call(nextPresets, "zero")) nextLevel = "low";
-    if (nextLevel === "low" && !Object.prototype.hasOwnProperty.call(nextPresets, "low")) nextLevel = "zero";
-    draft.maxReasoningTokens = nextPresets[nextLevel] ?? Object.values(nextPresets)[0];
+    const nextModel = MODEL_OPTIONS[nextIndex].id;
+    draft.maxReasoningTokens = reasoningTokensForModelChange(
+      currentModel,
+      nextModel,
+      draft.maxReasoningTokens
+    );
+    draft.model = nextModel;
     return `모델: ${MODEL_OPTIONS[nextIndex].label}`;
   }
   if (row.key === "maxOutputTokens") {
@@ -2283,6 +2291,11 @@ async function updateSetting(field, value) {
       console.log(`지원 모델: ${MODELS.join(", ")}`);
       return;
     }
+    next.maxReasoningTokens = reasoningTokensForModelChange(
+      st.model,
+      v,
+      st.maxReasoningTokens
+    );
     next.model = v;
   } else if (field === "maxOutputTokens") {
     if (!v) {

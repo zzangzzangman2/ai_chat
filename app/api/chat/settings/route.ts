@@ -199,6 +199,10 @@ export async function POST(req: Request) {
   const chat = db.prepare(`SELECT id FROM chats WHERE id=? AND userEmail=?`).get(chatId, u.email);
   if (!chat) return NextResponse.json({ error: "채팅을 찾지 못했습니다." }, { status: 404 });
 
+  const existingSettings = db
+    .prepare(`SELECT model FROM chat_settings WHERE chatId=?`)
+    .get(chatId) as { model?: string } | undefined;
+
   const personaName = String(body.personaName || "").trim();
   const personaAge = Number(body.personaAge || 0);
   const personaGender = String(body.personaGender || "").trim();
@@ -219,7 +223,7 @@ export async function POST(req: Request) {
   let model = coerceChatModelId(String(body.model || DEFAULT_MODEL), DEFAULT_MODEL);
 
   const maxOutputTokens = Number(body.maxOutputTokens ?? 1200);
-  const maxReasoningTokens = Number(body.maxReasoningTokens ?? defaultReasoningTokens(model));
+  let maxReasoningTokens = Number(body.maxReasoningTokens ?? defaultReasoningTokens(model));
 
   // --- Validation ---
   if (personaAge && (!Number.isFinite(personaAge) || personaAge < 0)) return bad("나이는 숫자로 적어주세요.");
@@ -230,7 +234,19 @@ export async function POST(req: Request) {
   if (maxOutputTokens < 800 || maxOutputTokens > 5000) return bad("출력길이는 800~5000자 사이로 설정해 주세요.");
   const supportsZeroReasoning = isGemini3FlashModel(model) || isGemini3ProModel(model);
   const minReasoning = supportsZeroReasoning ? 0 : 384;
-  if (maxReasoningTokens < minReasoning || maxReasoningTokens > 8192) {
+  const previousModel = existingSettings?.model
+    ? coerceChatModelId(String(existingSettings.model), DEFAULT_MODEL)
+    : "";
+  const reasoningOutOfRange =
+    !Number.isFinite(maxReasoningTokens) ||
+    maxReasoningTokens < minReasoning ||
+    maxReasoningTokens > 8192;
+
+  // 모델만 바꿀 때 이전 모델의 합법적인 값(예: Gemini 3.x의 0)이 새 모델에서는
+  // 불법일 수 있다. 사용자가 추론 설정까지 다시 고르게 하지 않고 새 모델의 LOW로 맞춘다.
+  if (reasoningOutOfRange && previousModel && previousModel !== model) {
+    maxReasoningTokens = defaultReasoningTokens(model);
+  } else if (reasoningOutOfRange) {
     return bad(
       supportsZeroReasoning
         ? "추론길이는 0~8192 토큰 사이로 설정해 주세요."
