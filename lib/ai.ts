@@ -166,11 +166,40 @@ export type ChatGenOpts = {
   thinkingLevel?: "low" | "medium" | "high" | null;
   // Optional per-call timeout override (ms). If omitted, model defaults are used.
   timeoutMs?: number;
+  // Cancels local SDK/network consumption when the caller disconnects or leaves the chat.
+  signal?: AbortSignal;
 
   // Forward-compat: allow additional provider-specific options without breaking TypeScript builds.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   [key: string]: any;
 };
+
+function abortError(reason?: unknown): Error {
+  const error = new Error(typeof reason === "string" && reason ? reason : "aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw abortError(signal.reason);
+}
+
+function linkedAbortController(signal?: AbortSignal) {
+  const controller = new AbortController();
+  const onAbort = () => {
+    try {
+      controller.abort(signal?.reason);
+    } catch {
+      controller.abort();
+    }
+  };
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  return {
+    controller,
+    dispose: () => signal?.removeEventListener("abort", onAbort),
+  };
+}
 
 function normalizeModelName(model: string) {
   return stripProviderPrefix(model);
@@ -652,6 +681,7 @@ export async function generateText(params: {
   opts: ChatGenOpts;
 }): Promise<{ text: string; usage: any }> {
   const { system, user, opts } = params;
+  throwIfAborted(opts.signal);
 
   const t0 = Date.now();
 
@@ -791,10 +821,12 @@ export async function generateText(params: {
 
   for (const { label, req } of reqList) {
     const t1 = Date.now();
+    const linkedAbort = linkedAbortController(opts.signal);
     try {
-      // Use globalThis to avoid TS lib mismatches across environments.
-      const controller = new (globalThis as any).AbortController();
-      const reqWithSignal = { ...(req as any), signal: controller.signal };
+      const reqWithSignal = {
+        ...(req as any),
+        config: { ...((req as any).config || {}), abortSignal: linkedAbort.controller.signal },
+      };
 
       const r0 = await withTimeout(
         withRetry(() => genai.models.generateContent(reqWithSignal), {
@@ -805,12 +837,13 @@ export async function generateText(params: {
         CALL_TIMEOUT_MS,
         () => {
           try {
-            controller.abort();
+            linkedAbort.controller.abort();
           } catch {
             // ignore
           }
         }
       );
+      throwIfAborted(opts.signal);
 
       if (!r0) {
         if (isChatDebug()) {
@@ -837,8 +870,11 @@ export async function generateText(params: {
       attempts.push({ label, ok: true, ms: Date.now() - t1 } as any);
       break;
     } catch (e: any) {
+      if (opts.signal?.aborted) throw abortError(opts.signal.reason);
       lastErr = e;
       attempts.push({ label, ok: false, ms: Date.now() - t1, err: String(e?.message || e) });
+    } finally {
+      linkedAbort.dispose();
     }
   }
 
@@ -1170,6 +1206,7 @@ export async function generateTextStream(params: {
   opts: ChatGenOpts;
 }): Promise<{ stream: AsyncIterable<string>; final: Promise<{ text: string; usage: any }> }> {
   const { system, user, opts } = params;
+  throwIfAborted(opts.signal);
 
   const t0 = Date.now();
 
@@ -1249,8 +1286,12 @@ export async function generateTextStream(params: {
   });
 
   // Stream call (abortable)
-  const controller = new (globalThis as any).AbortController();
-  const reqWithSignal = { ...(req as any), signal: controller.signal };
+  const linkedAbort = linkedAbortController(opts.signal);
+  const controller = linkedAbort.controller;
+  const reqWithSignal = {
+    ...(req as any),
+    config: { ...((req as any).config || {}), abortSignal: controller.signal },
+  };
 
   let streamObj: any = null;
   try {
@@ -1274,6 +1315,7 @@ export async function generateTextStream(params: {
     // can see the actual SDK stream shape.
     streamObj = (s0 as any)?.value ?? s0;
   } catch (e: any) {
+    linkedAbort.dispose();
     // No fallback calls here: callers may require strict single-call behavior.
     if (opts?.logOnError) console.error("generateTextStream stream call failed", e);
     throw e;
@@ -1333,6 +1375,8 @@ export async function generateTextStream(params: {
   if (!streamIt) {
     if (responsePromise) {
       const resp: any = await responsePromise.catch(() => null);
+      linkedAbort.dispose();
+      throwIfAborted(opts.signal);
       const parts0 = (resp?.candidates?.[0]?.content?.parts || []) as any[];
       const text =
         (typeof (resp as any)?.text === "string" ? (resp as any).text : "") ||
@@ -1385,6 +1429,7 @@ export async function generateTextStream(params: {
       };
     }
 
+    linkedAbort.dispose();
     throw new Error("generateTextStream: non-iterable stream shape");
   }
   const streamIter: AsyncIterable<any> = streamIt;
@@ -1409,6 +1454,7 @@ export async function generateTextStream(params: {
   async function* iterator(): AsyncIterable<string> {
     try {
       for await (const chunk of streamIter) {
+        throwIfAborted(opts.signal);
         const t = extractChunkText(chunk);
         if (!t) continue;
 
@@ -1429,6 +1475,7 @@ export async function generateTextStream(params: {
       } catch {
         // ignore
       }
+      linkedAbort.dispose();
     }
   }
 

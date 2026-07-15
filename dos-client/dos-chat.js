@@ -195,10 +195,16 @@ function installPromptShortcuts(rl) {
   }
 
   const onKeypress = (str, key) => {
-    if (!state.promptController || state.activeController) return;
-    if ((key && key.ctrl && key.name === "z") || str === "\x1a") {
+    const isCtrlZ = (key && key.ctrl && key.name === "z") || str === "\x1a";
+    const isCtrlC = key && key.ctrl && key.name === "c";
+    if (state.activeController && (isCtrlZ || isCtrlC)) {
+      abortActiveRequest();
+      return;
+    }
+    if (!state.promptController) return;
+    if (isCtrlZ) {
       requestPromptShortcut("delete");
-    } else if (key && key.ctrl && key.name === "c") {
+    } else if (isCtrlC) {
       requestPromptShortcut("back");
     } else if ((key && key.name === "f2") || str === "\x1bOQ" || str === "\x1b[12~") {
       requestPromptShortcut("settings");

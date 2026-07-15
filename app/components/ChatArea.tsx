@@ -4251,6 +4251,11 @@ return (
     [bumpSendSeq, stopStreamPacer, setStallUiActive]
   );
 
+  // Switching chats or leaving the chat view also cancels the server-side model request.
+  useEffect(() => {
+    return () => cancelInFlightSend("chat-context-change");
+  }, [chatId, presetId, cancelInFlightSend]);
+
 
   // 최신 추천 생성용(ref): 스트리밍 완료본을 state 레이스 없이 사용
   const lastAssistantForSuggestRef = useRef<string>("");

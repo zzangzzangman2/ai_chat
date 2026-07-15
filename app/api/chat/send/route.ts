@@ -1121,6 +1121,18 @@ export async function POST(req: Request) {
         ? sReason
         : defaultReasoningTokensByModel(chosenModel);
 
+    const generationAbortController = new AbortController();
+    const abortGeneration = () => {
+      if (generationAbortController.signal.aborted) return;
+      try {
+        generationAbortController.abort(req.signal.reason);
+      } catch {
+        generationAbortController.abort();
+      }
+    };
+    if (req.signal.aborted) abortGeneration();
+    else req.signal.addEventListener("abort", abortGeneration, { once: true });
+
     const opts = {
       model: chosenModel,
       maxOutputTokens: (() => {
@@ -1133,6 +1145,7 @@ export async function POST(req: Request) {
         const minReasoning = isGemini3FlashModel(chosenModel) || isGemini3ProModel(chosenModel) ? 0 : 384;
         return Math.max(minReasoning, Math.min(8192, Math.floor(v)));
       })(),
+      signal: generationAbortController.signal,
     };
 
     try {
@@ -2289,6 +2302,7 @@ tEnd(tPrompt);
 const STREAM_DEBUG = process.env.STREAM_DEBUG === "1";
 if (wantStream) {
 const encoder = new TextEncoder();
+let cancelStreamWork: (() => void) | null = null;
 
   // Stream debug logging (set STREAM_DEBUG=1 to enable)
   const STREAM_DEBUG = process.env.STREAM_DEBUG === "1";
@@ -2330,21 +2344,35 @@ const encoder = new TextEncoder();
             return true;
           } catch (e: any) {
             streamClosed = true;
+            abortGeneration();
+            if (keepaliveTimer) {
+              clearInterval(keepaliveTimer);
+              keepaliveTimer = null;
+            }
             if (STREAM_DEBUG) console.warn(`${streamTag} enqueue ignored (closed)`, e?.message || e);
             return false;
           }
         };
 
         const safeClose = () => {
-          if (streamClosed) return;
+          const wasClosed = streamClosed;
           streamClosed = true;
-        if (keepaliveTimer) {
-          clearInterval(keepaliveTimer);
-          keepaliveTimer = null;
-        }
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+          }
+          if (wasClosed) return;
           try {
             controller.close();
           } catch {}
+        };
+
+        cancelStreamWork = () => {
+          streamClosed = true;
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+          }
         };
 
         // First-byte flush (keep-alive before Gemini starts producing)
@@ -3301,6 +3329,11 @@ safeEnqueue({
           safeClose();
         }
       })();
+    },
+    cancel() {
+      cancelStreamWork?.();
+      abortGeneration();
+      cleanupPendingUserOnFailure(cid);
     },
   });
 
