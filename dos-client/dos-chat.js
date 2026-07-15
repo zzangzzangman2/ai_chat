@@ -1761,15 +1761,27 @@ async function chooseModelMenu(rl) {
   return await new Promise((resolve) => {
     const stdin = process.stdin;
     const wasRaw = stdin.isRaw;
+    let suspendedKeypressListeners = [];
+    let keypressListenersRestored = false;
+    const suspendChatKeypressListeners = () => {
+      suspendedKeypressListeners = stdin.listeners("keypress");
+      for (const listener of suspendedKeypressListeners) stdin.off("keypress", listener);
+    };
+    const restoreChatKeypressListeners = () => {
+      if (keypressListenersRestored) return;
+      keypressListenersRestored = true;
+      for (const listener of suspendedKeypressListeners) stdin.on("keypress", listener);
+    };
     const render = () => {
       rows = renderModelLauncher(selectedIndex, typed, currentModel);
     };
     const cleanup = (value) => {
       stdin.off("data", onData);
-      process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}`);
+      process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}${ANSI.alternateOff}\r\x1b[2K`);
       try {
         stdin.setRawMode(Boolean(wasRaw));
       } catch {}
+      restoreChatKeypressListeners();
       try {
         rl?.resume?.();
       } catch {}
@@ -1828,9 +1840,10 @@ async function chooseModelMenu(rl) {
     try {
       rl?.pause?.();
     } catch {}
+    suspendChatKeypressListeners();
     stdin.setRawMode(true);
     stdin.resume();
-    process.stdout.write(ANSI.mouseOn);
+    process.stdout.write(`${ANSI.alternateOn}${ANSI.mouseOn}`);
     render();
     stdin.on("data", onData);
   });
