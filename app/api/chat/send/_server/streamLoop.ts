@@ -1,4 +1,9 @@
-import { buildStreamLoopConfig, findCleanBoundaryForStream, hasUnclosedFence } from "./streamCut";
+import {
+  buildStreamLoopConfig,
+  findCleanBoundaryForStream,
+  findFirstCompleteBoundaryAfter,
+  hasUnclosedFence,
+} from "./streamCut";
 
 export type ConsumeMainStreamDeltasParams = {
   stream: AsyncIterable<any>;
@@ -43,17 +48,64 @@ export async function consumeMainStreamDeltas(
   const metaScanGraceChars = loopCfg.metaScanGraceChars;
   const allowMetaAfterCap = loopCfg.allowMetaAfterCap;
   const metaOpenRe = loopCfg.metaOpenRe;
+  const holdbackChars = loopCfg.holdbackChars;
+  const bodyOverflowMaxChars = loopCfg.bodyOverflowMaxChars;
 
   let raw = "";
   let hadDelta = false;
   let lastEmitAt = Date.now();
   let stoppedEarly = false;
 
+  // Text in raw[flushedLen..] is intentionally private. It can still be repaired
+  // before the append-only delta stream exposes it to the client.
+  let flushedLen = 0;
+  const flushTo = (targetLen: number) => {
+    const end = Math.min(Math.max(targetLen, flushedLen), raw.length);
+    if (end <= flushedLen) return;
+    const text = raw.slice(flushedLen, end);
+    flushedLen = end;
+    hadDelta = true;
+    params.safeEnqueue({ type: "delta", text });
+  };
+  const flushWithHoldback = () => flushTo(raw.length - holdbackChars);
+  const flushAll = () => flushTo(raw.length);
+
   let capReached = false;
   let metaStarted = false;
   let metaStartIdx = -1;
   let metaEmitted = 0;
   let pendingAfterCap = "";
+
+  const finishBodyFromPending = (continuation: string) => {
+    const addition = String(continuation || "").slice(0, bodyOverflowMaxChars);
+    const combined = raw + addition;
+    const completeAt = findFirstCompleteBoundaryAfter(
+      combined,
+      Math.max(0, capForText - 1),
+      combined.length
+    );
+
+    if (completeAt >= capForText) {
+      raw = combined.slice(0, completeAt);
+      return;
+    }
+
+    // The provider itself jumped to meta without completing the sentence. Roll
+    // back only inside the private holdback; sent deltas remain append-only.
+    const fallbackAt = findCleanBoundaryForStream(
+      combined,
+      Math.max(flushedLen, capForText - cleanWindow),
+      isG3Pro
+    );
+    if (fallbackAt >= flushedLen) {
+      raw = combined.slice(0, fallbackAt);
+      return;
+    }
+
+    // If no retractable boundary exists, preserving generated continuation is
+    // less destructive than the old hard cut at exactly bodyMaxChars.
+    raw = combined;
+  };
 
   for await (const delta of params.stream) {
     const d = String(delta ?? "");
@@ -89,22 +141,30 @@ export async function consumeMainStreamDeltas(
         } else if (out.length > remaining) {
           capReached = true;
           const original = out;
-          const initial = original.slice(0, remaining);
-          const candidate = raw + initial;
-          const minPos = Math.max(raw.length, capForText - cleanWindow);
-          const cutIdx = findCleanBoundaryForStream(candidate, minPos, isG3Pro);
-          const consumed = cutIdx >= raw.length && cutIdx <= candidate.length ? cutIdx - raw.length : initial.length;
-          out = original.slice(0, consumed);
-          scanRemainder = original.slice(consumed);
+          const crossingPrefixStart = Math.max(flushedLen, raw.length - 64);
+          const crossingCandidate = raw.slice(crossingPrefixStart) + original;
+          const crossingOpenAt = crossingCandidate.search(metaOpenRe);
 
-          // If we cut inside an unclosed fence, close it within reserved budget.
-          if (fenceReserve > 0) {
-            let cand2 = raw + out;
-            if (hasUnclosedFence(cand2)) {
-              cand2 = cand2.slice(0, capForText).trimEnd();
-              cand2 = (cand2.trimEnd() + "\n```").trimEnd();
-              out = cand2.slice(raw.length);
+          if (crossingOpenAt >= 0) {
+            const absoluteOpenAt = crossingPrefixStart + crossingOpenAt;
+            if (absoluteOpenAt < raw.length) {
+              // The opening fence itself straddles raw and this provider delta.
+              scanRemainder = crossingCandidate.slice(crossingOpenAt);
+              raw = raw.slice(0, absoluteOpenAt);
+              out = "";
+            } else {
+              const fenceAtInDelta = absoluteOpenAt - raw.length;
+              if (fenceAtInDelta <= remaining) {
+                out = original.slice(0, fenceAtInDelta);
+                scanRemainder = original.slice(fenceAtInDelta);
+              } else {
+                out = original.slice(0, remaining);
+                scanRemainder = original.slice(remaining);
+              }
             }
+          } else {
+            out = original.slice(0, remaining);
+            scanRemainder = original.slice(remaining);
           }
         }
       }
@@ -112,38 +172,49 @@ export async function consumeMainStreamDeltas(
 
     // Emit body/meta chunk (if any)
     if (out) {
-      const combined = raw + out;
-      raw = combined;
+      raw = raw + out;
       const now = Date.now();
       const gap = now - lastEmitAt;
       lastEmitAt = now;
 
-      hadDelta = true;
       if (params.streamDebug) console.debug(`${params.streamTag} delta recv (${params.tag}) (gap=${gap}ms len=${out.length})`);
-      params.safeEnqueue({ type: "delta", text: out });
+      flushWithHoldback();
     }
 
     // Track meta fence start if it appears in the emitted stream
     if (!metaStarted && metaOpenRe && metaOpenRe.test(raw)) {
-      metaStarted = true;
       const idx = raw.search(metaOpenRe);
-      metaStartIdx = Math.max(0, idx);
+      if (idx >= flushedLen) {
+        const metaChunk = raw.slice(idx);
+        raw = raw.slice(0, idx);
+        finishBodyFromPending("");
+        const bodyEnd = raw.length;
+        raw = raw + metaChunk;
+        const localFence = metaChunk.indexOf("```");
+        metaStartIdx = bodyEnd + (localFence >= 0 ? localFence : 0);
+      } else {
+        metaStartIdx = Math.max(0, idx);
+      }
+      metaStarted = true;
       metaEmitted = Math.max(0, raw.length - metaStartIdx);
     }
 
     // If body cap reached, keep scanning the non-emitted tail for a meta fence start.
     if (!metaStarted && capReached && allowMetaAfterCap && metaOpenRe) {
       if (scanRemainder) pendingAfterCap += scanRemainder;
-      if (pendingAfterCap.length > metaScanGraceChars) {
-        pendingAfterCap = pendingAfterCap.slice(-metaScanGraceChars);
-      }
 
-      const openAt = pendingAfterCap.search(metaOpenRe);
+      // Include a small private suffix from raw so a fence split exactly at the
+      // body cap (for example raw="\n``" + pending="`INFO") is still detected.
+      const scanPrefixStart = Math.max(flushedLen, raw.length - 64);
+      const metaCandidate = raw.slice(scanPrefixStart) + pendingAfterCap;
+      const openAt = metaCandidate.search(metaOpenRe);
       if (openAt >= 0) {
-        const metaChunkFull = pendingAfterCap.slice(openAt);
+        raw = raw.slice(0, scanPrefixStart) + metaCandidate.slice(0, openAt);
+        const metaChunkFull = metaCandidate.slice(openAt);
         pendingAfterCap = "";
         metaStarted = true;
 
+        finishBodyFromPending("");
         const rawBeforeLen = raw.length;
         let metaChunk = metaChunkFull;
         if (metaChunk.length > metaFenceMaxChars) {
@@ -156,10 +227,9 @@ export async function consumeMainStreamDeltas(
         metaStartIdx = rawBeforeLen + (localFence >= 0 ? localFence : 0);
         metaEmitted = Math.max(0, raw.length - metaStartIdx);
         lastEmitAt = Date.now();
-        hadDelta = true;
 
         if (params.streamDebug) console.debug(`${params.streamTag} meta passthru (${params.tag}) (len=${metaChunk.length})`);
-        params.safeEnqueue({ type: "delta", text: metaChunk });
+        flushWithHoldback();
 
         const metaSub = raw.slice(Math.max(0, metaStartIdx));
         if (params.isMetaFenceClosed(metaSub)) {
@@ -168,11 +238,10 @@ export async function consumeMainStreamDeltas(
         }
       } else if (pendingAfterCap.length >= metaScanGraceChars) {
         // No meta found within a large tail buffer.
-        // - If meta is REQUIRED, keep scanning until the model ends (but cap memory).
+        // - If meta is REQUIRED, keep scanning until the model ends. The pending
+        //   body is needed to complete the sentence before the eventual fence.
         // - If meta is optional, stop to avoid runaway.
-        if (params.metaRequired === "YES") {
-          pendingAfterCap = pendingAfterCap.slice(-metaScanGraceChars);
-        } else {
+        if (params.metaRequired !== "YES") {
           stoppedEarly = true;
           break;
         }
@@ -196,12 +265,22 @@ export async function consumeMainStreamDeltas(
     if (stoppedEarly) break;
   }
 
+  // No meta fence arrived. Still use the generated tail to finish the sentence
+  // instead of exposing a bodyMaxChars hard cut.
+  if (!metaStarted && capReached && pendingAfterCap) {
+    finishBodyFromPending(pendingAfterCap);
+    pendingAfterCap = "";
+  }
+
   // If the model ended naturally but left a fenced meta/status block open, close it (within *body* budget).
   if (!stoppedEarly && fenceReserve > 0 && hasUnclosedFence(raw) && raw.length + 4 <= bodyCapChars) {
-    raw = (raw.trimEnd() + "\n```").trimEnd();
-    hadDelta = true;
-    params.safeEnqueue({ type: "delta", text: "\n```" });
+    const kept = raw.slice(0, flushedLen);
+    const tail = raw.slice(flushedLen).replace(/[ \t\r\n]+$/, "");
+    raw = kept + tail;
+    raw = raw + (raw.endsWith("\n") ? "```" : "\n```");
   }
+
+  flushAll();
 
   return { raw, hadDelta };
 }

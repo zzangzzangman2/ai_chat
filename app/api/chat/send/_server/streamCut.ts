@@ -87,12 +87,6 @@ export function findCleanBoundaryForStream(text: string, minPos: number, isG3Pro
       continue;
     }
 
-    // 7) soft punctuation / clause break
-    if (/[,;:\uFF0C\uFF1B\uFF1A]/.test(ch)) {
-      const p = accept(i);
-      if (p >= 0) return p;
-      continue;
-    }
   }
 
   // Fallback: avoid whitespace cuts (they frequently produce mid-sentence breaks in Korean).
@@ -117,12 +111,30 @@ export function findCleanBoundaryForStream(text: string, minPos: number, isG3Pro
       return i;
   }
 
-  // Very last resort: cut at a whitespace boundary (avoid mid-word).
-  for (let i = s.length; i >= hardStart; i--) {
-    const ch = s[i - 1];
-    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
-      return i;
-    }
+  return -1;
+}
+
+export function findFirstCompleteBoundaryAfter(text: string, minPos: number, maxPos?: number): number {
+  const s = String(text || "");
+  const start = Math.max(0, Math.min(s.length, Math.floor(minPos)));
+  const limit = Math.max(start, Math.min(s.length, Math.floor(maxPos ?? s.length)));
+
+  for (let i = start; i < limit; i++) {
+    const ch = s[i];
+    if (!/[.!?\u3002\uFF01\uFF1F\u2026]/.test(ch)) continue;
+
+    // Do not mistake the dot in a decimal/version number for a sentence ending.
+    if (ch === "." && /\d/.test(s[i - 1] || "") && /\d/.test(s[i + 1] || "")) continue;
+
+    let end = i + 1;
+    while (end < limit && /[.!?\u3002\uFF01\uFF1F\u2026]/.test(s[end])) end += 1;
+    while (end < limit && /[\*"'\u2019\u201D)\]}]/.test(s[end])) end += 1;
+
+    // A sentence marker embedded in a word is not a safe streaming boundary.
+    const next = s[end] || "";
+    if (next && !/\s/.test(next)) continue;
+    while (end < limit && /[ \t\r\n]/.test(s[end])) end += 1;
+    return end;
   }
 
   return -1;
@@ -164,6 +176,8 @@ export type StreamLoopConfig = {
   metaScanGraceChars: number;
   allowMetaAfterCap: boolean;
   metaOpenRe: RegExp;
+  holdbackChars: number;
+  bodyOverflowMaxChars: number;
 };
 
 export function buildStreamLoopConfig(params: BuildStreamLoopConfigParams): StreamLoopConfig {
@@ -182,6 +196,24 @@ export function buildStreamLoopConfig(params: BuildStreamLoopConfigParams): Stre
   // NOTE: We intentionally do NOT require whitespace after ``` because creators may use arbitrary labels like ```on.
   const metaOpenRe = /(^|\n)\s*```[^\n]*/i;
 
+  // Keep the tail private until the server knows whether the body is complete.
+  // This lets us retract an unfinished final sentence without changing text already sent.
+  const holdbackChars = (() => {
+    if (!isG3Pro) return 0;
+    const env = parseInt(process.env.AI_G3PRO_STREAM_HOLDBACK_CHARS || "", 10);
+    const value = Number.isFinite(env) && env >= 0 ? env : 600;
+    return Math.max(0, Math.min(1200, value));
+  })();
+
+  // bodyMaxChars is a soft target. Preserve the generated continuation through the
+  // next complete sentence before switching to the trailing meta panel.
+  const bodyOverflowMaxChars = (() => {
+    const env = parseInt(process.env.AI_STREAM_BODY_OVERFLOW_CHARS || "", 10);
+    const fallback = isG3Pro ? 800 : 480;
+    const value = Number.isFinite(env) && env > 0 ? env : fallback;
+    return Math.max(128, Math.min(2000, value));
+  })();
+
   return {
     bodyCapChars,
     fenceReserve,
@@ -192,5 +224,7 @@ export function buildStreamLoopConfig(params: BuildStreamLoopConfigParams): Stre
     metaScanGraceChars,
     allowMetaAfterCap,
     metaOpenRe,
+    holdbackChars,
+    bodyOverflowMaxChars,
   };
 }
