@@ -140,6 +140,15 @@ export function selectHybridMemory(params: {
         const occurrences = hay.split(token).length - 1;
         if (occurrences > 1) score += Math.min(3, occurrences - 1);
       }
+      // Persistent state changes must not lose a top slot to incidental name mentions.
+      // The continuity ledger independently enforces the latest state, while this boost
+      // also gives the model the surrounding event that caused the state change.
+      if (
+        score > 0 &&
+        /(?:사망|사살|숨졌|죽었|목숨을\s*잃|생존|부활|되살아|실종|행방불명|결혼|이혼|임신|출산)/u.test(hay)
+      ) {
+        score += 20;
+      }
       for (const range of ranges) {
         if (rangesOverlap(range, section)) score += 100;
       }

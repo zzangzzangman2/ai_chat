@@ -379,6 +379,7 @@ function isGemini3ProFamily(model: string): boolean {
 }
 
 export function getReasoningLevelOptions(model: string): ReasoningLevel[] {
+  if (/^gemini-3\.6-flash(?:-|$)/i.test(String(model || ""))) return ["middle", "high"];
   if (isGemini3ProFamily(model)) return ["zero", "middle", "high"];
   return ["low", "middle", "high"];
 }
@@ -389,6 +390,10 @@ export function getReasoningPresets(model: string): Record<ReasoningLevel, numbe
   if (isGemini3ProFamily(model)) {
     // The zero slot is shown as FAST and maps to the officially supported low level.
     return { zero: 0, low: 384, middle: 768, high: 1536 };
+  }
+  if (/^gemini-3\.6-flash(?:-|$)/i.test(model)) {
+    // Gemini 3.6 Flash officially exposes medium/high thinking levels.
+    return { zero: 640, low: 640, middle: 640, high: 1024 };
   }
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(model)) {
     // Gemini 3 Flash: LOW는 latency 우선 minimal, MID/HIGH는 thinkingLevel로 매핑한다.
@@ -450,6 +455,7 @@ export function stripLeadingTitleForDisplay(text: string): string {
 export function getModelDisplayLabel(rawModel: string): string {
   const m = String(rawModel || "").replace(/^google\//i, "").trim().toLowerCase();
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) return "3.1-pro";
+  if (/^gemini-3\.6-flash(?:-|$)/i.test(m)) return "3.6-flash";
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) return "3.5-flash";
   if (/^gemini-3-pro(?:-|$)/i.test(m)) return "3.1-pro";
   if (/^gemini-2\.5-flash(?:-|$)/i.test(m)) return "2.5-pro";
@@ -461,6 +467,9 @@ export function getModelBadge(rawModel: string): { label: string; bg: string; fg
   const m = String(rawModel || "").replace(/^google\//i, "").trim().toLowerCase();
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) {
     return { label: "3.1-pro", bg: "rgba(255, 75, 75, 0.22)", fg: "rgba(255, 165, 165, 0.98)" };
+  }
+  if (/^gemini-3\.6-flash(?:-|$)/i.test(m)) {
+    return { label: "3.6-flash", bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };
   }
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) {
     return { label: "3.5-flash", bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };

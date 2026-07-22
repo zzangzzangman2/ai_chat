@@ -150,24 +150,17 @@ export async function POST(req: Request) {
       .get(chatId) as any;
     const rolledUpCount = Math.max(0, Number(row?.rolledUpCount || 0));
 
-    const saveEditedSummary = db.transaction(() => {
-      db.prepare(
-        `INSERT INTO chat_memory_cache (chatId, recentSummary, summarizedEndTurn, rolledUpCount, lastSummarizedAt, updatedAt, recentSummaryChars)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(chatId) DO UPDATE SET
-           recentSummary=excluded.recentSummary,
-           summarizedEndTurn=excluded.summarizedEndTurn,
-           rolledUpCount=excluded.rolledUpCount,
-           lastSummarizedAt=excluded.lastSummarizedAt,
-           updatedAt=excluded.updatedAt,
-           recentSummaryChars=excluded.recentSummaryChars`
-      ).run(chatId, encryptIfPossible(next), nextEndTurn, rolledUpCount, now, now, recentSummaryChars);
-
-      // 수동 편집 전 내용으로 만든 검색 블록이 다시 주입되지 않게 원자적으로 비운다.
-      // 다음 자동 갱신 때 현재 캐시 요약을 기준으로 안전하게 재구축된다.
-      db.prepare(`DELETE FROM chat_memory_blocks WHERE chatId=?`).run(chatId);
-    });
-    saveEditedSummary();
+    db.prepare(
+      `INSERT INTO chat_memory_cache (chatId, recentSummary, summarizedEndTurn, rolledUpCount, lastSummarizedAt, updatedAt, recentSummaryChars)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(chatId) DO UPDATE SET
+         recentSummary=excluded.recentSummary,
+         summarizedEndTurn=excluded.summarizedEndTurn,
+         rolledUpCount=excluded.rolledUpCount,
+         lastSummarizedAt=excluded.lastSummarizedAt,
+         updatedAt=excluded.updatedAt,
+         recentSummaryChars=excluded.recentSummaryChars`
+    ).run(chatId, encryptIfPossible(next), nextEndTurn, rolledUpCount, now, now, recentSummaryChars);
 
     return NextResponse.json({
       ok: true,

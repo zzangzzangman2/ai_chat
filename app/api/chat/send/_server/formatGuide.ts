@@ -41,9 +41,11 @@ export function buildFormatGuide(args: FormatGuideArgs): string {
   const bodyTargetChars = Math.max(200, Math.min(bodyMaxChars, targetChars || bodyMaxChars));
   const bodyFloorChars =
     metaRequired === "YES"
-      ? Math.max(200, Math.floor(bodyTargetChars * 0.72))
+      ? Math.max(200, Math.min(promptMinChars, Math.floor(bodyTargetChars * 0.9)))
       : Math.max(200, Math.floor((targetChars || promptMinChars) * 0.9));
-  const beatBasisChars = metaRequired === "YES" ? bodyFloorChars : bodyTargetChars;
+  // The status panel has its own tail budget. Base scene density on the narrative
+  // target so a large panel cannot make a nominal 1200-char reply end at ~600 chars.
+  const beatBasisChars = bodyTargetChars;
   const beatCount =
     beatBasisChars >= 2400 ? 7 :
     beatBasisChars >= 1700 ? 5 :
@@ -101,7 +103,7 @@ const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars
 `   메타/상태 fenced 코드블록은 서사 본문이 끝난 뒤 답변의 맨 마지막에 1회. 서사 중간 삽입 금지. 닫는 ${FENCE} 이후엔 어떤 텍스트도 출력하지 않는다.`,
 `   - "[상태창 대화]" 같은 메타 라벨만 대사처럼 출력 금지. 상태창/시스템이 말한다면 실제 대사 문장까지 완성하고, 라벨은 메타 fenced 코드블록에만 쓴다.`,
 (metaRequired === "YES"
-  ? `   (최우선) 메타 fenced 코드블록은 절대 생략 금지. 공간이 부족하면 본문을 줄여서라도 메타를 완성한다.
+  ? `   (최우선) 메타 fenced 코드블록은 절대 생략 금지. 단, 메타는 별도 예산이므로 서사 본문 최소 분량을 줄이는 근거로 삼지 않는다.
    - 본문 + 메타 합쳐 약 ${promptMaxChars}자 이내. 본문은 약 ${bodyMaxChars}자 이내에서 완결된 문장/지문/대사로 마무리한 뒤 ${FENCE}로 메타 시작.
    - 지문은 *로, 대사는 "로 닫고 문장/조사 중간에서 끊지 않는다. 대사 안에서 [ 로 시작한 통신/방송/속말 표기는 반드시 ] 로 닫는다. 본문 끝이 종결 기호(. ! ? … " * ] )로 닫히지 않으면 짧은 완결 문장을 더 붙여 마침표로 닫고 메타 시작.
    - 메타 블록은 약 ${metaMaxChars}자 이내로 간결하게. 라벨 자유(없어도 됨). 내부 빈칸 금지(모르는 값은 "미상", 템플릿 "|" 컬럼은 끝까지 채움). 시작했으면 반드시 닫는 ${FENCE}까지.`
@@ -111,15 +113,16 @@ const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars
 `5) 한국어로만 쓴다. 답변 안에 모델 자기참조/계획/해설/(OOC) 라인 금지. 예: "이제 ~할 차례다", "(이 답변에서는...)", "다음에는 ~를 묘사하겠다" 모두 금지.`,
 `6) 이번 턴 서사 본문 분량 목표는 약 ${targetChars}자. (메타는 답변 맨 끝 별도 예산)`,
 (metaRequired === "YES"
-      ? `   - 본문 약 ${Math.min(bodyMaxChars, targetChars)}자 내외(권장 ${Math.max(200, Math.floor(Math.min(bodyMaxChars, targetChars) * 0.80))}~${Math.min(bodyMaxChars, targetChars)}자)로 마무리하고 즉시 메타로. 전체(본문+메타) 최소 ${promptMinChars}자, 최대 ${promptMaxChars}자.`
+      ? `   - 상태창을 제외한 서사 본문만 최소 ${bodyFloorChars}자, 목표 ${bodyTargetChars}자를 채운 뒤 메타로 넘어간다. 상태창 글자 수를 본문 분량에 합산하지 않는다. 전체(본문+메타)는 최대 ${promptMaxChars}자.`
       : `   - 최소 ${promptMinChars}자 이상을 채워 길고 풍성하게. 짧으면 묘사/심리/배경을 대폭 보강해 분량을 늘려라.`),
 `   - 너무 길어지면 ${softCapChars}자 근처에서 자연스럽게 마무리하고 메타로 넘어간다. 본문 상한을 맞추려고 문장/지문/따옴표를 중간에 끊지 않는다.`,
 `6.1) 단일 호출 분량 계약: 서버는 짧은 답변을 재호출로 늘리지 않는다. 첫 답변 안에서 직접 분량을 채운다.`,
-`   - 본문이 약 ${bodyFloorChars}자보다 짧은 상태에서는 종료하지 않는다. 글자수를 정확히 셀 수 없으면 최소 ${beatCount}개 장면 비트를 채운 뒤 끝낸다.`,
+`   - 상태창/코드블록을 모두 제외한 본문이 ${bodyFloorChars}자보다 짧은 상태에서는 절대 종료하지 않는다. 글자수를 정확히 셀 수 없으면 최소 ${beatCount}개의 충분한 장면 비트를 서로 다른 문단으로 채운 뒤 끝낸다.`,
 `   - 장면 비트는 관찰 가능한 반응, 표정/몸짓, 주변 상황 변화, NPC의 판단 변화, 다음 선택지를 압박하는 대사 중 서로 다른 요소로 구성한다.`,
+`   - 짧은 대사 한 줄이나 상태창 한 줄을 장면 비트로 세지 않는다. 장면이 단순해도 감각 묘사, NPC 반응, 주변 변화로 본문 분량을 채운다.`,
 `   - 목표 문단 수는 ${paragraphHint}문단이다. 한 문단짜리 요약이나 즉답만으로 끝내지 않는다.`,
-`   - 메타/상태창이 필수이면 본문을 더 늘리는 것보다 완성된 fenced 메타를 우선한다. 메타를 시작했다면 항목 일부만 쓰고 닫지 말고, 짧더라도 의미 있는 전체 상태창을 완성한다.`,
-`6.5) statusRequired=YES 또는 metaRequired=YES면 메타/STATUS fenced 블록을 답변 맨 끝에 반드시 1회 포함한다. 본문보다 우선이고 닫는 ${FENCE} 필수.`,
+`   - 메타/상태창이 필수이면 본문 최소 분량을 먼저 채운 뒤 완성된 fenced 메타를 출력한다. 메타를 시작했다면 항목 일부만 쓰고 닫지 말고, 간결하더라도 의미 있는 전체 상태창을 완성한다.`,
+`6.5) statusRequired=YES 또는 metaRequired=YES면 본문 최소 분량을 달성한 뒤 메타/STATUS fenced 블록을 답변 맨 끝에 반드시 1회 포함한다. 닫는 ${FENCE} 필수.`,
 `7) 2단계 종료 구조: 1단계(본문, *지문*/"대사")로 장면 전개 → 2단계(필요할 때만 메타 fenced 1회). 2단계가 필요하면 출력 전 종료 금지. 서사 본문이 대사로 끝났다면 짧은 지문 1~2문장으로 마무리 권장(단, '*...*' 단독 자리표시자 금지).`,
 `8) 장면은 사용자의 다음 입력이 필요한 지점(상대 반응/질문/긴장)에서 멈춘다. 한 답변 안에 며칠/몇 주 건너뛰기 및 자가 결말 금지. 주인공의 다음 발화/행동을 대신 쓰지 않는다.`,
 `9) 매 답변의 첫 문장(지문/대사)을 직전 1~2턴과 같은 단어/구조로 시작하지 않는다. 도입 표현을 매번 다르게.`,

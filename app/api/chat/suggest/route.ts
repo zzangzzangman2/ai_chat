@@ -340,9 +340,8 @@ export async function POST(req: Request) {
       user,
       opts: {
         // Fast + cheap, but keep enough quality
-        model: "gemini-3.5-flash",
+        model: "gemini-3.6-flash",
         maxOutputTokens: 220,
-        temperature: 0.25,
       } as any,
     });
 

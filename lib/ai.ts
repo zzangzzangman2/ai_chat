@@ -1,13 +1,25 @@
 import { GoogleGenAI } from "@google/genai";
+import { createHash } from "crypto";
 import {
   isGemini25ProModel,
   isGemini31ProModel,
+  isGemini36FlashModel,
   isGemini3FlashModel,
   isGemini3Model,
   isGemini3ProModel,
   providerModelNameForGemini,
   stripProviderPrefix,
 } from "@/lib/models";
+
+// (디버그) 캐시 프리픽스 안정성 확인용: 시스템 프롬프트가 턴 간 바이트 동일하면 해시도 동일.
+// CHAT_DEBUG=1 로그(gemini.req)에서 systemHash가 턴마다 같아야 implicit cache가 적중할 수 있다.
+function promptHash12(s: string): string {
+  try {
+    return createHash("sha1").update(String(s || ""), "utf8").digest("hex").slice(0, 12);
+  } catch {
+    return "";
+  }
+}
 
 function envFlag(name: string) {
   const v = String(process.env[name] || "").trim().toLowerCase();
@@ -250,17 +262,17 @@ function buildThinkingConfig(model: string, maxReasoningTokens: number, maxOutpu
     //
     // (보수적 매핑, 2026-05) thinkingLevel은 hard cap이 아니라 강도 힌트라서
     // "medium"으로 보내면 실제 reasoning이 2000~3500 토큰까지 쉽게 튀어오른다.
-    // Gemini 3.1 Pro cannot disable thinking. The fastest supported setting is low.
+    // Gemini 3.1 Pro cannot disable thinking. Use supported levels only:
+    // FAST/legacy LOW -> low, MID -> medium, HIGH -> high.
     if (t <= 0) {
       return { thinkingLevel: "low" };
     }
-
-    // Numeric UI presets are local intent; the provider receives supported levels only.
-    //  - FAST/legacy LOW (<640) → low
-    //  - MID (>=640) → medium
-    //  - HIGH (>=1280) → high
     const level = t >= 1280 ? "high" : t >= 640 ? "medium" : "low";
     return { thinkingLevel: level };
+  }
+  if (isGemini36FlashModel(model)) {
+    // Gemini 3.6 Flash supports medium/high; legacy zero/LOW maps to medium.
+    return { thinkingLevel: t >= 1024 ? "high" : "medium" };
   }
   if (isGemini3Flash(model)) {
     // Gemini 3 Flash defaults to dynamic/high thinking if omitted.
@@ -781,6 +793,7 @@ export async function generateText(params: {
         topK: samplingConfig?.topK ?? null,
         stopSequences: stopSequences.length ? stopSequences : null,
         systemChars: system.length,
+        systemHash: promptHash12(system),
         userChars: user.length,
         systemPreview: safePreview(system, 240),
         userPreview: safePreview(user, 240),
@@ -962,7 +975,9 @@ export async function generateText(params: {
     // Do ONE rescue call on the SAME model to secure visible output.
     // For Gemini 3 Pro, avoid thinkingLevel (some variants reject certain levels).
     // Instead, cap thinking strictly with a small thinkingBudget.
-    const rescueLevel = isGemini3Flash(opts.model) ? "minimal" : "low";
+    const rescueLevel = isGemini36FlashModel(opts.model)
+      ? "medium"
+      : isGemini3Flash(opts.model) ? "minimal" : "low";
     const rescueThinkingConfig: any = modelIs3Pro ? { thinkingBudget: 128 } : { thinkingLevel: rescueLevel };
     const rescueHeadroom = modelIs3Pro ? 1024 : thinkingLevelHeadroom(rescueLevel);
 
@@ -1269,6 +1284,7 @@ export async function generateTextStream(params: {
         topK: samplingConfig?.topK ?? null,
         stopSequences: stopSequences.length ? stopSequences : null,
         systemChars: system.length,
+        systemHash: promptHash12(system),
         userChars: user.length,
         systemPreview: safePreview(system, 240),
         userPreview: safePreview(user, 240),
@@ -1451,12 +1467,70 @@ export async function generateTextStream(params: {
     return parts0.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
   };
 
+  // (진단 2026-07) 지연 분해용 스트림 계측:
+  // - ttftMs: 첫 가시 청크까지 시간 (프리필+대기+안전필터 홀드 포함)
+  // - maxInterChunkMs: 청크 사이 최대 공백 (스트림 중간 멈춤 = 안전필터 홀드/혼잡 정황)
+  // thinking=0인데 총 시간이 긴 케이스가 "첫 토큰 대기"인지 "중간 멈춤"인지 구분할 수 있다.
+  let tFirstChunkAt = 0;
+  let lastChunkAt = 0;
+  let maxInterChunkMs = 0;
+  let streamChunks = 0;
+  // (수정 2026-07) 일부 SDK/엔드포인트 조합은 usageMetadata를 responsePromise가 아니라
+  // "마지막 스트림 청크"에 실어 보낸다. 이걸 안 읽으면 스트림 턴의 usage가 0으로 저장되어
+  // reasoning/finishReason이 항상 비어 보이는 문제가 있었다. 청크에서도 usage를 수집한다.
+  let usageFromChunks: any = null;
+  let finishFromChunks = "";
+  let streamEndKind = ""; // 진단: done|consumer-break
+  let tailDrainChunks = 0; // 진단: 조기중단 후 추가로 읽은 청크 수
+  let lastChunkKeys = ""; // 진단: 마지막 청크의 필드 구성
+
+  // 중간 청크의 usageMetadata는 '부분'(trafficType 등만)일 수 있고,
+  // prompt/thoughts 수치가 포함된 '완전한' usage는 마지막 청크에만 실린다.
+  const usageLooksComplete = (u: any) => Number(u?.promptTokenCount ?? u?.prompt_tokens ?? 0) > 0;
+
+  const collectChunkMeta = (chunk: any) => {
+    try {
+      const um = chunk?.usageMetadata || chunk?.usage;
+      if (um && typeof um === "object") {
+        // 더 완전한(늦게 온) usage가 이전 부분 usage를 덮어쓰게 한다.
+        if (!usageFromChunks || usageLooksComplete(um) || !usageLooksComplete(usageFromChunks)) {
+          usageFromChunks = um;
+        }
+      }
+      const fr = String(chunk?.candidates?.[0]?.finishReason || "");
+      if (fr) finishFromChunks = fr;
+      if (chunk && typeof chunk === "object") lastChunkKeys = Object.keys(chunk).join(",");
+    } catch {
+      // ignore
+    }
+  };
+
+  // NOTE: for-await 대신 이터레이터를 수동으로 잡는다.
+  // 소비자(route)가 fence 닫힘 등으로 조기 break하면 for-await는 내부 스트림까지
+  // 즉시 닫아버려서, "마지막 청크에 실려 오는 usage/finishReason"을 영영 놓친다.
+  // (그동안 스트림 턴의 usage가 추정치로만 저장되던 원인)
+  const innerIt: AsyncIterator<any> = (streamIter as any)[Symbol.asyncIterator]();
+
   async function* iterator(): AsyncIterable<string> {
     try {
-      for await (const chunk of streamIter) {
+      while (true) {
         throwIfAborted(opts.signal);
+        const r = await innerIt.next();
+        throwIfAborted(opts.signal);
+        if (r?.done) {
+          streamEndKind = "done";
+          break;
+        }
+        const chunk = r?.value;
+        collectChunkMeta(chunk);
         const t = extractChunkText(chunk);
         if (!t) continue;
+
+        const nowChunk = Date.now();
+        if (!tFirstChunkAt) tFirstChunkAt = nowChunk;
+        if (lastChunkAt) maxInterChunkMs = Math.max(maxInterChunkMs, nowChunk - lastChunkAt);
+        lastChunkAt = nowChunk;
+        streamChunks += 1;
 
         // Support both cumulative and incremental chunk styles.
         let delta = t;
@@ -1470,6 +1544,32 @@ export async function generateTextStream(params: {
         if (delta) yield delta;
       }
     } finally {
+      // (usage 꼬리 회수) 소비자가 조기 중단해도 usage가 실린 마지막 청크를
+      // 잠깐(≤1.2초)만 더 읽어 회수한다. 텍스트는 버린다.
+      try {
+        if (!streamEndKind) streamEndKind = "consumer-break";
+        if (!controller.signal.aborted && !usageLooksComplete(usageFromChunks)) {
+          const deadline = Date.now() + 1200;
+          while (Date.now() < deadline) {
+            const waitMs = Math.max(50, deadline - Date.now());
+            const r: any = await Promise.race([
+              innerIt.next().catch(() => null),
+              new Promise((res) => setTimeout(() => res(undefined), waitMs)),
+            ]);
+            if (!r || r.done) break;
+            tailDrainChunks += 1;
+            collectChunkMeta(r.value);
+            if (usageLooksComplete(usageFromChunks)) break;
+          }
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        innerIt.return?.(undefined as any);
+      } catch {
+        // ignore
+      }
       try {
         doneResolve && doneResolve();
       } catch {
@@ -1489,8 +1589,9 @@ export async function generateTextStream(params: {
       resp = null;
     }
 
-    const usage = (resp?.usageMetadata || resp?.usage || {}) as any;
-    const finishReason = String(resp?.candidates?.[0]?.finishReason || resp?.finishReason || "");
+    // responsePromise가 usage를 안 주는 SDK 조합에서는 마지막 청크에서 수집한 usage로 보강한다.
+    const usage = (resp?.usageMetadata || resp?.usage || usageFromChunks || {}) as any;
+    const finishReason = String(resp?.candidates?.[0]?.finishReason || resp?.finishReason || finishFromChunks || "");
 
     const promptTokens = Number(usage?.promptTokenCount ?? usage?.prompt_tokens ?? 0) || 0;
     const outputTokens = Number(usage?.candidatesTokenCount ?? usage?.output_tokens ?? 0) || 0;
@@ -1525,7 +1626,32 @@ export async function generateTextStream(params: {
       reasoningHeadroomTokens: Math.max(0, Number(effectiveMaxOutputTokens || 0) - Number(maxOutputTokensForProvider || 0)),
       thinkingBudget: (thinkingConfig as any)?.thinkingBudget ?? null,
       thinkingLevel: (thinkingConfig as any)?.thinkingLevel ?? null,
+      // (진단) 지연 분해: 첫 청크까지 / 중간 최대 공백 / 청크 수
+      ttftMs: tFirstChunkAt ? tFirstChunkAt - t0 : null,
+      maxInterChunkMs,
+      streamChunks,
     };
+
+    if (isChatDebug()) {
+      console.log(
+        JSON.stringify({
+          tag: "gemini.resp.stream",
+          model: opts.model,
+          latencyMs,
+          ttftMs: (finalUsage as any).ttftMs,
+          maxInterChunkMs,
+          streamChunks,
+          promptTokens,
+          outputTokens,
+          reasoningTokens,
+          finishReason,
+          usageSource: resp?.usageMetadata || resp?.usage ? "resp" : usageFromChunks ? "chunks" : "none",
+          streamEndKind,
+          tailDrainChunks,
+          lastChunkKeys,
+        })
+      );
+    }
 
     // Update rolling stats for Gemini 3 Pro headroom tuning (best-effort).
     try {
@@ -1823,8 +1949,11 @@ export async function summarizeLongMemoryKorean(params: {
 - [사용자]가 관계/호칭을 부정하거나 정정하면 그 최신 정정을 [어시스턴트]의 이전 서술보다 우선해라.
 - 부정된 관계 단어를 긍정 관계로 뒤집지 말고, 부정/철회/정정 상태를 그대로 보존해라.
 - 시간 흐름은 과거→현재 순으로 유지하고, 최신 변화/현재 상태를 문장 끝에서 분명히 마무리해라.
-- 숫자 정보(나이/출생연도/횟수/수치/날짜)는 반드시 원문의 숫자 표기를 그대로 복사해라. 숫자를 한글 음차나 비슷한 표현으로 바꾸지 마라(예: 2004년생을 공사년생으로 바꾸면 안 된다).
+- 숫자 정보(나이/횟수/수치/날짜)는 가능하면 원문 값을 유지해라.
 - 기존 사실과 충돌하는 새 정보가 있으면 '변경됨'을 짧게 명시해라.
+- 사망/사살/생존/부활/실종/귀환은 해당 인물의 고유명사와 확정 여부를 반드시 함께 보존해라.
+- 사망 보도/소문/추정과 실제 사망을 구분하고, 이후 생존 확인이나 오보 정정이 있으면 최신 상태를 명시해라.
+- 죽거나 실종된 인물을 후속 장면에서 근거 없이 살아 돌아온 것으로 요약하지 마라.
 - 문장을 중간에서 끊지 말고 완결된 문장으로 끝내라.`;
 
   const user = `아래 [대화]를 읽고 장기기억 요약을 작성해줘.${extraGuide}
@@ -1847,7 +1976,7 @@ ${cleanDialogue}`;
   const summaryModel = noDownshift
     ? String(opts.model || "").trim()
     : opts.model && opts.model.startsWith("gemini-3")
-      ? "gemini-3.5-flash"
+      ? "gemini-3.6-flash"
       : opts.model;
 
   const summaryMaxOutputTokens =
@@ -2003,8 +2132,11 @@ export async function summarizeLongMemorySectionKorean(params: {
 - [사용자]가 관계/호칭을 부정하거나 정정하면 그 최신 정정을 [어시스턴트]의 이전 서술보다 우선할 것
 - 부정된 관계 단어를 긍정 관계로 뒤집지 말고, 부정/철회/정정 상태를 그대로 보존할 것
 - 시간 흐름은 구간 시작→종료 순으로 유지하고, 최신 상태/결론을 마지막에 명시할 것
-- 숫자 정보(나이/출생연도/횟수/수치/날짜)는 반드시 원문의 숫자 표기를 그대로 복사. 숫자를 한글 음차나 비슷한 표현으로 바꾸지 말 것(예: 2004년생을 공사년생으로 바꾸면 안 됨)
+- 숫자 정보(나이/횟수/수치/날짜)는 가능하면 원문 값을 유지
 - 기존 사실과 충돌하는 새 정보가 있으면 '변경됨'을 짧게 명시
+- 사망/사살/생존/부활/실종/귀환은 해당 인물의 고유명사와 확정 여부를 반드시 함께 보존할 것
+- 사망 보도/소문/추정과 실제 사망을 구분하고, 이후 생존 확인이나 오보 정정이 있으면 최신 상태를 명시할 것
+- 죽거나 실종된 인물을 후속 장면에서 근거 없이 살아 돌아온 것으로 요약하지 말 것
 - 사실/등장인물을 임의로 추가하지 말 것
 - 본문(2번째 줄)은 약 ${soft}자 이내로 최대한 압축(필요하면 과감히 생략)
 ${extraGuide}
@@ -2026,7 +2158,7 @@ ${cleanDialogue}`;
   const summaryModel = noDownshift
     ? String(opts.model || "").trim()
     : opts.model && opts.model.startsWith("gemini-3")
-      ? "gemini-3.5-flash"
+      ? "gemini-3.6-flash"
       : opts.model;
 
   const summaryMaxOutputTokens =

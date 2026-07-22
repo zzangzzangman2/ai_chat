@@ -351,7 +351,7 @@ export async function POST(req: Request) {
       "No markdown. No extra text.",
     ].join("\n");
 
-    const model = String(process.env.CHARACTER_TURN_MEMORY_MODEL || "gemini-3.5-flash").trim();
+    const model = String(process.env.CHARACTER_TURN_MEMORY_MODEL || "gemini-3.6-flash").trim();
     const r = await generateText({
       system,
       user,

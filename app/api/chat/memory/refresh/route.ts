@@ -41,7 +41,7 @@ function pickLongMemorySummaryModel() {
   if (forced) return forced;
 
   // Long-memory refresh always prefers fast/cheap summarization.
-  return "gemini-3.5-flash";
+  return "gemini-3.6-flash";
 }
 
 function pickLongMemorySummaryFallbackModel() {

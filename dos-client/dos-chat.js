@@ -10,10 +10,10 @@ const readline = require("readline/promises");
 const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, "data", "data.sqlite3");
 const ENC_PREFIX = "enc:v1:";
-const MODELS = ["gemini-2.5-pro", "gemini-3.5-flash", "gemini-3.1-pro-preview"];
+const MODELS = ["gemini-2.5-pro", "gemini-3.6-flash", "gemini-3.1-pro-preview"];
 const MODEL_OPTIONS = [
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
+  { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
   { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview" },
 ];
 
@@ -38,6 +38,8 @@ function isGemini3FlashModel(model) {
 }
 function getReasoningPresets(model) {
   if (isGemini3ProFamilyModel(model)) return { zero: 0, middle: 768, high: 1536 };
+  // Gemini 3.6 Flash supports medium/high thinking levels, not zero/minimal.
+  if (/^gemini-3\.6-flash(?:-|$)/i.test(String(model || ""))) return { middle: 640, high: 1024 };
   if (isGemini3FlashModel(model))     return { low: 0, middle: 640, high: 1024 };
   return { low: 384, middle: 768, high: 2048 }; // gemini-2.5-pro 등
 }
@@ -46,8 +48,9 @@ function reasoningTokensForModelChange(currentModel, nextModel, currentTokens) {
   const currentPresets = getReasoningPresets(currentModel);
   const nextPresets = getReasoningPresets(nextModel);
   let level = inferLevel(currentPresets, currentTokens);
-  if (level === "zero" && !Object.prototype.hasOwnProperty.call(nextPresets, "zero")) level = "low";
-  if (level === "low" && !Object.prototype.hasOwnProperty.call(nextPresets, "low")) level = "zero";
+  if (!Object.prototype.hasOwnProperty.call(nextPresets, level)) {
+    level = Object.prototype.hasOwnProperty.call(nextPresets, "middle") ? "middle" : Object.keys(nextPresets)[0];
+  }
   return nextPresets[level] ?? Object.values(nextPresets)[0];
 }
 function reasoningLevelLabel(model, level) {
@@ -2339,6 +2342,8 @@ async function updateSetting(field, value) {
   } else if (field === "maxReasoningTokens") {
     const presets = getReasoningPresets(next.model || st.model);
     const zeroAvailable = Object.prototype.hasOwnProperty.call(presets, "zero");
+    const reasonCommand = { zero: "fast", low: "low", middle: "mid", high: "high" };
+    const availableCommandText = Object.keys(presets).map((key) => reasonCommand[key]).filter(Boolean).join(" | ");
     if (!v) {
       const cur = inferLevel(presets, st.maxReasoningTokens);
       hr("추론 토큰");
@@ -2351,7 +2356,7 @@ async function updateSetting(field, value) {
         console.log(`  ${label} → ${detail}`);
       }
       console.log("");
-      console.log(`변경: /reason ${zeroAvailable ? "fast | mid | high" : "low | mid | high"}`);
+      console.log(`변경: /reason ${availableCommandText}`);
       const isGemini3Pro = isGemini3ProFamilyModel(next.model || st.model);
       if (isGemini3Pro) {
         console.log("");
@@ -2361,7 +2366,7 @@ async function updateSetting(field, value) {
     }
     const lv = parseLevelArg(v, zeroAvailable);
     if (!lv || !Object.prototype.hasOwnProperty.call(presets, lv)) {
-      console.log(`/reason ${zeroAvailable ? "fast | mid | high" : "low | mid | high"} 중 하나로 입력하세요.`);
+      console.log(`/reason ${availableCommandText} 중 하나로 입력하세요.`);
       return;
     }
     next.maxReasoningTokens = presets[lv];

@@ -8,8 +8,9 @@ export function getModelPricing(model: string): ModelPricing {
   const table: Record<string, ModelPricing> = {
     // Gemini 2.5
     "gemini-2.5-pro": { inPer1M: 1.25, outPer1M: 10.0 },
-    // Gemini 3.x flash — 신/구 ID 모두 같은 단가로 매핑 (사용자가 구체 단가 알리기 전까지 기존 3-flash 단가 유지)
-    "gemini-3.5-flash": { inPer1M: 0.3, outPer1M: 2.5 },
+    // Official on-demand Gemini API pricing (USD per 1M tokens).
+    "gemini-3.6-flash": { inPer1M: 1.5, outPer1M: 7.5 },
+    "gemini-3.5-flash": { inPer1M: 1.5, outPer1M: 9.0 },
     "gemini-3-flash-preview": { inPer1M: 0.3, outPer1M: 2.5 },
     "gemini-3.1-flash": { inPer1M: 0.3, outPer1M: 2.5 },
     "gemini-3.1-pro-preview": { inPer1M: 2.0, outPer1M: 12.0 },

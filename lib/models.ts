@@ -1,6 +1,6 @@
 export const GEMINI_25_PRO_MODEL = "gemini-2.5-pro" as const;
-// (변경 2026-05) gemini-3-flash-preview → gemini-3.5-flash. 변수명은 보존(하위 호환).
-export const GEMINI_3_FLASH_MODEL = "gemini-3.5-flash" as const;
+// Legacy constant name is preserved for callers while the selected Flash model advances.
+export const GEMINI_3_FLASH_MODEL = "gemini-3.6-flash" as const;
 export const GEMINI_31_PRO_MODEL = "gemini-3.1-pro-preview" as const;
 export const DEFAULT_CHAT_MODEL = GEMINI_31_PRO_MODEL;
 
@@ -35,8 +35,10 @@ export function normalizeModelId(model: string): string {
     m === "gemini-3.1-flash-preview" ||
     m === "gemini-3.1-flash-lite" ||
     m === "gemini-3.1-flash-lite-preview" ||
+    m === "gemini-3.5-flash" ||
     m === "gemini-3.5-flash-preview" ||
-    m === "gemini-3.5-flash-lite"
+    m === "gemini-3.5-flash-lite" ||
+    m === "gemini-3.6-flash-preview"
   ) {
     return GEMINI_3_FLASH_MODEL;
   }
@@ -64,6 +66,7 @@ export function providerModelNameForGemini(model: string): string {
 }
 
 export function defaultReasoningTokensForModel(model?: string): number {
+  if (model && isGemini36FlashModel(model)) return 640;
   if (model && isGemini3FlashModel(model)) return 0;
   return 384;
 }
@@ -74,6 +77,10 @@ export function isGemini3ProModel(model: string): boolean {
 
 export function isGemini31ProModel(model: string): boolean {
   return /^gemini-3\.1-pro(?:-|$)/i.test(normalizeModelId(model));
+}
+
+export function isGemini36FlashModel(model: string): boolean {
+  return normalizeModelId(model) === GEMINI_3_FLASH_MODEL;
 }
 
 export function isGemini3FlashModel(model: string): boolean {

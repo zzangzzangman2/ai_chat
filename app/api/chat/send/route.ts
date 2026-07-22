@@ -57,6 +57,7 @@ import { sanitizePromptCached } from "./_server/promptCache";
 import { buildFormatGuide } from "./_server/formatGuide";
 import { normalizeSummaryTail, sanitizeLongMemorySummary, upsertSummaryRangeBlock } from "./_server/memory";
 import { selectHybridMemory } from "./_server/memorySelection";
+import { buildContinuityLedgerBlock } from "./_server/continuityState";
 import {
   _reEsc,
   applyPromptPlaceholders,
@@ -1623,7 +1624,7 @@ ${body}`.trim();
       maxRelatedChars: 2400,
       fallbackSections: 2,
     });
-    // 헤더가 없는 구형 요약은 섹션 검색이 불가능하므로 기존 검색 블록을 보조 경로로 쓴다.
+    // Legacy summaries without range sections cannot be searched by the hybrid selector.
     const legacyRelatedMemory =
       hybridMemory.totalSections === 0
         ? buildRelatedMemoryBlocks({
@@ -1640,8 +1641,27 @@ ${body}`.trim();
       userText,
       ...tail.slice(-4).map((m: any) => String(m?.content || "")),
     ].join("\n");
+    const continuityIdentities = (db
+      .prepare(
+        `SELECT name, aliases, status
+         FROM chat_character_roster
+         WHERE chatId=? AND enabled != 0
+         ORDER BY updatedAt DESC, name ASC
+         LIMIT 40`
+      )
+      .all(cid) as any[]).map((row) => ({
+        name: String(row?.name || ""),
+        aliases: decryptIfPossible(String(row?.aliases || "")),
+        status: decryptIfPossible(String(row?.status || "")),
+      }));
+    const continuityLedger = buildContinuityLedgerBlock({
+      historySummary,
+      identities: continuityIdentities,
+      userText,
+    });
     const manualCharacterRosterBlock = buildManualCharacterRosterBlock(cid, characterFocusText);
     const historySummaryForPrompt = [
+      continuityLedger.block,
       hybridMemory.currentArcText,
       relatedArchiveText,
       manualCharacterRosterBlock,
@@ -1657,13 +1677,16 @@ ${body}`.trim();
       pickedBlocks: hybridMemory.relatedRanges,
       currentArcChars: strlen(hybridMemory.currentArcText),
       pickedChars: strlen(relatedArchiveText),
+      continuityStates: continuityLedger.states,
+      continuityChars: strlen(continuityLedger.block),
       manualCharacterRosterChars: strlen(manualCharacterRosterBlock),
     });
     const memoryBlock = [
-      `# (2) 혼합형 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
+      `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
       `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
-      `- 과거 사건은 현재 입력과 관련된 구간만 보강하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
+      `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
       `- 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
+      `- 인물 연속성 장부가 있으면 과거 캐릭터 기록과 최신 일반 장면 지시보다 우선한다.`,
       historySummaryForPrompt || "(없음)",
     ].join("\n");
     tEnd(tLongMemoryBlock);
@@ -1689,7 +1712,11 @@ ${body}`.trim();
     const isGemini3Pro = isGemini3ProFamilyModel(modelName);
 
     
-    const G3PRO_DONE_ONLY = Boolean(isGemini3Pro) && String(process.env.AI_G3PRO_DONE_ONLY || "1").trim() !== "0";
+    // (2026-07) gemini-3-pro 계열도 기본은 실시간 델타 스트리밍.
+    // 과거 DONE-ONLY 전환 사유였던 "본문 캡+메타 펜스 직전 문장 잘림"은 streamLoop의
+    // 홀드백 버퍼(마지막 N자 보류 → 경계 보정 후 방출)로 해결했다.
+    // 롤백: AI_G3PRO_DONE_ONLY=1 이면 기존 DONE-ONLY(버퍼링+done만 전송)로 복귀.
+    const G3PRO_DONE_ONLY = Boolean(isGemini3Pro) && String(process.env.AI_G3PRO_DONE_ONLY || "0").trim() === "1";
 // Gemini 3 Pro는 1-shot으로 한 번에 출력을 뱉는 경우가 많아서,
     // 이어쓰기(추가 generateText 호출)가 들어가면 대기 시간이 거의 2배가 된다.
     // → 이 모델에 한해 "추가 호출(이어쓰기/짧음 보정/메타 오버랩)"을 금지한다.
@@ -2093,23 +2120,48 @@ const formatGuide = buildFormatGuide({
           metaTemplateFence: metaFenceTemplateHint ? metaFenceTemplateHint : undefined,
         });
 
-const systemRaw = [
-      `너는 아래 설정을 따르는 '상대방 캐릭터'로서 반응한다.`,
-      ``,
-      sanitizePromptCached(presetBlock),
-      ``,
-      sanitizePromptCached(personaBlock),
-      ``,
-      sanitizePromptCached(noteBlock),
-      ``,
-      sanitizePromptCached(memoryBlock),
-      ``,
-      sanitizePromptCached(relationshipConsistencyBlock),
-      ``,
-      sanitizePromptCached(loreBlock),
-      ``,
-      sanitizePromptCached(formatGuide),
-    ].join("\n");
+// (2026-07) 캐시 친화 배치: Vertex implicit cache는 "앞에서부터 바이트 동일한 프리픽스"만
+// 적중하므로, 고정 블록(작품설정/페르소나/유저노트/관계규칙)을 앞에, 매턴 변동 블록
+// (로어=키워드 매칭, 장기기억=FTS 검색+N턴 요약)을 뒤에 배치한다. (블록 내용은 동일, 순서만 변경)
+// - 카드/프로필/작품설정을 수정하면 바이트가 달라져 자동으로 캐시 미스→재캐싱된다(퍼지 불필요).
+// - formatGuide는 형식(상태창 펜스) 준수율을 위해 기존처럼 맨 뒤 유지.
+// - 롤백: AI_CACHE_FRIENDLY_PROMPT=0 → 기존 순서(장기기억이 중간).
+const cacheFriendlyLayout = String(process.env.AI_CACHE_FRIENDLY_PROMPT || "1").trim() !== "0";
+const systemRaw = (cacheFriendlyLayout
+    ? [
+        `너는 아래 설정을 따르는 '상대방 캐릭터'로서 반응한다.`,
+        ``,
+        sanitizePromptCached(presetBlock),
+        ``,
+        sanitizePromptCached(personaBlock),
+        ``,
+        sanitizePromptCached(noteBlock),
+        ``,
+        sanitizePromptCached(relationshipConsistencyBlock),
+        ``,
+        sanitizePromptCached(loreBlock),
+        ``,
+        sanitizePromptCached(memoryBlock),
+        ``,
+        sanitizePromptCached(formatGuide),
+      ]
+    : [
+        `너는 아래 설정을 따르는 '상대방 캐릭터'로서 반응한다.`,
+        ``,
+        sanitizePromptCached(presetBlock),
+        ``,
+        sanitizePromptCached(personaBlock),
+        ``,
+        sanitizePromptCached(noteBlock),
+        ``,
+        sanitizePromptCached(memoryBlock),
+        ``,
+        sanitizePromptCached(relationshipConsistencyBlock),
+        ``,
+        sanitizePromptCached(loreBlock),
+        ``,
+        sanitizePromptCached(formatGuide),
+      ]).join("\n");
     const npcName = preset.characterName || (preset as any).name || "상대";
     const system = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });
 
@@ -2195,7 +2247,7 @@ const systemRaw = [
     // 사용자 입력을 모드에 맞춰 전달한다.
     const userLine = continueMode ? "[이어쓰기]" : buildUserLineForMode(userText, personaName, renderMode);
 
-    // Gemini 3.5 Flash: keep LOW fast and MID actually medium by default.
+    // Gemini 3.6 Flash: use MID by default and reserve HIGH for heavy reasoning.
     // Raise MID to HIGH only when the *user's current request* asks for reasoning over the heavy context.
     // Otherwise long-memory/status/character-heavy chats would make MID behave like HIGH on every turn.
     if (
@@ -2277,8 +2329,8 @@ const systemRaw = [
       : [
           context ? `[최근 대화]\n${context}` : "",
           ``,
-          latestInputNoEchoRule,
-          `상대가 입력을 들었다는 전제에서 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
+	          latestInputNoEchoRule,
+	          `상대가 입력을 들었다는 전제에서 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
           `사용자 최신 입력(참고용, 재출력 금지): ${userLine}`,
           ``,
           oneShotLengthContract,
@@ -2412,7 +2464,7 @@ let cancelStreamWork: (() => void) | null = null;
             const _metaCompletionModel =
               (process.env.AI_META_COMPLETION_MODEL || "").trim() ||
               ((isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
-                ? "gemini-3.5-flash"
+                ? "gemini-3.6-flash"
                 : String((opts as any)?.model || (settings as any)?.model || ""));
             const _metaOverlapTriggerRatio = (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || ""))) ? 0.65 : 0.85;
             const _metaOverlapTriggerChars = Math.max(420, Math.min(promptMaxChars, Math.floor(targetChars * _metaOverlapTriggerRatio)));
@@ -2430,12 +2482,12 @@ let cancelStreamWork: (() => void) | null = null;
           const mergeUsage = mergeStreamUsage;
           const makeContinueUser = (combined: string) => makeContinueUserPrompt(context, combined);
 
-          // Gemini 3 Pro 계열은 스트리밍 중 "본문 캡(bodyMaxChars) + 메타 펜스 pass-through" 구조 때문에
-          // 문장이 덜 끝난 채로 ```(오픈 펜스) 직전에 끊기는 문제가 자주 발생한다.
-          // 따라서 gemini-3-pro* 는 모델 호출은 버퍼링(generateText)으로 받고,
-          // NDJSON transport는 ping(keep-alive) + done만 보내는 DONE-ONLY 모드로 전환한다.
-          // (디버그) AI_G3PRO_DONE_ONLY=0 이면 기존 스트리밍(generateTextStream) 유지.
-          const PRO_DONE_ONLY = Boolean(isGemini3Pro) && String(process.env.AI_G3PRO_DONE_ONLY || "1").trim() !== "0";
+          // (2026-07) gemini-3-pro 계열도 기본은 실시간 델타 스트리밍(generateTextStream).
+          // 과거 DONE-ONLY(전체 버퍼링) 전환 사유였던 "본문 캡(bodyMaxChars) + 메타 펜스 직전 문장 잘림"은
+          // streamLoop의 홀드백 버퍼(마지막 N자 보류 → 캡/펜스 경계 보정 후 방출)로 해결했다.
+          // - 방출된 델타는 절대 회수/수정하지 않으므로 delta 누적본과 done/DB 본문이 항상 일치한다.
+          // 롤백: AI_G3PRO_DONE_ONLY=1 이면 기존 DONE-ONLY(버퍼링+done만 전송) 모드로 복귀.
+          const PRO_DONE_ONLY = Boolean(isGemini3Pro) && String(process.env.AI_G3PRO_DONE_ONLY || "0").trim() === "1";
 
 	          const runOneBuffered = async (userPrompt: string, tag: string) => {
 	            try {
@@ -2651,12 +2703,7 @@ if (!TRANSPORT_STREAMING) {
 }
 
 if (!TRANSPORT_STREAMING) {
-            // 줄 단위로 적용해야 첫 줄의 `작품 제목 | 지문`도 정상 정리된다.
-            // 전체 응답을 한 번에 넘기면 정규식의 `.`이 개행을 넘지 못해 접두가 남는다.
-            assistantText = assistantText
-              .split(/\r?\n/)
-              .map((line) => stripNamePrefixFromNarration(line))
-              .join("\n");
+            assistantText = stripNamePrefixFromNarration(assistantText);
             assistantText = stripDialogueWrappedNarration(assistantText);
 
             // In novel mode, avoid aggressive trimming that can drop early scene setup.
@@ -3818,9 +3865,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           user: statusUser,
           opts: {
             ...opts,
-            model: "gemini-3.5-flash",
-            // status-only는 추론을 최소화하여 출력 토큰을 최대한 확보
-            maxReasoningTokens: 0,
+            model: "gemini-3.6-flash",
+            // Gemini 3.6 Flash의 공식 최저 단계인 medium을 사용한다.
+            maxReasoningTokens: 640,
             maxOutputTokens: 640,
           },
         });
@@ -3888,7 +3935,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           system: systemStatus,
           user: statusUser,
 	          opts: (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
-	            ? { ...opts, model: "gemini-3.5-flash", maxReasoningTokens: 0, maxOutputTokens: 640 }
+	            ? { ...opts, model: "gemini-3.6-flash", maxReasoningTokens: 640, maxOutputTokens: 640 }
 	            : { ...opts, maxOutputTokens: Math.min(1024, maxOutputTokensForCall) },
         });
 
