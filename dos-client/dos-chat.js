@@ -1888,6 +1888,46 @@ function displayWidth(value) {
   return Array.from(String(value || "")).reduce((sum, ch) => sum + terminalCharWidth(ch), 0);
 }
 
+function terminalRowsForLine(value, columns) {
+  const cols = Math.max(1, Math.floor(Number(columns) || 80));
+  let rows = 1;
+  let col = 0;
+
+  for (const ch of Array.from(String(value || ""))) {
+    if (ch === "\n") {
+      rows += 1;
+      col = 0;
+      continue;
+    }
+    if (ch === "\r") {
+      col = 0;
+      continue;
+    }
+
+    const width = ch === "\t" ? 8 - (col % 8) : terminalCharWidth(ch);
+    if (width <= 0) continue;
+
+    if (col >= cols || (col > 0 && col + width > cols)) {
+      rows += 1;
+      col = 0;
+    }
+    col += width;
+  }
+
+  return rows;
+}
+
+function clearPreviousTerminalRows(rows) {
+  const count = Math.max(1, Math.floor(Number(rows) || 1));
+  let out = `\x1b[${count}A\r`;
+  for (let i = 0; i < count; i += 1) {
+    out += "\x1b[2K";
+    if (i < count - 1) out += "\x1b[1B\r";
+  }
+  if (count > 1) out += `\x1b[${count - 1}A\r`;
+  return out;
+}
+
 function fitDisplay(value, maxWidth) {
   const text = String(value || "");
   if (displayWidth(text) <= maxWidth) return text;
@@ -3062,7 +3102,9 @@ async function main() {
       if (line.includes("*") && process.stdout.isTTY) {
         try {
           const promptStr = prompt.replace(/^\n+/, ""); // 줄바꿈 제외한 prompt 본문
-          process.stdout.write("\x1b[1A\x1b[2K");
+          const terminalColumns = Math.max(1, Number(process.stdout.columns || 80));
+          const echoedRows = terminalRowsForLine(`${promptStr}${line}`, terminalColumns);
+          process.stdout.write(clearPreviousTerminalRows(echoedRows));
           process.stdout.write(`${promptStr}${colorNovelInline(line)}\n`);
         } catch {
           // 일부 TTY 환경에서 ANSI 이동이 실패하면 무시 (기능 영향 없음)
@@ -3117,4 +3159,6 @@ module.exports = {
   displayWidth,
   fitDisplay,
   settingsPanelRows,
+  terminalRowsForLine,
+  clearPreviousTerminalRows,
 };
