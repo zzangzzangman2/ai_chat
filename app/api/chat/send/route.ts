@@ -34,6 +34,7 @@ import {
   selectRecentByUserTurns,
   formatStoryTurnsForMode,
   buildUserLineForMode,
+  isOocMetaInstruction,
   ensurePrefix,
   stripNamePrefixFromNarration,
   stripDialogueWrappedNarration,
@@ -888,6 +889,7 @@ export async function POST(req: Request) {
     }
 
 	    const userText = effectiveUserText;
+    const currentOocInstruction = isOocMetaInstruction(userText) ? userText : "";
 	    if (!userText) return bad("메시지를 입력해 주세요.");
 
 	    if (!LOCAL_POINTS_DISABLED) {
@@ -2163,7 +2165,20 @@ const systemRaw = (cacheFriendlyLayout
         sanitizePromptCached(formatGuide),
       ]).join("\n");
     const npcName = preset.characterName || (preset as any).name || "상대";
-    const system = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });
+    const systemBase = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });
+    const currentOocPriorityBlock = currentOocInstruction
+      ? [
+          `# [CURRENT OOC OVERRIDE — ABSOLUTE HIGHEST STORY PRIORITY]`,
+          `- 아래 OOC 원문은 현재 턴의 사용자 메타 지시다. 캐릭터 대사로 해석하지 않는다.`,
+          `- 작품 설정, 프리셋, 최근 대화, 장기기억, 관계·감정, 기존 전개와 충돌하면 아래 OOC를 최우선으로 적용한다.`,
+          `- 충돌하는 기존 정보는 이번 응답에서 무시하고, OOC가 적용된 결과부터 메타 설명 없이 바로 출력한다.`,
+          ``,
+          currentOocInstruction,
+        ].join("\n")
+      : "";
+    const system = currentOocPriorityBlock
+      ? `${systemBase}\n\n${currentOocPriorityBlock}`
+      : systemBase;
 
 		    // (변경) 상태창을 포함한 응답을 '한 번의 호출'로 생성한다.
 	    // - Gemini 3 Pro는 streaming 중간에 fenced(STATUS/INFO)가 반쪽으로 보이는 문제가 컸지만,
