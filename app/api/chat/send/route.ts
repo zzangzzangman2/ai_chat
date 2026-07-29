@@ -636,6 +636,8 @@ function buildManualCharacterRosterBlock(chatIdRaw: string, focusTextRaw = "") {
     "- Encounter logs are ordered by turn number from oldest to newest; treat later turn numbers as happening after earlier turn numbers.",
     `- The persona name is "${personaName}". Do not refer to the persona as 사용자, 주인공, or 플레이어 in character memory.`,
     `- Use the encounter logs mainly to remember what happened between ${personaName} and each character.`,
+    "- This registry is not a complete cast list. An unregistered or role-only NPC present in recent conversation remains a separate current-scene character.",
+    "- Never omit, merge, or silence an unregistered current-scene NPC merely because only registered characters have detailed memory below.",
     detailedRows.length ? `- Current-scene detailed characters: ${detailedRows.map((row) => row.name).join(", ")}` : "",
     body,
     inactiveNames.length ? `- Other registered but currently inactive characters (names only): ${inactiveNames.join(", ")}` : "",
@@ -2131,7 +2133,7 @@ const formatGuide = buildFormatGuide({
 const cacheFriendlyLayout = String(process.env.AI_CACHE_FRIENDLY_PROMPT || "1").trim() !== "0";
 const systemRaw = (cacheFriendlyLayout
     ? [
-        `너는 아래 설정을 따르는 '상대방 캐릭터'로서 반응한다.`,
+        `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
         ``,
         sanitizePromptCached(presetBlock),
         ``,
@@ -2148,7 +2150,7 @@ const systemRaw = (cacheFriendlyLayout
         sanitizePromptCached(formatGuide),
       ]
     : [
-        `너는 아래 설정을 따르는 '상대방 캐릭터'로서 반응한다.`,
+        `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
         ``,
         sanitizePromptCached(presetBlock),
         ``,
@@ -2196,7 +2198,7 @@ const systemRaw = (cacheFriendlyLayout
 	    //   (직전 출력 tail을 user 메시지로 제공하므로, 이어쓰기에는 format+persona 중심으로 충분)
 	    const systemForContinuationRaw = (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
 	      ? [
-	          `너는 아래 설정을 따르는 '상대방 캐릭터'로서 반응한다.`,
+	          `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
 	          ``,
 	          sanitizePromptCached(personaBlock),
 	          ``,
@@ -2222,7 +2224,7 @@ const systemRaw = (cacheFriendlyLayout
 	    // - 프롬프트를 경량화해 지연을 최소화한다.
 	    const systemForStatus = (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
 	      ? [
-	          `너는 아래 설정을 따르는 '상대방 캐릭터'로서 반응한다.`,
+	          `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
 	          ``,
 	          sanitizePromptCached(personaBlock),
 	          ``,
