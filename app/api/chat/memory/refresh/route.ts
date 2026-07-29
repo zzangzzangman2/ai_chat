@@ -9,6 +9,11 @@ import {
   analyzeRelationshipCorrectionDrift,
   buildRelationshipCorrectionGuidance,
 } from "@/lib/relationship_memory";
+import {
+  analyzeIdentityCanonDrift,
+  buildIdentityCanonBlock,
+  inferPersonaNameFromMessages,
+} from "@/lib/identity_memory";
 
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
@@ -778,16 +783,46 @@ export async function POST(req: Request) {
 
     // Generate a single section: "### <title> (a-b턴)\n<body>"
     const targetChars = Math.min(100000, Math.max(80, perTurnCharsVal * summaryEveryVal));
-    const personaName = String(st?.personaName || "").trim();
+    const configuredPersonaName = String(st?.personaName || "").trim();
+    const inferredPersonaName = configuredPersonaName
+      ? ""
+      : inferPersonaNameFromMessages(all);
+    const personaName = configuredPersonaName || inferredPersonaName;
+    const identityKnownNames = (db
+      .prepare(
+        `SELECT name
+         FROM chat_character_roster
+         WHERE chatId=? AND enabled != 0
+         ORDER BY updatedAt DESC, name ASC
+         LIMIT 60`
+      )
+      .all(chatId) as Array<{ name: string }>).map((row) =>
+      String(row?.name || "").trim()
+    );
+    const identityCanon = buildIdentityCanonBlock({
+      messages: all,
+      knownNames: identityKnownNames,
+      personaName,
+    });
 
     const sourceNameSet = collectLikelyKoreanNames(cleanedText);
+    for (const fact of identityCanon.canon.nameFacts) {
+      sourceNameSet.add(fact.canonicalName);
+      for (const alias of fact.aliases) sourceNameSet.add(alias);
+    }
+    if (personaName) sourceNameSet.add(personaName);
     const sourceNameList = [...sourceNameSet].sort((a, b) => a.localeCompare(b, "ko-KR"));
     const nameLockGuidance = sourceNameList.length
       ? `- (필수) 인명은 [${sourceNameList.join(", ")}] 목록에서만 사용. 목록에 없는 새 인명 생성 금지.`
       : "- (필수) 대화에 없는 새 인명 생성 금지.";
 
     const relationshipCorrectionGuidance = buildRelationshipCorrectionGuidance(cleanedText);
-    const baseGuidance = [LONG_MEMORY_SUMMARY_RULES, relationshipCorrectionGuidance, nameLockGuidance]
+    const baseGuidance = [
+      LONG_MEMORY_SUMMARY_RULES,
+      relationshipCorrectionGuidance,
+      identityCanon.block,
+      nameLockGuidance,
+    ]
       .filter(Boolean)
       .join("\n");
     const strictGuidance = [
@@ -824,9 +859,14 @@ export async function POST(req: Request) {
     let q = analyzeLongMemoryBody(norm.body);
     let ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
     let relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
+    let identityDrift = analyzeIdentityCanonDrift({
+      sourceText: cleanedText,
+      summary: norm.body,
+      canon: identityCanon.canon,
+    });
 
     // 2) retry with stricter prompt and without model downshift (more reliable, higher cost, rare)
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -846,10 +886,15 @@ export async function POST(req: Request) {
       q = analyzeLongMemoryBody(norm.body);
       ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
       relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
+      identityDrift = analyzeIdentityCanonDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        canon: identityCanon.canon,
+      });
     }
 
     // 3) last-resort: fallback summarizer (body-only) then wrap into a section.
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -868,11 +913,16 @@ export async function POST(req: Request) {
       q = analyzeLongMemoryBody(norm.body);
       ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
       relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
+      identityDrift = analyzeIdentityCanonDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        canon: identityCanon.canon,
+      });
     }
 
     // 4) optional rescue pass: only when LONG_MEMORY_SUMMARY_FALLBACK_MODEL is explicitly set.
     // Default policy is flash-only (no automatic model bounce).
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
       const fallbackModel = pickLongMemorySummaryFallbackModel();
       if (fallbackModel) {
         try {
@@ -896,6 +946,11 @@ export async function POST(req: Request) {
           q = analyzeLongMemoryBody(norm.body);
           ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
           relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
+          identityDrift = analyzeIdentityCanonDrift({
+            sourceText: cleanedText,
+            summary: norm.body,
+            canon: identityCanon.canon,
+          });
         } catch {
           // Keep original failure reasons and let bad_output path handle.
         }
@@ -905,17 +960,20 @@ export async function POST(req: Request) {
     let forcedBadOutputSaved = false;
     let sectionRawForStore = String(sectionRaw || "");
 
-    // A relationship correction conflict is semantic corruption, not a formatting defect.
+    // Relationship/identity conflicts are semantic corruption, not formatting defects.
     // Never save it even when the debug-only bad-output override is enabled.
-    if (!relationshipDrift.ok) {
+    if (!relationshipDrift.ok || !identityDrift.ok) {
       return NextResponse.json({
         ok: true,
         skipped: true,
-        reason: "relationship_correction_conflict",
+        reason: !identityDrift.ok
+          ? "identity_canon_conflict"
+          : "relationship_correction_conflict",
         windowStartTurn,
         windowEndTurn,
         boundaryEndTurn,
         relationshipDrift,
+        identityDrift,
       });
     }
 
@@ -932,6 +990,7 @@ export async function POST(req: Request) {
           quality: q,
           nameDrift: ndrift,
           relationshipDrift,
+          identityDrift,
           repairing: Boolean(repair),
           repairRange: repair ? { startTurn: repair.startTurn, endTurn: repair.endTurn, title: repair.title } : null,
         });
@@ -1091,6 +1150,7 @@ export async function POST(req: Request) {
         quality: q,
         nameDrift: ndrift,
         relationshipDrift,
+        identityDrift,
         sourceSig: sourceSig1,
       },
       now,
@@ -1228,6 +1288,7 @@ export async function POST(req: Request) {
       quality: q,
       nameDrift: ndrift,
       relationshipDrift,
+      identityDrift,
       memoryBlocksBackfilled,
       autoCharactersAdded,
       autoCharactersBackfilled,

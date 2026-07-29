@@ -169,6 +169,30 @@ export function postprocessLongMemorySummary(input: string): string {
   // Final whitespace normalization
   let s = merged.join("\n");
 
+  // Remove leaked model self-review/reasoning from otherwise valid one-line sections.
+  // If the leak begins near the start, the whole body line is untrustworthy. If it
+  // appears after a real summary paragraph, keep only the story prefix.
+  const metaLeakMarker =
+    /Detailed\s+Character\s*&\s*Constraint\s+Check|Character\s*&\s*Constraint\s+Check|(?:^|\s)Analysis\s*:|시스템\s*지침|개발자\s*프롬프트|요구사항\s*(?:검토|확인)/i;
+  s = s
+    .split(/\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || /^#{2,4}\s+/.test(trimmed)) return line;
+      const markerIndex = line.search(metaLeakMarker);
+      if (markerIndex < 0) return line;
+      const prefix = line.slice(0, markerIndex).trimEnd();
+      if (!prefix) return "";
+      if (
+        markerIndex < 120 &&
+        (!/[가-힣]/u.test(prefix) || prefix.length < 12 || !/[.!?…。]\s*$/.test(prefix))
+      ) {
+        return "";
+      }
+      return /[.!?…。]\s*$/.test(prefix) ? prefix : `${prefix}.`;
+    })
+    .join("\n");
+
   // 1) META_LINE_DROP: remove model/meta boilerplate accidentally captured in memory summaries.
   s = s.split(/\n/).filter((ln) => {
     const t = ln.trim();

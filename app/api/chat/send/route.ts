@@ -7,11 +7,18 @@ import { countTokens, generateText, generateTextStream, summarizeKorean, summari
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { DEFAULT_CHAT_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
 
-import { stripUrlsAndMediaMarkdown } from "@/lib/memory_sanitize";
+import {
+  postprocessLongMemorySummary,
+  stripUrlsAndMediaMarkdown,
+} from "@/lib/memory_sanitize";
 import {
   buildRelationshipCorrectionGuidance,
   findFocusedCharacterIds,
 } from "@/lib/relationship_memory";
+import {
+  buildIdentityCanonBlock,
+  inferPersonaNameFromMessages,
+} from "@/lib/identity_memory";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -360,7 +367,11 @@ function buildRelatedMemoryBlocks(params: {
   for (const row of rows) {
     const startTurn = Math.max(1, Math.floor(Number(row?.startTurn) || 0));
     const endTurn = Math.max(startTurn, Math.floor(Number(row?.endTurn) || startTurn));
-    const summary = decryptIfPossible(String(row?.summary || "")).trim();
+    const summary = postprocessLongMemorySummary(
+      stripUrlsAndMediaMarkdown(decryptIfPossible(String(row?.summary || "")), {
+        keepHeadings: true,
+      })
+    ).trim();
     if (!summary) continue;
     // (개선) 부분문자열 dedupe → 턴 범위 기반 dedupe.
     // historySummary에 [startTurn..endTurn]을 포괄하는 구간 헤더가 이미 있으면 스킵.
@@ -495,7 +506,11 @@ function parseLorebooksCached(raw: string): any[] {
   return arr;
 }
 
-function buildManualCharacterRosterBlock(chatIdRaw: string, focusTextRaw = "") {
+function buildManualCharacterRosterBlock(
+  chatIdRaw: string,
+  focusTextRaw = "",
+  personaNameOverride = ""
+) {
   const chatId = String(chatIdRaw || "").trim();
   if (!chatId) return "";
 
@@ -507,9 +522,12 @@ function buildManualCharacterRosterBlock(chatIdRaw: string, focusTextRaw = "") {
   if (Number(rosterCount?.n || 0) === 0) return "";
 
   const settings = db.prepare(`SELECT personaName FROM chat_settings WHERE chatId=?`).get(chatId) as any;
-  const personaName = String(settings?.personaName || "").trim() || "나";
+  const personaName =
+    String(personaNameOverride || "").trim() ||
+    String(settings?.personaName || "").trim() ||
+    "나";
 
-  const rows = db
+  const rosterRows = db
     .prepare(
       `SELECT id, name, aliases, role, profile, relationshipNote, emotionNote, status
        FROM chat_character_roster
@@ -518,6 +536,17 @@ function buildManualCharacterRosterBlock(chatIdRaw: string, focusTextRaw = "") {
        LIMIT 30`
     )
     .all(chatId) as any[];
+  const personaKey = personaName.toLowerCase();
+  const rows = rosterRows.filter((row) => {
+    const name = String(row?.name || "").trim().toLowerCase();
+    if (name && name === personaKey) return false;
+    const aliases = decryptIfPossible(String(row?.aliases || ""))
+      .split(/[\n,;\/|]+/g)
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    return !aliases.includes(personaKey);
+  });
+  if (!rows.length) return "";
 
   const scopeRows = rows.map((row) => ({
     id: String(row?.id || ""),
@@ -1243,7 +1272,10 @@ export async function POST(req: Request) {
     //   UI/프롬프트에서 "장기기억이 갑자기 0"처럼 보이는 문제가 생긴다.
     let historySummary = cache?.recentSummary ? decryptIfPossible(String(cache.recentSummary)) : "";
     // 현재 설정(summaryEvery)에 맞는 블록만 남겨서 prompt/UI 혼란을 방지
-    historySummary = normalizeStoredMemorySummary(historySummary, summaryEveryVal);
+    historySummary = sanitizeLongMemorySummary(
+      normalizeStoredMemorySummary(historySummary, summaryEveryVal),
+      summaryEveryVal
+    );
     let lastSummarizedAt = Number(cache?.lastSummarizedAt || 0);
     let rolledUpCount = Number(cache?.rolledUpCount || 0);
 
@@ -1477,7 +1509,12 @@ ${body}`.trim();
     const tPersonaBlock = tStart("페르소나설정");
     // NOTE: personaOverride(프론트 임시값) + settings(DB 저장값)을 이미 resolvePersona로 합쳤다.
     // user 입력 1턴 기준(=user 메시지)으로 프롬프트가 흔들리지 않도록 여기서는 persona만 사용한다.
-    const personaNameFinal = persona.name || "주인공";
+    const inferredPersonaName = persona.name ? "" : inferPersonaNameFromMessages(all);
+    if (!persona.name && inferredPersonaName) {
+      persona.name = inferredPersonaName;
+      persistPersonaIfMissing(db, cid, settings, persona);
+    }
+    const personaNameFinal = persona.name || inferredPersonaName || "주인공";
     const personaAgeFinal = persona.age || 0;
     const personaGenderFinal = persona.gender;
     const personaInfoFinal = persona.info;
@@ -1659,13 +1696,33 @@ ${body}`.trim();
         name: String(row?.name || ""),
         aliases: decryptIfPossible(String(row?.aliases || "")),
         status: decryptIfPossible(String(row?.status || "")),
-      }));
+      }))
+      .filter((identity) => {
+        const personaKey = personaNameFinal.trim().toLowerCase();
+        if (!personaKey) return true;
+        if (identity.name.trim().toLowerCase() === personaKey) return false;
+        return !identity.aliases
+          .split(/[\n,;\/|]+/g)
+          .map((value) => value.trim().toLowerCase())
+          .filter(Boolean)
+          .includes(personaKey);
+      });
     const continuityLedger = buildContinuityLedgerBlock({
       historySummary,
       identities: continuityIdentities,
       userText,
     });
-    const manualCharacterRosterBlock = buildManualCharacterRosterBlock(cid, characterFocusText);
+    const identityCanon = buildIdentityCanonBlock({
+      messages: all,
+      knownNames: continuityIdentities.map((identity) => identity.name),
+      personaName: personaNameFinal,
+    });
+    const identityCanonBlock = identityCanon.block;
+    const manualCharacterRosterBlock = buildManualCharacterRosterBlock(
+      cid,
+      characterFocusText,
+      personaNameFinal
+    );
     const historySummaryForPrompt = [
       continuityLedger.block,
       hybridMemory.currentArcText,
@@ -1686,6 +1743,10 @@ ${body}`.trim();
       continuityStates: continuityLedger.states,
       continuityChars: strlen(continuityLedger.block),
       manualCharacterRosterChars: strlen(manualCharacterRosterBlock),
+      identityCanonChars: strlen(identityCanonBlock),
+      identityNameFacts: identityCanon.canon.nameFacts.length,
+      identityRoleAnchors: identityCanon.canon.roleAnchors.length,
+      inferredPersonaName: inferredPersonaName || "",
     });
     const memoryBlock = [
       `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
@@ -1693,6 +1754,7 @@ ${body}`.trim();
       `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
       `- 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
       `- 인물 연속성 장부가 있으면 과거 캐릭터 기록과 최신 일반 장면 지시보다 우선한다.`,
+      `- 별도의 인물 정체성·가족관계 정사 블록이 있으면 이 통합 장기기억보다 우선한다.`,
       historySummaryForPrompt || "(없음)",
     ].join("\n");
     tEnd(tLongMemoryBlock);
@@ -1703,6 +1765,8 @@ ${body}`.trim();
       `- 캐릭터별 관계와 호칭은 서로 독립이다. 한 캐릭터가 쓰는 호칭을 다른 캐릭터에게 복사하지 않는다.`,
       `- 장기기억이나 캐릭터 기록의 ## 이름 경계를 절대 넘지 않는다. 각 항목은 해당 이름의 인물에게만 적용한다.`,
       `- 같은 인물을 한 답변 안에서 서로 다른 호칭으로 섞지 않는다. (예: "오빠/선배/야" 혼용 금지)`,
+      `- '아빠/엄마/딸/아들'은 반드시 누구의 가족인지 대상 인물과 세대를 함께 확인한다. 대상이 다른 가족 호칭을 같은 인물로 합치지 않는다.`,
+      `- 대사 속 자칭·질문·추측이나 사진·편지의 발신 사실만으로 혈연과 정체성을 확정하지 않는다.`,
       `- 사용자가 "앞으로 ~라고 불러"처럼 명시적으로 바꾸기 전에는 호칭을 임의 변경하지 않는다.`,
       `- 사용자가 관계나 호칭을 부정·정정하면 그 최신 정정이 이전 어시스턴트 대사와 모든 기억보다 우선한다.`,
       `- 호칭이 불확실하면 새 호칭을 만들지 말고, 호칭 없이 자연스럽게 반응한다.`,
@@ -2189,6 +2253,9 @@ const systemRaw = (cacheFriendlyLayout
       ]).join("\n");
     const npcName = preset.characterName || (preset as any).name || "상대";
     const systemBase = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });
+    const systemWithIdentityCanon = identityCanonBlock
+      ? `${systemBase}\n\n${sanitizePromptCached(identityCanonBlock)}`
+      : systemBase;
     const currentOocPriorityBlock = currentOocInstruction
       ? [
           `# [CURRENT OOC OVERRIDE — ABSOLUTE HIGHEST STORY PRIORITY]`,
@@ -2200,8 +2267,8 @@ const systemRaw = (cacheFriendlyLayout
         ].join("\n")
       : "";
     const system = currentOocPriorityBlock
-      ? `${systemBase}\n\n${currentOocPriorityBlock}`
-      : systemBase;
+      ? `${systemWithIdentityCanon}\n\n${currentOocPriorityBlock}`
+      : systemWithIdentityCanon;
 
 		    // (변경) 상태창을 포함한 응답을 '한 번의 호출'로 생성한다.
 	    // - Gemini 3 Pro는 streaming 중간에 fenced(STATUS/INFO)가 반쪽으로 보이는 문제가 컸지만,
@@ -2230,6 +2297,8 @@ const systemRaw = (cacheFriendlyLayout
 	          sanitizePromptCached(formatGuide),
 	          recentExpressionAvoidanceBlock ? `` : "",
 	          recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
+	          identityCanonBlock ? `` : "",
+	          identityCanonBlock ? sanitizePromptCached(identityCanonBlock) : "",
 	          ``,
 	          "※ (중요) 이 이어쓰기 호출에서는 fenced 코드블록(```...```) 출력 금지. STATUS/INFO/메타 블록도 출력하지 마라.",
 	        ].join("\n")

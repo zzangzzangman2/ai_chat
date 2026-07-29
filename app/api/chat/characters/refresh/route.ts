@@ -6,6 +6,11 @@ import {
   analyzeRelationshipCorrectionDrift,
   buildRelationshipCorrectionGuidance,
 } from "@/lib/relationship_memory";
+import {
+  analyzeIdentityCanonDrift,
+  buildIdentityCanonBlock,
+  inferPersonaNameFromMessages,
+} from "@/lib/identity_memory";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
 type MsgRow = {
@@ -272,7 +277,14 @@ export async function POST(req: Request) {
     const turnNo = assistantTurnNo(all, assistantId);
     if (turnNo <= 0) return NextResponse.json({ ok: true, skipped: true, reason: "no_turn_no" });
 
-    const roster = db
+    const settings = db.prepare(`SELECT personaName FROM chat_settings WHERE chatId=?`).get(chatId) as any;
+    const configuredPersonaName = cleanText(settings?.personaName, 80);
+    const inferredPersonaName = configuredPersonaName
+      ? ""
+      : inferPersonaNameFromMessages(all);
+    const personaName = configuredPersonaName || inferredPersonaName || "나";
+
+    const rosterAll = db
       .prepare(
         `SELECT id, name, aliases, role, profile, relationshipNote, emotionNote, status
          FROM chat_character_roster
@@ -281,11 +293,17 @@ export async function POST(req: Request) {
          LIMIT 40`
       )
       .all(chatId) as any[];
+    const identityCanon = buildIdentityCanonBlock({
+      messages: all,
+      knownNames: rosterAll.flatMap((row) => characterNames(row)),
+      personaName,
+    });
+    const personaKey = personaName.toLowerCase();
+    const roster = rosterAll.filter(
+      (row) => !characterNames(row).some((name) => name.toLowerCase() === personaKey)
+    );
 
     if (!roster.length) return NextResponse.json({ ok: true, skipped: true, reason: "no_registered_characters", turnNo });
-
-    const settings = db.prepare(`SELECT personaName FROM chat_settings WHERE chatId=?`).get(chatId) as any;
-    const personaName = cleanText(settings?.personaName, 80) || "나";
 
     const prevUser = userBeforeAssistant(all, assistantId);
     const sceneText = [
@@ -316,6 +334,7 @@ export async function POST(req: Request) {
       "Every registered character is an isolated memory owner. Never copy a relationship, title, promise, emotion, or dialogue style from another character.",
       "A title used by one character never becomes a title that another character may use.",
       "If the persona corrects or denies a relationship/title, that correction overrides the assistant response and must remain negated.",
+      identityCanon.block,
       "Write summaries in Korean casual banmal ending with forms like ~했어, ~하고 있어, ~보였어. Do not use formal endings like ~합니다, ~했습니다, ~습니다.",
       `The persona/user/player name is "${personaName}". Always refer to the persona as "${personaName}", never as 사용자, 주인공, or 플레이어.`,
       `Focus only on direct conversation between ${personaName} and the character, because this memory will be used later to remember their shared history.`,
@@ -398,6 +417,12 @@ export async function POST(req: Request) {
         if (!summary) continue;
         const relationshipDrift = analyzeRelationshipCorrectionDrift(sceneText, summary);
         if (!relationshipDrift.ok) continue;
+        const identityDrift = analyzeIdentityCanonDrift({
+          sourceText: sceneText,
+          summary,
+          canon: identityCanon.canon,
+        });
+        if (!identityDrift.ok) continue;
         const evidence = cleanText(replaceGenericPersonaRefs(item?.evidence, personaName), 500);
         const name = String(row?.name || "").trim();
 
