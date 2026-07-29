@@ -78,6 +78,7 @@ import {
 import { buildModelCallOpts, runBufferedOne, runOptionalShortContinue, runStreamMainGeneration } from "./_server/streamRunner";
 import { makeContinueUserPrompt, mergeStreamUsage } from "./_server/streamHelpers";
 import { buildRecentExpressionAvoidanceBlock } from "./_server/repetitionGuard";
+import { buildWorldDirectorBlock } from "./_server/worldDirector";
 import { applyStreamFinalizeUsageStats, finalizeStreamResult } from "./_server/streamFinal";
 import { consumeMainStreamDeltas } from "./_server/streamLoop";
 import {
@@ -2125,6 +2126,16 @@ const formatGuide = buildFormatGuide({
           metaTemplateFence: metaFenceTemplateHint ? metaFenceTemplateHint : undefined,
         });
 const recentExpressionAvoidanceBlock = buildRecentExpressionAvoidanceBlock(tail);
+const worldDirectorBlock = currentOocInstruction
+  ? ""
+  : buildWorldDirectorBlock({
+      messages: tail,
+      currentUserText: userText,
+      authorConstraintText: [presetBlock, noteBlock].join("\n"),
+      registeredNames: continuityIdentities.map((identity) => String(identity?.name || "")),
+      chatId: cid,
+      userTurnCount,
+    });
 
 // (2026-07) 캐시 친화 배치: Vertex implicit cache는 "앞에서부터 바이트 동일한 프리픽스"만
 // 적중하므로, 고정 블록(작품설정/페르소나/유저노트/관계규칙)을 앞에, 매턴 변동 블록
@@ -2152,6 +2163,8 @@ const systemRaw = (cacheFriendlyLayout
         sanitizePromptCached(formatGuide),
         recentExpressionAvoidanceBlock ? `` : "",
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
+        worldDirectorBlock ? `` : "",
+        worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
       ]
     : [
         `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
@@ -2171,6 +2184,8 @@ const systemRaw = (cacheFriendlyLayout
         sanitizePromptCached(formatGuide),
         recentExpressionAvoidanceBlock ? `` : "",
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
+        worldDirectorBlock ? `` : "",
+        worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
       ]).join("\n");
     const npcName = preset.characterName || (preset as any).name || "상대";
     const systemBase = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });
