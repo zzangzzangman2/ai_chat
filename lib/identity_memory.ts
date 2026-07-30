@@ -3,6 +3,15 @@ export type IdentityMessageLike = {
   content?: unknown;
 };
 
+export type IdentityCharacterSource = {
+  name?: unknown;
+  role?: unknown;
+  profile?: unknown;
+  relationshipNote?: unknown;
+  emotionNote?: unknown;
+  status?: unknown;
+};
+
 export type CanonicalNameFact = {
   subject: string;
   subjectKey: string;
@@ -14,7 +23,10 @@ export type CanonicalNameFact = {
 
 export type FamilyRelation =
   | "아버지" | "어머니" | "딸" | "아들"
-  | "손녀" | "손자" | "자녀";
+  | "손녀" | "손자" | "자녀" | "부모"
+  | "할아버지" | "할머니" | "조부모" | "손자녀"
+  | "언니" | "누나" | "오빠" | "형"
+  | "동생" | "여동생" | "남동생" | "자매" | "형제" | "형제자매";
 
 export type ScopedRoleAnchor = {
   subjectName: string;
@@ -235,7 +247,7 @@ export function extractScopedRoleAnchors(
 
   for (const message of userMessages(messages)) {
     if (personaName) {
-      const personaRelation = /(?:우리|저희|내|제)\s*(?:(?:어린|사랑하는|유일한)\s*)?((?:첫째|둘째|셋째|막내)?\s*)(아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀)/gu;
+      const personaRelation = /(?:우리|저희|내|제)\s*(?:(?:어린|사랑하는|유일한)\s*)?((?:첫째|둘째|셋째|막내)?\s*)(아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제)/gu;
       for (const match of message.text.matchAll(personaRelation)) {
         const ordinal = String(match[1] || "").replace(/\s+/g, "");
         const term = String(match[2] || "");
@@ -285,18 +297,18 @@ export function extractScopedRoleAnchors(
     for (const name of names) {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const direct = new RegExp(
-        `${escaped}(?:이|의)\\s*(아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀)`,
+        `${escaped}(?:이|의)\\s*(아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제)`,
         "gu"
       );
       const scopedPronoun = new RegExp(
-        `${escaped}[^.!?\\n]{0,28}(?:그|그녀|걔)의\\s*((?:(?:아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀)[\\s,]*){1,6})`,
+        `${escaped}[^.!?\\n]{0,28}(?:그|그녀|걔)의\\s*((?:(?:아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제)[\\s,]*){1,6})`,
         "gu"
       );
       const terms = [
         ...Array.from(message.text.matchAll(direct), (match) => match[1]),
         ...Array.from(message.text.matchAll(scopedPronoun)).flatMap((match) =>
           Array.from(
-            String(match[1] || "").matchAll(/아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀/gu),
+            String(match[1] || "").matchAll(/아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제/gu),
             (termMatch) => termMatch[0]
           )
         ),
@@ -326,11 +338,26 @@ export function extractScopedRoleAnchors(
       const relationPatterns: Array<{ relation: FamilyRelation; pattern: string }> = [
         { relation: "아버지", pattern: "(?:아빠|아버지)" },
         { relation: "어머니", pattern: "(?:엄마|어머니)" },
+        { relation: "부모", pattern: "부모" },
+        { relation: "할아버지", pattern: "할아버지" },
+        { relation: "할머니", pattern: "할머니" },
+        { relation: "조부모", pattern: "조부모" },
         { relation: "딸", pattern: "딸" },
         { relation: "아들", pattern: "아들" },
         { relation: "손녀", pattern: "손녀" },
         { relation: "손자", pattern: "손자" },
+        { relation: "손자녀", pattern: "손자녀" },
         { relation: "자녀", pattern: "자녀" },
+        { relation: "여동생", pattern: "여동생" },
+        { relation: "남동생", pattern: "남동생" },
+        { relation: "동생", pattern: "(?<!여|남)동생" },
+        { relation: "언니", pattern: "언니" },
+        { relation: "누나", pattern: "누나" },
+        { relation: "오빠", pattern: "오빠" },
+        { relation: "형", pattern: "형(?!제)" },
+        { relation: "자매", pattern: "자매" },
+        { relation: "형제자매", pattern: "형제자매" },
+        { relation: "형제", pattern: "형제(?!자매)" },
       ];
       for (const entry of relationPatterns) {
         const namedByAssignment = message.text.match(
@@ -341,7 +368,7 @@ export function extractScopedRoleAnchors(
         );
         const namedByInverse = message.text.match(
           new RegExp(
-            `(${KOREAN_OR_LATIN_NAME})(?:은|는|이|가)\\s*${escaped}(?:이|의)\\s*${entry.pattern}`,
+            `(${KOREAN_OR_LATIN_NAME})(?:은|는|이|가)\\s*${escaped}(?:이|의)\\s*(?:(?:\\d{1,3}\\s*(?:세|살)|어린|친|막내|첫째|둘째|셋째)\\s*){0,4}${entry.pattern}`,
             "u"
           )
         );
@@ -381,20 +408,45 @@ export function extractScopedRoleAnchors(
     .slice(-160);
 }
 
+function characterIdentityMessages(sources: IdentityCharacterSource[] = []) {
+  const messages: IdentityMessageLike[] = [];
+  for (const source of sources) {
+    const name = validPersonaName(String(source?.name || ""));
+    if (!name) continue;
+    for (const value of [
+      source?.role,
+      source?.profile,
+      source?.relationshipNote,
+      source?.emotionNote,
+      source?.status,
+    ]) {
+      const fact = normalizedMessageText(value).replace(/^\(자동 탐지\)\s*/u, "").trim();
+      if (!fact) continue;
+      messages.push({ role: "user", content: `${name}은 ${fact}` });
+    }
+  }
+  return messages;
+}
+
 export function deriveIdentityCanon(params: {
   messages: IdentityMessageLike[];
   knownNames?: string[];
   personaName?: string;
+  characterSources?: IdentityCharacterSource[];
 }): IdentityCanon {
   const nameFacts = extractCanonicalNameFacts(params.messages);
   const inferredPersonaName = inferPersonaNameFromMessages(params.messages);
   const personaName = validPersonaName(String(params.personaName || "")) || inferredPersonaName;
+  const relationshipMessages = [
+    ...params.messages,
+    ...characterIdentityMessages(params.characterSources),
+  ];
   const knownNames = uniqueKnownNames([
     ...(params.knownNames || []),
     personaName,
     ...nameFacts.flatMap((fact) => [fact.canonicalName, ...fact.aliases]),
   ]);
-  const roleAnchors = extractScopedRoleAnchors(params.messages, knownNames, personaName);
+  const roleAnchors = extractScopedRoleAnchors(relationshipMessages, knownNames, personaName);
   if (personaName) {
     for (const fact of nameFacts) {
       const key = fact.subjectKey.replace(/\s+/g, "");
@@ -477,6 +529,7 @@ export function formatIdentityCanonBlock(canon: IdentityCanon) {
 export function buildIdentityCanonBlock(params: {
   messages: IdentityMessageLike[];
   knownNames?: string[];
+  characterSources?: IdentityCharacterSource[];
   personaName?: string;
 }) {
   const canon = deriveIdentityCanon(params);

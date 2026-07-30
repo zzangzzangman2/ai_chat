@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Theme = {
   bg: string;
@@ -34,6 +34,7 @@ type Affinity = {
   characterName: string;
   score: number;
   label: string;
+  relationshipLabel: string;
   lastDelta: number;
   reason: string;
   evidence: string;
@@ -62,6 +63,17 @@ type CharacterMemory = {
   updatedAt?: number;
 };
 
+type CharacterDetails = {
+  id: string;
+  name: string;
+  role: string;
+  profile: string;
+  relationshipNote: string;
+  emotionNote: string;
+  status: string;
+  memoryCount: number;
+};
+
 type GraphResponse = {
   ok: boolean;
   personaName: string;
@@ -77,6 +89,7 @@ type SelectedPerson = {
 };
 
 type MemoryState = {
+  character: CharacterDetails | null;
   memories: CharacterMemory[];
   total: number;
   offset: number;
@@ -86,6 +99,7 @@ type MemoryState = {
 };
 
 const emptyMemoryState: MemoryState = {
+  character: null,
   memories: [],
   total: 0,
   offset: 0,
@@ -152,16 +166,20 @@ function CenteredRelationshipGraph({
     const outer = nodes
       .filter((node) => node.key !== persona.key)
       .slice(0, 28);
-    const center = { x: 500, y: 350 };
+    const rowsPerSide = Math.max(1, Math.ceil(outer.length / 2));
+    const rowGap = 96;
+    const height = Math.max(620, rowsPerSide * rowGap + 150);
+    const center = { x: 500, y: height / 2 };
     const positions = new Map<string, { x: number; y: number }>();
     positions.set(persona.key, center);
-    const count = Math.max(1, outer.length);
     outer.forEach((node, index) => {
-      const angle = -Math.PI / 2 + (Math.PI * 2 * index) / count;
-      const ringOffset = count > 14 && index % 2 ? 42 : 0;
+      const rightSide = index % 2 === 1;
+      const row = Math.floor(index / 2);
+      const sideRows = rightSide ? Math.floor(outer.length / 2) : Math.ceil(outer.length / 2);
+      const top = (height - Math.max(0, sideRows - 1) * rowGap) / 2;
       positions.set(node.key, {
-        x: center.x + Math.cos(angle) * (350 - ringOffset),
-        y: center.y + Math.sin(angle) * (245 - ringOffset * 0.55),
+        x: rightSide ? 820 : 180,
+        y: top + row * rowGap,
       });
     });
 
@@ -196,10 +214,7 @@ function CenteredRelationshipGraph({
           id: `persona-link-${node.key}`,
           from: persona.key,
           to: node.key,
-          label: shortLabel(
-            node.relationshipNote,
-            shortLabel(node.role, affinity?.label || "등장인물")
-          ),
+          label: shortLabel(affinity?.relationshipLabel || "", "관계 미정"),
           actual: false,
         };
       });
@@ -211,6 +226,7 @@ function CenteredRelationshipGraph({
       affinityByRoster,
       edges: [...virtual, ...actual],
       center,
+      height,
     };
   }, [affinities, nodes, relations]);
 
@@ -244,9 +260,9 @@ function CenteredRelationshipGraph({
       }}
     >
       <svg
-        viewBox="0 0 1000 700"
+        viewBox={`0 0 1000 ${graph.height}`}
         aria-label="페르소나 중심 인물관계도"
-        style={{ display: "block", width: "100%", minWidth: 760, height: "auto" }}
+        style={{ display: "block", width: "100%", minWidth: 880, height: "auto" }}
       >
         <defs>
           <marker
@@ -287,11 +303,14 @@ function CenteredRelationshipGraph({
           const points = linePoints(
             from,
             to,
-            edge.from === "persona" ? 65 : 48,
-            edge.to === "persona" ? 65 : 48
+            edge.from === "persona" ? 104 : 88,
+            edge.to === "persona" ? 104 : 88
           );
-          const midX = (points.x1 + points.x2) / 2;
-          const midY = (points.y1 + points.y2) / 2;
+          const labelRatio = edge.actual
+            ? 0.5
+            : edge.from === "persona" ? 0.68 : edge.to === "persona" ? 0.32 : 0.5;
+          const midX = points.x1 + (points.x2 - points.x1) * labelRatio;
+          const midY = points.y1 + (points.y2 - points.y1) * labelRatio;
           const labelWidth = Math.max(48, Math.min(150, edge.label.length * 12 + 24));
           return (
             <g key={edge.id}>
@@ -332,10 +351,11 @@ function CenteredRelationshipGraph({
           const point = graph.positions.get(node.key);
           if (!point) return null;
           const persona = node.key === "persona";
-          const radius = persona ? 62 : 45;
           const affinity = node.rosterId
             ? graph.affinityByRoster.get(node.rosterId)
             : undefined;
+          const nodeWidth = persona ? 188 : 158;
+          const nodeHeight = persona ? 54 : 46;
           const color = persona
             ? "#67e8f9"
             : node.isUnknown
@@ -357,52 +377,52 @@ function CenteredRelationshipGraph({
               }}
               role={clickable ? "button" : undefined}
               tabIndex={clickable ? 0 : undefined}
+              aria-label={clickable ? `${node.name}의 개별 장기기억 보기` : node.name}
               style={{ cursor: clickable ? "pointer" : "default", outline: "none" }}
             >
               {active ? (
-                <circle r={radius + 9} fill="none" stroke="#f9a8d4" strokeWidth="3" opacity="0.82" />
+                <rect
+                  x={-nodeWidth / 2 - 5}
+                  y={-nodeHeight / 2 - 5}
+                  width={nodeWidth + 10}
+                  height={nodeHeight + 10}
+                  rx={16}
+                  fill="rgba(244,114,182,0.08)"
+                  stroke="#f9a8d4"
+                  strokeWidth="2"
+                />
               ) : null}
-              <circle
-                r={radius + 5}
-                fill="rgba(15,23,42,0.84)"
-                stroke={color}
-                strokeWidth={persona ? 4 : 3}
-                strokeDasharray={node.isUnknown ? "7 5" : undefined}
-                filter={persona ? "url(#relationship-node-glow)" : undefined}
-              />
-              <circle
-                r={radius - 5}
+              <rect
+                x={-nodeWidth / 2}
+                y={-nodeHeight / 2}
+                width={nodeWidth}
+                height={nodeHeight}
+                rx={persona ? 14 : 11}
                 fill={
                   persona
-                    ? "rgba(14,116,144,0.72)"
+                    ? "rgba(8,91,115,0.94)"
                     : node.isUnknown
-                      ? "rgba(71,85,105,0.44)"
-                      : "rgba(30,41,59,0.94)"
+                      ? "rgba(51,65,85,0.80)"
+                      : "rgba(15,23,42,0.95)"
                 }
+                stroke={color}
+                strokeWidth={persona ? 2.5 : 1.8}
+                strokeDasharray={node.isUnknown ? "6 4" : undefined}
+                filter={persona ? "url(#relationship-node-glow)" : undefined}
               />
               <text
                 x="0"
-                y={persona ? 5 : 4}
+                y="5"
                 textAnchor="middle"
                 fill="#fff"
-                fontSize={persona ? "25" : "18"}
+                fontSize={persona ? "18" : "15"}
                 fontWeight="950"
               >
-                {node.isUnknown ? "?" : node.name.slice(0, 1)}
+                {node.isUnknown ? "이름 미상" : node.name}
               </text>
               <text
                 x="0"
-                y={radius + 24}
-                textAnchor="middle"
-                fill={persona ? "#a5f3fc" : "#f8fafc"}
-                fontSize={persona ? "16" : "14"}
-                fontWeight="950"
-              >
-                {node.name}
-              </text>
-              <text
-                x="0"
-                y={radius + 42}
+                y={nodeHeight / 2 + 19}
                 textAnchor="middle"
                 fill="#94a3b8"
                 fontSize="11"
@@ -412,8 +432,8 @@ function CenteredRelationshipGraph({
                 {affinity ? ` · ♥ ${clampScore(affinity.score)}` : ""}
               </text>
               {persona ? (
-                <text x="0" y={-radius - 15} textAnchor="middle" fill="#67e8f9" fontSize="12" fontWeight="900">
-                  페르소나 · 관계의 중심
+                <text x="0" y={-nodeHeight / 2 - 15} textAnchor="middle" fill="#67e8f9" fontSize="12" fontWeight="900">
+                  페르소나 중심
                 </text>
               ) : null}
             </g>
@@ -482,29 +502,7 @@ function PersonNode({
         transition: "transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
-        <span
-          aria-hidden
-          style={{
-            width: 34,
-            height: 34,
-            borderRadius: "50%",
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            flex: "0 0 auto",
-            background: persona
-              ? "linear-gradient(145deg, #6366f1, #8b5cf6)"
-              : unknown
-                ? "rgba(148,163,184,0.16)"
-                : "linear-gradient(145deg, rgba(236,72,153,0.85), rgba(139,92,246,0.85))",
-            color: "#fff",
-            fontSize: 16,
-            fontWeight: 950,
-          }}
-        >
-          {unknown ? "?" : name.slice(0, 1)}
-        </span>
+      <div style={{ minWidth: 0 }}>
         <span style={{ minWidth: 0 }}>
           <span
             style={{
@@ -543,6 +541,7 @@ export default function RelationshipGraphPanel({
   const [relations, setRelations] = useState<Relation[]>([]);
   const [affinities, setAffinities] = useState<Affinity[]>([]);
   const [selected, setSelected] = useState<SelectedPerson | null>(null);
+  const memoryPanelRef = useRef<HTMLDivElement | null>(null);
   const [memoryState, setMemoryState] = useState<MemoryState>(emptyMemoryState);
 
   const loadGraph = useCallback(async () => {
@@ -588,6 +587,7 @@ export default function RelationshipGraphPanel({
         if (!response.ok || !body?.ok) throw new Error(body?.error || "개별 기억을 불러오지 못했습니다.");
         const incoming = Array.isArray(body.memories) ? body.memories : [];
         setMemoryState((previous) => ({
+          character: body?.character || previous.character || null,
           memories: offset > 0 ? [...previous.memories, ...incoming] : incoming,
           total: Math.max(0, Number(body.total || 0)),
           offset: Math.max(0, Number(body.nextOffset || offset + incoming.length)),
@@ -611,6 +611,9 @@ export default function RelationshipGraphPanel({
       setSelected(person);
       setMemoryState(emptyMemoryState);
       void loadMemories(person, 0);
+      window.setTimeout(() => {
+        memoryPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }, 0);
     },
     [loadMemories]
   );
@@ -618,6 +621,11 @@ export default function RelationshipGraphPanel({
   useEffect(() => {
     setSelected(null);
     setMemoryState(emptyMemoryState);
+    void loadGraph();
+  }, [chatId, loadGraph]);
+
+  useEffect(() => {
+    if (!chatId || turnKey === undefined || turnKey === null) return;
     void loadGraph();
   }, [chatId, turnKey, loadGraph]);
 
@@ -884,8 +892,8 @@ export default function RelationshipGraphPanel({
                     />
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 8, fontSize: 11, color: theme.muted }}>
-                    <span>{affinity.label}</span>
-                    <span>{affinity.lastTurnNo ? `${affinity.lastTurnNo}턴 기준` : "기준값"}</span>
+                    <span>{affinity.relationshipLabel}</span>
+                    <span>{affinity.lastTurnNo ? `${affinity.label} · ${affinity.lastTurnNo}턴` : "초기값"}</span>
                   </div>
                   {affinity.reason ? (
                     <div style={{ marginTop: 7, fontSize: 11, lineHeight: 1.45, color: theme.muted }}>
@@ -903,6 +911,7 @@ export default function RelationshipGraphPanel({
 
       {selected ? (
         <div
+          ref={memoryPanelRef}
           style={{
             border: "1px solid rgba(244,114,182,0.34)",
             borderRadius: 20,
@@ -918,11 +927,48 @@ export default function RelationshipGraphPanel({
               </div>
             </div>
             {selectedAffinity ? (
-              <div style={{ color: affinityColor(selectedAffinity.score), fontWeight: 950 }}>
-                ♥ {clampScore(selectedAffinity.score)} · {selectedAffinity.label}
+              <div style={{ color: affinityColor(selectedAffinity.score), fontWeight: 950, textAlign: "right" }}>
+                <div>{selectedAffinity.relationshipLabel}</div>
+                <div style={{ marginTop: 3, fontSize: 12 }}>
+                  ♥ {clampScore(selectedAffinity.score)} · {selectedAffinity.label}
+                </div>
               </div>
             ) : null}
           </div>
+
+          {memoryState.character ? (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
+                gap: 8,
+                marginTop: 13,
+              }}
+            >
+              {[
+                ["역할", memoryState.character.role],
+                ["관계 기억", memoryState.character.relationshipNote],
+                ["감정 기억", memoryState.character.emotionNote],
+                ["현재 상태", memoryState.character.status],
+                ["인물 설정", memoryState.character.profile],
+              ]
+                .filter((item) => String(item[1] || "").trim())
+                .map(([label, value]) => (
+                  <div
+                    key={label}
+                    style={{
+                      padding: "10px 11px",
+                      borderRadius: 12,
+                      border: `1px solid ${theme.borderSoft}`,
+                      background: "rgba(0,0,0,0.12)",
+                    }}
+                  >
+                    <div style={{ color: "#c7d2fe", fontSize: 11, fontWeight: 950 }}>{label}</div>
+                    <div style={{ marginTop: 4, fontSize: 12, lineHeight: 1.5, wordBreak: "keep-all" }}>{value}</div>
+                  </div>
+                ))}
+            </div>
+          ) : null}
 
           {memoryState.error ? (
             <div style={{ marginTop: 10, color: "#fecaca", fontSize: 12 }}>{memoryState.error}</div>
@@ -943,7 +989,7 @@ export default function RelationshipGraphPanel({
               </div>
             ))}
             {!memoryState.loading && !memoryState.memories.length ? (
-              <div style={{ color: theme.muted, fontSize: 13 }}>아직 저장된 개별 대화 기억이 없습니다.</div>
+              <div style={{ color: theme.muted, fontSize: 13 }}>아직 저장된 턴별 대화 기억은 없습니다. 위 인물 설정과 관계 기억은 채팅에 계속 반영됩니다.</div>
             ) : null}
           </div>
           {memoryState.loading ? (

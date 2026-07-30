@@ -1692,7 +1692,8 @@ ${body}`.trim();
     ].join("\n");
     const continuityIdentities = (db
       .prepare(
-        `SELECT name, aliases, status
+        `SELECT name, aliases, role, profile, relationshipNote,
+                emotionNote, status
          FROM chat_character_roster
          WHERE chatId=? AND enabled != 0
          ORDER BY updatedAt DESC, name ASC
@@ -1701,6 +1702,10 @@ ${body}`.trim();
       .all(cid) as any[]).map((row) => ({
         name: String(row?.name || ""),
         aliases: decryptIfPossible(String(row?.aliases || "")),
+        role: decryptIfPossible(String(row?.role || "")),
+        profile: decryptIfPossible(String(row?.profile || "")),
+        relationshipNote: decryptIfPossible(String(row?.relationshipNote || "")),
+        emotionNote: decryptIfPossible(String(row?.emotionNote || "")),
         status: decryptIfPossible(String(row?.status || "")),
       }))
       .filter((identity) => {
@@ -1722,6 +1727,7 @@ ${body}`.trim();
       messages: all,
       knownNames: continuityIdentities.map((identity) => identity.name),
       personaName: personaNameFinal,
+      characterSources: continuityIdentities,
     });
     let relationshipGraphBlock = "";
     try {

@@ -12,6 +12,8 @@ import {
   inferPersonaNameFromMessages,
 } from "@/lib/identity_memory";
 import {
+  formatRelationshipGraphBlock,
+  loadRelationshipGraph,
   resetCharacterAffinitiesForTurn,
   updateCharacterAffinity,
 } from "@/lib/relationship_graph";
@@ -297,10 +299,19 @@ export async function POST(req: Request) {
          LIMIT 40`
       )
       .all(chatId) as any[];
+    const identityCharacterSources = rosterAll.map((row) => ({
+      name: String(row?.name || ""),
+      role: decryptIfPossible(String(row?.role || "")),
+      profile: decryptIfPossible(String(row?.profile || "")),
+      relationshipNote: decryptIfPossible(String(row?.relationshipNote || "")),
+      emotionNote: decryptIfPossible(String(row?.emotionNote || "")),
+      status: decryptIfPossible(String(row?.status || "")),
+    }));
     const identityCanon = buildIdentityCanonBlock({
       messages: all,
       knownNames: rosterAll.flatMap((row) => characterNames(row)),
       personaName,
+      characterSources: identityCharacterSources,
     });
     const personaKey = personaName.toLowerCase();
     const roster = rosterAll.filter(
@@ -339,6 +350,9 @@ export async function POST(req: Request) {
       "A title used by one character never becomes a title that another character may use.",
       "If the persona corrects or denies a relationship/title, that correction overrides the assistant response and must remain negated.",
       identityCanon.block,
+      formatRelationshipGraphBlock(loadRelationshipGraph(chatId)),
+      "The saved relationship graph is a continuity constraint. Use it to keep family roles, narrative relationship type, age, and affinity attached to the correct character.",
+      "Do not claim an older graph fact happened in this exact turn unless the exact-turn scene text supports it.",
       "For each saved direct conversation, estimate only THIS TURN's change in the character's affinity toward the persona.",
       "affinityDelta must be an integer from -3 to 3. Use 0 when the exchange does not clearly change affinity.",
       "Do not infer affinity change from mere presence, narration, coercion, or dialogue with somebody else.",

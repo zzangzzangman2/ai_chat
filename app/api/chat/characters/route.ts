@@ -117,7 +117,7 @@ export async function GET(req: Request) {
 
   const rosterId = String(searchParams.get("rosterId") || "").trim();
   if (rosterId) {
-    const roster = db.prepare(`SELECT id FROM chat_character_roster WHERE chatId=? AND id=?`).get(chatId, rosterId) as any;
+    const roster = db.prepare(`SELECT * FROM chat_character_roster WHERE chatId=? AND id=?`).get(chatId, rosterId) as any;
     if (!roster) return bad("character not found", 404);
 
     const limit = intParam(searchParams.get("limit"), 5, 1, 20);
@@ -141,6 +141,7 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       ok: true,
+      character: rowForClient(roster, [], total, personaName),
       rosterId,
       total,
       offset,

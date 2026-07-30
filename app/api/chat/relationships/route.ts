@@ -38,14 +38,23 @@ function loadMessages(chatId: string) {
 }
 
 function loadRoster(chatId: string) {
-  return db
+  const rows = db
     .prepare(
-      `SELECT id, name
+      `SELECT id, name, role, profile, relationshipNote, emotionNote, status
        FROM chat_character_roster
        WHERE chatId=? AND enabled != 0
        ORDER BY updatedAt DESC, name ASC`
     )
-    .all(chatId) as Array<{ id: string; name: string }>;
+    .all(chatId) as any[];
+  return rows.map((row) => ({
+    id: String(row?.id || ""),
+    name: String(row?.name || ""),
+    role: decryptIfPossible(String(row?.role || "")),
+    profile: decryptIfPossible(String(row?.profile || "")),
+    relationshipNote: decryptIfPossible(String(row?.relationshipNote || "")),
+    emotionNote: decryptIfPossible(String(row?.emotionNote || "")),
+    status: decryptIfPossible(String(row?.status || "")),
+  }));
 }
 
 function graphResponse(chatId: string, personaFallback = "") {
@@ -97,6 +106,7 @@ export async function POST(req: Request) {
       messages,
       knownNames: roster.map((row) => String(row?.name || "")),
       personaName,
+      characterSources: roster,
     });
     const turnNo = messages.filter((message) =>
       ["assistant", "model"].includes(String(message.role || "").toLowerCase())

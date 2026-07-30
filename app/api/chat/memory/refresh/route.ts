@@ -14,6 +14,7 @@ import {
   buildIdentityCanonBlock,
   inferPersonaNameFromMessages,
 } from "@/lib/identity_memory";
+import { formatRelationshipGraphBlock, loadRelationshipGraph } from "@/lib/relationship_graph";
 
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
@@ -788,22 +789,32 @@ export async function POST(req: Request) {
       ? ""
       : inferPersonaNameFromMessages(all);
     const personaName = configuredPersonaName || inferredPersonaName;
-    const identityKnownNames = (db
+    const identityCharacters = (db
       .prepare(
-        `SELECT name
+        `SELECT name, role, profile, relationshipNote, emotionNote, status
          FROM chat_character_roster
          WHERE chatId=? AND enabled != 0
          ORDER BY updatedAt DESC, name ASC
          LIMIT 60`
       )
-      .all(chatId) as Array<{ name: string }>).map((row) =>
-      String(row?.name || "").trim()
-    );
+      .all(chatId) as any[]).map((row) => ({
+      name: String(row?.name || "").trim(),
+      role: decryptIfPossible(String(row?.role || "")),
+      profile: decryptIfPossible(String(row?.profile || "")),
+      relationshipNote: decryptIfPossible(String(row?.relationshipNote || "")),
+      emotionNote: decryptIfPossible(String(row?.emotionNote || "")),
+      status: decryptIfPossible(String(row?.status || "")),
+    }));
+    const identityKnownNames = identityCharacters
+      .map((row) => row.name)
+      .filter(Boolean);
     const identityCanon = buildIdentityCanonBlock({
       messages: all,
       knownNames: identityKnownNames,
       personaName,
+      characterSources: identityCharacters,
     });
+    const relationshipGraphBlock = formatRelationshipGraphBlock(loadRelationshipGraph(chatId));
 
     const sourceNameSet = collectLikelyKoreanNames(cleanedText);
     for (const fact of identityCanon.canon.nameFacts) {
@@ -821,7 +832,10 @@ export async function POST(req: Request) {
       LONG_MEMORY_SUMMARY_RULES,
       relationshipCorrectionGuidance,
       identityCanon.block,
+      relationshipGraphBlock,
       nameLockGuidance,
+      "- 저장된 관계도는 인물별 가족관계·서사 관계 성격·현재 나이·호감도를 지키기 위한 연속성 기준이다.",
+      "- 관계도 정보를 다른 인물에게 옮기지 말고, 이번 요약 구간 원문에 없는 과거 사건을 이번 구간 사건처럼 새로 쓰지 않는다.",
     ]
       .filter(Boolean)
       .join("\n");
