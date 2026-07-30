@@ -365,6 +365,12 @@ export default function WorkSelectModal(props: {
   };
   const openContinuePicker = () => {
     if (continueDisabled) return;
+    // 작품 카드의 "이어하기"는 최신 방 하나를 바로 여는 동작이다.
+    // 여러 과거 방을 고르는 기능은 채팅 화면의 채팅 목록에 남겨 둔다.
+    if (continueChats.length === 1) {
+      onContinueChat(continueChats[0].id);
+      return;
+    }
     setContinuePickerOpen(true);
   };
   const onPickContinueChat = (chatId: string) => {

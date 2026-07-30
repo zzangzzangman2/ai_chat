@@ -1577,6 +1577,8 @@ const loadOlder = useCallback(async () => {
   const forceNewChatStartedRef = useRef<string>("");
   const forceOpenChatIntentRef = useRef<{ presetId: string; chatId: string } | null>(null);
   const forceOpenChatAppliedRef = useRef<string>("");
+  // busy state가 렌더에 반영되기 전의 빠른 연속 클릭도 생성 POST를 하나로 합친다.
+  const createChatInFlightRef = useRef(false);
 
   const consumeForceNewChatFlag = useCallback(
     (pid: string) => {
@@ -3993,6 +3995,8 @@ return (
       });
       return;
     }
+    if (createChatInFlightRef.current) return;
+    createChatInFlightRef.current = true;
     setBusy(true);
     try {
       const res = await fetch("/api/chat/create", {
@@ -4018,6 +4022,7 @@ return (
     } catch (e: any) {
       showToast("설정 저장 실패", (e?.message || "오류"), "error", 3500);
     } finally {
+      createChatInFlightRef.current = false;
       setBusy(false);
     }
   }

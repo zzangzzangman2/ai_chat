@@ -534,7 +534,8 @@ useEffect(() => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [view, meEmail, meStatus]);
 
-  // 선택된 프리셋의 이어하기 채팅(최대 3개) 로드
+  // 작품 진입용 "이어하기"는 가장 최근 채팅 하나만 노출한다.
+  // 과거 채팅은 채팅 화면의 목록에서 그대로 접근할 수 있다.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -546,7 +547,7 @@ useEffect(() => {
       }
       setLatestChatLoaded(false);
       try {
-        const res = await fetch(`/api/chat/list?presetId=${encodeURIComponent(selectedPresetId)}&limit=3`, {
+        const res = await fetch(`/api/chat/list?presetId=${encodeURIComponent(selectedPresetId)}&limit=1`, {
           cache: "no-store",
         });
         if (!res.ok) throw new Error(await res.text());
@@ -562,7 +563,7 @@ useEffect(() => {
               lastMessage: String(c?.lastMessage || ""),
             }))
             .filter((c: ContinueChatOption) => !!c.id)
-            .slice(0, 3)
+            .slice(0, 1)
         );
         setLatestChatLoaded(true);
       } catch {
