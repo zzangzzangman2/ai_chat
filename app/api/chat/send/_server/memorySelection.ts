@@ -25,23 +25,100 @@ const STOPWORDS = new Set([
   "채팅",
   "대화",
   "장기",
-  "기억",
-  "요약",
   "블록",
 ]);
 
-function searchTokens(text: string) {
-  const hits = String(text || "").toLowerCase().match(/[가-힣a-z0-9]{2,}/g) || [];
+const SEMANTIC_SEARCH_GROUPS: Array<{ pattern: RegExp; tokens: string[] }> = [
+  {
+    pattern: /(약속|맹세|서약|다짐|합의|정했|하기로|지키기로)/u,
+    tokens: ["약속", "맹세", "서약", "다짐", "합의", "하기로", "지키기로"],
+  },
+  {
+    pattern: /(관계|사이|인연|친구|동료|연인|부부|가족|상사|부하|선배|후배)/u,
+    tokens: ["관계", "사이", "인연", "친구", "동료", "연인", "부부", "가족", "상사", "부하"],
+  },
+  {
+    pattern: /(결혼|혼인|부부|배우자|남편|아내)/u,
+    tokens: ["결혼", "혼인", "부부", "배우자", "남편", "아내"],
+  },
+  {
+    pattern: /(이별|헤어|결별|이혼|절교)/u,
+    tokens: ["이별", "헤어", "결별", "이혼", "절교"],
+  },
+  {
+    pattern: /(구조|구출|구해|살려|도왔|도움)/u,
+    tokens: ["구조", "구출", "구해", "살려", "도움"],
+  },
+  {
+    pattern: /(사망|죽었|숨졌|살해|목숨)/u,
+    tokens: ["사망", "죽었", "숨졌", "살해", "목숨"],
+  },
+  {
+    pattern: /(실종|사라졌|행방|찾기로|찾아야)/u,
+    tokens: ["실종", "사라졌", "행방", "찾기로", "찾아야"],
+  },
+  {
+    pattern: /(부상|다쳤|병원|입원|수술|치료)/u,
+    tokens: ["부상", "다쳤", "병원", "입원", "수술", "치료"],
+  },
+  {
+    pattern: /(비밀|숨겼|고백|밝혔|정체)/u,
+    tokens: ["비밀", "숨겼", "고백", "밝혔", "정체"],
+  },
+  {
+    pattern: /(배신|속였|거짓말|기만)/u,
+    tokens: ["배신", "속였", "거짓말", "기만"],
+  },
+  {
+    pattern: /(싸움|다툼|갈등|화해|용서)/u,
+    tokens: ["싸움", "다툼", "갈등", "화해", "용서"],
+  },
+];
+
+function stripKoreanParticle(token: string) {
+  const stripped = token.replace(
+    /(?:에게서|한테서|으로부터|이랑|하고|에게|한테|부터|까지|으로|에서|처럼|보다|랑|와|과|은|는|이|가|을|를|도|만)$/u,
+    ""
+  );
+  return stripped.length >= 2 ? stripped : token;
+}
+
+export function memorySearchTokens(text: string) {
+  const src = String(text || "").toLowerCase();
+  const hits = src.match(/[가-힣a-z0-9]{2,}/g) || [];
+  const primaryLine = src.split("\n", 1)[0] || "";
+  const primaryHits = primaryLine.match(/[가-힣a-z0-9]{2,}/g) || [];
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const raw of hits) {
-    const token = raw.trim();
-    if (token.length < 2 || STOPWORDS.has(token) || seen.has(token)) continue;
-    if (/^\d+$/.test(token) && token.length > 4) continue;
+  const add = (raw: string) => {
+    const token = String(raw || "").trim();
+    if (token.length < 2 || STOPWORDS.has(token) || seen.has(token)) return;
+    if (/^\d+$/.test(token) && token.length > 4) return;
     seen.add(token);
     out.push(token);
+  };
+  const addHits = (items: string[]) => {
+    for (const raw of items) {
+      const token = raw.trim();
+      add(token);
+      add(stripKoreanParticle(token));
+      if (out.length >= 80) break;
+    }
+  };
+
+  // queryText is ordered as current user input followed by recent context.
+  // Reserve the front of the token budget for the current request and its
+  // semantic expansions before recent dialogue can consume all 80 slots.
+  addHits(primaryHits);
+  for (const group of SEMANTIC_SEARCH_GROUPS) {
+    if (!group.pattern.test(src)) continue;
+    for (const token of group.tokens) {
+      add(token);
+      if (out.length >= 80) break;
+    }
     if (out.length >= 80) break;
   }
+  if (out.length < 80) addHits(hits);
   return out;
 }
 
@@ -126,7 +203,7 @@ export function selectHybridMemory(params: {
   const currentKeys = new Set(current.map((section) => `${section.startTurn}:${section.endTurn}`));
   const older = sections.filter((section) => !currentKeys.has(`${section.startTurn}:${section.endTurn}`));
 
-  const tokens = searchTokens(params.queryText);
+  const tokens = memorySearchTokens(params.queryText);
   const ranges = explicitTurnRanges(params.queryText);
   const scored = older
     .map((section) => {
@@ -168,8 +245,22 @@ export function selectHybridMemory(params: {
   }
 
   if (!picked.length && fallbackSections > 0 && maxRelatedSections > 0 && maxRelatedChars > 0) {
-    for (let i = older.length - 1; i >= 0 && picked.length < fallbackSections; i--) {
-      const section = older[i];
+    // The current arc already contains the latest story. A no-hit fallback must
+    // preserve foundational history too, not duplicate only the newest archive.
+    const fallbackCandidates =
+      fallbackSections <= 1
+        ? older.slice(0, 1)
+        : [...older.slice(0, fallbackSections - 1), older[older.length - 1]].filter(
+            (section, index, all) =>
+              section &&
+              all.findIndex(
+                (item) =>
+                  item.startTurn === section.startTurn &&
+                  item.endTurn === section.endTurn
+              ) === index
+          );
+    for (const section of fallbackCandidates) {
+      if (picked.length >= fallbackSections) break;
       const chars = sectionChars(section) + 2;
       if (relatedChars > 0 && relatedChars + chars > maxRelatedChars) continue;
       picked.push({ section, score: 0, fallback: true });

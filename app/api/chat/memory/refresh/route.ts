@@ -841,9 +841,8 @@ export async function POST(req: Request) {
     const summaryEveryVal = SUMMARY_EVERY_ASSISTANT_TURNS; // must match /api/chat/send shouldRefresh logic
     const keepUserTurnsVal = KEEP_USER_TURNS;
     const perTurnCharsVal = normalizePerTurnChars(body?.perTurnChars ?? st?.longMemoryPerTurnChars ?? 80);
-    // 기본 동작: 기존 블록 재요약 금지(토큰 재소모 방지).
-    // 필요할 때만 repairCorrupted=true로 명시적으로 self-heal 허용.
-    const repairCorrupted = Boolean(body?.repairCorrupted);
+    // 손상된 구간은 기본적으로 자동 복구한다. 명시적으로 false인 관리 요청만 건너뛴다.
+    const repairCorrupted = body?.repairCorrupted !== false;
     // 디버깅/검증용: 품질 필터 실패(bad_output)여도 강제로 저장.
     const allowBadOutputSave = Boolean(body?.allowBadOutputSave);
 
@@ -902,25 +901,20 @@ export async function POST(req: Request) {
       now: Date.now(),
     });
 
-    const summarizedEndTurnDb = Math.max(0, Number(cache?.summarizedEndTurn || 0));
     const summarizedEndTurnText = Math.max(0, getSummarizedEndTurn(recentSummary));
 
     // IMPORTANT: Trust the actual stored summary content over the DB cursor.
-    // In some cases a generated window can be sanitized away (too short / non-contiguous),
-    // but older logic still advanced summarizedEndTurn to the requested windowEndTurn.
-    // That creates a mismatch where endTurn leaps ahead while the text stays at 1-3,
-    // making future refreshes skip forever.
-    let summarizedEndTurn = summarizedEndTurnText;
-    if (!summarizedEndTurn && !recentSummary.trim()) {
-      // If we have no stored text at all, fall back to DB cursor.
-      summarizedEndTurn = summarizedEndTurnDb;
-    }
+    // Never revive a non-zero cursor when normalization removed every section.
+    // Cursor/text mismatch otherwise skips the missing first window forever.
+    const summarizedEndTurn = summarizedEndTurnText;
 
     const persistNormalizedSummaryIfNeeded = (nextSummarizedEndTurn: number) => {
       if (!didNormalizeSummary) return;
       const now = Date.now();
-      const safeEndTurn = Math.max(0, Math.floor(Number(nextSummarizedEndTurn) || 0));
       const safeSummary = String(recentSummary || "");
+      const contentEndTurn = Math.max(0, getSummarizedEndTurn(safeSummary));
+      const requestedEndTurn = Math.max(0, Math.floor(Number(nextSummarizedEndTurn) || 0));
+      const safeEndTurn = Math.min(requestedEndTurn, contentEndTurn);
       const safeSummaryChars = strlenSummary(safeSummary);
       db.prepare(
         `UPDATE chat_memory_cache
@@ -935,7 +929,7 @@ export async function POST(req: Request) {
       );
     };
 
-    // (Self-heal, opt-in) corrupted block repair is disabled by default to avoid token re-spend.
+    // Existing corrupted sections are repaired automatically before new windows advance.
     const repair = repairCorrupted ? firstBadSectionRange(recentSummary, boundaryEndTurn) : null;
 
     // 이미 장기요약이 끝난 기존 채팅이라도 roster가 비어 있으면 수동 새로고침에서

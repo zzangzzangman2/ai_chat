@@ -72,7 +72,7 @@ import {
 import { sanitizePromptCached } from "./_server/promptCache";
 import { buildFormatGuide } from "./_server/formatGuide";
 import { normalizeSummaryTail, sanitizeLongMemorySummary, upsertSummaryRangeBlock } from "./_server/memory";
-import { selectHybridMemory } from "./_server/memorySelection";
+import { memorySearchTokens, selectHybridMemory } from "./_server/memorySelection";
 import { buildContinuityLedgerBlock } from "./_server/continuityState";
 import {
   _reEsc,
@@ -174,44 +174,6 @@ type RelatedMemoryBlock = {
   summary: string;
   score: number;
 };
-
-const MEMORY_BLOCK_STOPWORDS = new Set([
-  "그리고",
-  "하지만",
-  "그러나",
-  "그래서",
-  "이번",
-  "지금",
-  "다음",
-  "계속",
-  "상대",
-  "사용자",
-  "어시스턴트",
-  "채팅",
-  "대화",
-  "장기",
-  // ("기억", "요약" 제거) — 사용자가 "그 기억 살아있어?" "요약 보여줘" 등으로
-  // 검색할 때 매칭 토큰이 줄어들어 좋은 블록을 놓치는 부작용이 있어 stopwords에서 뺀다.
-  "블록",
-]);
-
-function memorySearchTokens(text: string): string[] {
-  const src = String(text || "").toLowerCase();
-  const hits = src.match(/[가-힣a-z0-9]{2,}/g) || [];
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of hits) {
-    const t = raw.trim();
-    if (t.length < 2) continue;
-    if (MEMORY_BLOCK_STOPWORDS.has(t)) continue;
-    if (/^\d+$/.test(t) && t.length > 4) continue;
-    if (seen.has(t)) continue;
-    seen.add(t);
-    out.push(t);
-    if (out.length >= 80) break;
-  }
-  return out;
-}
 
 function explicitTurnRanges(text: string): Array<{ start: number; end: number }> {
   const src = String(text || "");
@@ -1672,21 +1634,20 @@ ${body}`.trim();
       currentArcMaxChars: 3200,
       maxRelatedSections: 6,
       maxRelatedChars: 2400,
-      fallbackSections: 2,
+      fallbackSections: 3,
     });
-    // Legacy summaries without range sections cannot be searched by the hybrid selector.
-    const legacyRelatedMemory =
-      hybridMemory.totalSections === 0
-        ? buildRelatedMemoryBlocks({
-            chatId: cid,
-            queryText: memoryQueryText,
-            historySummary,
-            maxBlocks: 5,
-            maxChars: 1800,
-          })
-        : null;
+    // Search the indexed block ledger on every turn. Passing an empty archive
+    // prevents the cumulative summary from suppressing the same detailed range.
+    const indexedRelatedMemory = buildRelatedMemoryBlocks({
+      chatId: cid,
+      queryText: memoryQueryText,
+      historySummary: "",
+      maxBlocks: 5,
+      maxChars: 1800,
+    });
     const relatedArchiveText =
-      hybridMemory.relatedArchiveText || String(legacyRelatedMemory?.blockText || "").trim();
+      String(indexedRelatedMemory.blockText || "").trim() ||
+      hybridMemory.relatedArchiveText;
     const characterFocusText = [
       userText,
       ...tail.slice(-4).map((m: any) => String(m?.content || "")),
@@ -1757,8 +1718,12 @@ ${body}`.trim();
         focusText: characterFocusText,
         graph: loadRelationshipGraph(cid),
       });
-    } catch {
-      // 관계 기억 조회 실패가 본 대화 생성을 막지 않게 한다.
+    } catch (error) {
+      console.error("[chat/send] dynamic character context failed", {
+        chatId: cid,
+        reqId,
+        error: String((error as { message?: unknown })?.message || error),
+      });
     }
     const focusedCanonNames = new Set(
       [
@@ -1803,9 +1768,22 @@ ${body}`.trim();
     const identityCanonBlock = formatIdentityCanonBlock(identityCanonForPrompt);
     // 새 동적 조회가 비어 있거나 DB 조회에 실패한 경우에만 기존 등록 캐릭터
     // 블록을 복구 경로로 사용한다. 정상 경로에서는 두 기억 블록을 중복 주입하지 않는다.
-    const manualCharacterRosterFallback = dynamicCharacterContext.block
-      ? ""
-      : buildManualCharacterRosterBlock(cid, characterFocusText, personaNameFinal);
+    let manualCharacterRosterFallback = "";
+    if (!dynamicCharacterContext.block) {
+      try {
+        manualCharacterRosterFallback = buildManualCharacterRosterBlock(
+          cid,
+          characterFocusText,
+          personaNameFinal
+        );
+      } catch (error) {
+        console.error("[chat/send] manual character context fallback failed", {
+          chatId: cid,
+          reqId,
+          error: String((error as { message?: unknown })?.message || error),
+        });
+      }
+    }
     const historySummaryForPrompt = [
       continuityLedger.block,
       hybridMemory.currentArcText,
@@ -1820,7 +1798,19 @@ ${body}`.trim();
       reqId,
       totalArchiveSections: hybridMemory.totalSections,
       currentRanges: hybridMemory.currentRanges,
-      pickedBlocks: hybridMemory.relatedRanges,
+      pickedBlocks: indexedRelatedMemory.blocks.length
+        ? indexedRelatedMemory.blocks.map((block) => ({
+            startTurn: block.startTurn,
+            endTurn: block.endTurn,
+            score: block.score,
+            fallback: false,
+            source: "fts-ledger",
+          }))
+        : hybridMemory.relatedRanges.map((range) => ({
+            ...range,
+            source: "summary-archive",
+          })),
+      indexedMemoryBlocks: indexedRelatedMemory.blocks.length,
       currentArcChars: strlen(hybridMemory.currentArcText),
       pickedChars: strlen(relatedArchiveText),
       continuityStates: continuityLedger.states,

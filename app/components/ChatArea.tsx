@@ -4363,6 +4363,7 @@ const lastAssistantSuggestSummaryRef = useRef<string>("");
                     chatId: refreshChatId,
                     runtime: runtimeForRefresh,
                     mode,
+                    repairCorrupted: true,
                     allowBadOutputSave: false,
                   }),
                   keepalive: true,

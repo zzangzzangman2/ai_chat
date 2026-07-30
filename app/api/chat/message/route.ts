@@ -211,7 +211,9 @@ export async function PATCH(req: Request) {
         trimLongMemoryCache(cid, truncateEndTurn);
 
         // Other derived tables (best-effort)
-        db.prepare(`DELETE FROM chat_memory_blocks WHERE chatId=?`).run(cid);
+        db.prepare(
+          `DELETE FROM chat_memory_blocks WHERE chatId=? AND endTurn>?`
+        ).run(cid, truncateEndTurn);
         db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
       }
     } catch {
@@ -297,7 +299,9 @@ export async function DELETE(req: Request) {
           trimLongMemoryCache(cid, truncateEndTurn);
 
           // other derived tables (best-effort)
-          db.prepare(`DELETE FROM chat_memory_blocks WHERE chatId=?`).run(cid);
+          db.prepare(
+            `DELETE FROM chat_memory_blocks WHERE chatId=? AND endTurn>?`
+          ).run(cid, truncateEndTurn);
           db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
         }
       } catch {
