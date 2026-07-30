@@ -78,12 +78,13 @@ export function affinityLabel(scoreRaw: number) {
   return "적대";
 }
 
-const RELATIONSHIP_SIGNAL_RULES: Array<[label: string, pattern: RegExp]> = [
-  ["원수", /(철천지원수|불구대천|원수|복수(?:의)?\s*대상|복수해야|원한|삶을\s*(?:짓밟|파괴)|평생[^.!?]{0,30}저주)/u],
-  ["악연", /(악연|(?:인생|삶)을\s*(?:망치|짓밟|파괴)|파멸시|비극의\s*원인)/u],
-  ["숙적", /(숙적|라이벌|경쟁자|맞수)/u],
-  ["공포", /(극심한\s*공포|공포에\s*질|두려워|무서워|벌벌\s*떨|살려\s*달라)/u],
-  ["적대", /(적대|적군|대적|살해|죽이려|죽여야|증오|혐오|악마|가해자)/u],
+const STRUCTURAL_RELATIONSHIP_RULES: Array<[label: string, pattern: RegExp]> = [
+  ["같은 반 친구", /(같은\s*반\s*친구|반\s*친구|학급\s*친구)/u],
+  ["동급생", /(동급생|같은\s*학년)/u],
+  ["같은 학교", /(같은\s*학교|동문)/u],
+  ["소꿉친구", /소꿉친구/u],
+  ["절친", /(절친|가장\s*친한\s*친구)/u],
+  ["친구", /친구/u],
   ["배우자", /(배우자|남편|아내|부부|신랑|신부)/u],
   ["연인", /(연인|애인|남자친구|여자친구|약혼|사랑하는\s*사이)/u],
   ["아버지", /(?:친부|양부|아버지|아빠)/u],
@@ -92,28 +93,32 @@ const RELATIONSHIP_SIGNAL_RULES: Array<[label: string, pattern: RegExp]> = [
   ["아들", /(?:친아들|양아들|아들)(?=\s|[,.!?]|$|이|은|는|을|를|과|와|로|에게)/u],
   ["손녀", /손녀/u],
   ["손자", /손자/u],
-  ["형제자매", /(형제|자매|남매|오빠|언니|누나|동생)/u],
+  ["여동생", /여동생/u],
+  ["남동생", /남동생/u],
+  ["언니", /언니/u],
+  ["누나", /누나/u],
+  ["오빠", /오빠/u],
+  ["형", /형(?!제)/u],
+  ["형제자매", /(형제자매|형제|자매|남매|동생)/u],
   ["가족", /(가족|혈육|친척)/u],
-  ["절친", /(절친|가장\s*친한\s*친구|소꿉친구)/u],
-  ["친구", /(친구|동창)/u],
   ["스승", /(스승|선생님|교사|교수|멘토)/u],
-  ["제자", /(제자|학생|후배)/u],
-  ["보호자", /(보호자|후견인|돌봐|보호해)/u],
+  ["제자", /(제자|담당\s*학생)/u],
+  ["선배", /선배/u],
+  ["후배", /후배/u],
+  ["보호자", /(보호자|후견인)/u],
+  ["담당자", /(담당자|담당관)/u],
   ["동료", /(동료|동업자|팀원|전우|협력자)/u],
   ["상사", /(상사|사장|대표|고용주|주군)/u],
-  ["부하", /(부하|직원|고용인|수하|하인)/u],
+  ["부하 직원", /(부하\s*직원|부하|고용인|수하|하인)/u],
   ["채무 관계", /(채무|빚|채권자|채무자)/u],
-  ["의심", /(의심|수상해|믿지\s*못|불신)/u],
-  ["경계", /(경계|조심|거리(?:를)?\s*두|꺼려)/u],
   ["동맹", /(동맹|한편|공조|연합)/u],
-  ["신뢰", /(신뢰|믿고|의지하|은인)/u],
+  ["원수", /(철천지원수|불구대천|원수)/u],
+  ["라이벌", /(라이벌|경쟁자|숙적|맞수)/u],
+  ["가해자", /가해자/u],
+  ["피해자", /피해자/u],
+  ["이웃", /이웃/u],
+  ["지인", /지인/u],
 ];
-
-const DIRECT_RELATIONSHIP_LABELS = new Set([
-  "배우자", "연인", "아버지", "어머니", "딸", "아들", "손녀", "손자",
-  "형제자매", "가족", "절친", "친구", "스승", "제자", "보호자", "동료",
-  "상사", "부하", "채무 관계",
-]);
 
 function cleanRelationshipSource(value: unknown) {
   return decryptIfPossible(String(value || ""))
@@ -125,65 +130,21 @@ export function narrativeRelationshipLabel(params: {
   score: number;
   lastTurnNo?: number;
   role?: unknown;
-  profile?: unknown;
   relationshipNote?: unknown;
-  emotionNote?: unknown;
-  status?: unknown;
-  reason?: unknown;
-  evidence?: unknown;
-  memories?: unknown[];
 }) {
-  const directSource = [
+  const structuralSource = [
     params.relationshipNote,
     params.role,
   ]
     .map(cleanRelationshipSource)
     .filter(Boolean)
     .join(" ");
-  const source = [
-    params.relationshipNote,
-    params.role,
-    params.profile,
-    params.emotionNote,
-    params.status,
-    params.reason,
-    params.evidence,
-    ...(Array.isArray(params.memories) ? params.memories : []),
-  ]
-    .map(cleanRelationshipSource)
-    .filter(Boolean)
-    .join(" ");
-  for (const [label, pattern] of RELATIONSHIP_SIGNAL_RULES) {
-    if (directSource && pattern.test(directSource)) return label;
-  }
-  for (const [label, pattern] of RELATIONSHIP_SIGNAL_RULES) {
-    if (DIRECT_RELATIONSHIP_LABELS.has(label)) continue;
-    if (pattern.test(source)) return label;
+  for (const [label, pattern] of STRUCTURAL_RELATIONSHIP_RULES) {
+    if (structuralSource && pattern.test(structuralSource)) return label;
   }
 
-  const score = clampInt(params.score, 0, 100);
   const hasInteraction = Math.max(0, Number(params.lastTurnNo || 0)) > 0;
-  if (!hasInteraction) return "관계 미정";
-  if (score >= 85) return "깊은 신뢰";
-  if (score >= 70) return "가까운 사이";
-  if (score >= 58) return "우호";
-  if (score >= 43) return "거리 유지";
-  if (score >= 28) return "경계";
-  if (score >= 15) return "불신";
-  return "적대";
-}
-
-function relationshipBaselineScore(label: string) {
-  if (label === "원수") return 5;
-  if (label === "악연") return 12;
-  if (label === "적대") return 15;
-  if (label === "공포") return 18;
-  if (label === "숙적") return 25;
-  if (label === "의심") return 35;
-  if (label === "경계") return 38;
-  if (label === "동맹") return 65;
-  if (label === "신뢰") return 72;
-  return 50;
+  return hasInteraction ? "아는 사이" : "관계 미정";
 }
 
 export function syncIdentityCanonRelations(params: {
@@ -202,11 +163,9 @@ export function syncIdentityCanonRelations(params: {
       const relation = cleanText(anchor.relation, 40);
       const relatedName = cleanText(anchor.relatedName, 80);
       const slotKey = cleanText(anchor.slotKey || "default", 80) || "default";
-      if (!subjectName || !relation) return null;
+      if (!subjectName || !relation || !relatedName) return null;
       const subjectKey = stableNameKey(subjectName, personaName);
-      const objectKey = relatedName
-        ? stableNameKey(relatedName, personaName)
-        : `role:${subjectKey}:${relation}:${slotKey}`.toLowerCase();
+      const objectKey = stableNameKey(relatedName, personaName);
       return {
         id: randomUUID(),
         chatId,
@@ -331,84 +290,23 @@ export function ensureCharacterAffinityRows(params: {
   });
   write();
 
-  const latestTurns = db
-    .prepare(
-      `SELECT rosterId, MAX(turnNo) AS latestTurn
-       FROM chat_character_turn_memories
-       WHERE chatId=?
-       GROUP BY rosterId`
-    )
-    .all(chatId) as Array<{ rosterId?: string; latestTurn?: number }>;
-  const latestTurnByRoster = new Map(
-    latestTurns
-      .map((row) => [String(row?.rosterId || ""), Math.max(0, Number(row?.latestTurn || 0))] as const)
-      .filter(([rosterId, latestTurn]) => Boolean(rosterId) && latestTurn > 0)
-  );
-  if (!latestTurnByRoster.size) return;
-
-  const memoryTextByRoster = new Map<string, string[]>();
-  const memoryRows = db
-    .prepare(
-      `SELECT rosterId, summary
-       FROM chat_character_turn_memories
-       WHERE chatId=?
-       ORDER BY turnNo DESC
-       LIMIT 240`
-    )
-    .all(chatId) as Array<{ rosterId?: string; summary?: string }>;
-  for (const row of memoryRows) {
-    const rosterId = String(row?.rosterId || "");
-    if (!latestTurnByRoster.has(rosterId)) continue;
-    const values = memoryTextByRoster.get(rosterId) || [];
-    if (values.length >= 8) continue;
-    values.push(decryptIfPossible(String(row?.summary || "")));
-    memoryTextByRoster.set(rosterId, values);
-  }
-
-  const candidates = db
-    .prepare(
-      `SELECT a.rosterId, a.score, a.lastTurnNo, a.reason,
-              r.role, r.profile, r.relationshipNote, r.emotionNote, r.status
-       FROM chat_character_affinity a
-       LEFT JOIN chat_character_roster r
-         ON r.chatId=a.chatId AND r.id=a.rosterId
-       WHERE a.chatId=? AND a.lastTurnNo=0`
-    )
-    .all(chatId) as any[];
-  const updateBaseline = db.prepare(
+  const artificialRows = db
+    .prepare(`SELECT rosterId, reason FROM chat_character_affinity WHERE chatId=?`)
+    .all(chatId) as Array<{ rosterId?: string; reason?: string }>;
+  const resetArtificial = db.prepare(
     `UPDATE chat_character_affinity
-     SET score=?, lastDelta=0, reason=?, evidence='', lastTurnNo=?, updatedAt=?
-     WHERE chatId=? AND rosterId=? AND lastTurnNo=0`
+     SET score=50, lastDelta=0, reason='', evidence='', lastTurnNo=0, updatedAt=?
+     WHERE chatId=? AND rosterId=?`
   );
-  const backfill = db.transaction(() => {
-    for (const row of candidates) {
+  const repair = db.transaction(() => {
+    for (const row of artificialRows) {
       const rosterId = String(row?.rosterId || "");
-      const latestTurn = latestTurnByRoster.get(rosterId) || 0;
-      if (!latestTurn) continue;
-      const relationshipLabel = narrativeRelationshipLabel({
-        score: Number(row?.score ?? 50),
-        lastTurnNo: latestTurn,
-        role: row?.role,
-        profile: row?.profile,
-        relationshipNote: row?.relationshipNote,
-        emotionNote: row?.emotionNote,
-        status: row?.status,
-        reason: row?.reason,
-        memories: memoryTextByRoster.get(rosterId) || [],
-      });
-      const score = relationshipBaselineScore(relationshipLabel);
-      if (score === 50) continue;
-      updateBaseline.run(
-        score,
-        encryptIfPossible(`기존 개별 장기기억 기반 초기 관계: ${relationshipLabel}`),
-        latestTurn,
-        now,
-        chatId,
-        rosterId
-      );
+      const reason = decryptIfPossible(String(row?.reason || ""));
+      if (!rosterId || !reason.startsWith("기존 개별 장기기억 기반 초기 관계:")) continue;
+      resetArtificial.run(now, chatId, rosterId);
     }
   });
-  backfill();
+  repair();
 }
 
 export function resetCharacterAffinitiesForTurn(chatIdRaw: string, turnNoRaw: number) {
@@ -530,7 +428,7 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
          FROM chat_character_relations r
          LEFT JOIN chat_character_roster sr ON sr.chatId=r.chatId AND sr.name=r.subjectName
          LEFT JOIN chat_character_roster orr ON orr.chatId=r.chatId AND orr.name=r.objectName
-         WHERE r.chatId=?
+         WHERE r.chatId=? AND TRIM(r.objectName) <> ''
          ORDER BY r.subjectName ASC, r.relation ASC, r.slotKey ASC`
       )
       .all(chatId) as any[]
@@ -549,24 +447,6 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     lastSeenTurn: Number(row?.lastSeenTurn || 0),
     updatedAt: Number(row?.updatedAt || 0),
   }));
-  const memoryTextByRoster = new Map<string, string[]>();
-  const recentMemoryRows = db
-    .prepare(
-      `SELECT rosterId, summary
-       FROM chat_character_turn_memories
-       WHERE chatId=?
-       ORDER BY turnNo DESC
-       LIMIT 240`
-    )
-    .all(chatId) as Array<{ rosterId?: string; summary?: string }>;
-  for (const row of recentMemoryRows) {
-    const rosterId = String(row?.rosterId || "");
-    if (!rosterId) continue;
-    const values = memoryTextByRoster.get(rosterId) || [];
-    if (values.length >= 8) continue;
-    values.push(decryptIfPossible(String(row?.summary || "")));
-    memoryTextByRoster.set(rosterId, values);
-  }
 
   const affinities = (
     db
@@ -574,10 +454,7 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         `SELECT a.id, a.rosterId, a.personaName, a.characterName, a.score, a.lastDelta,
                 a.reason, a.evidence, a.lastTurnNo, a.updatedAt,
                 COALESCE(r.role, '') AS role,
-                COALESCE(r.profile, '') AS profile,
-                COALESCE(r.relationshipNote, '') AS relationshipNote,
-                COALESCE(r.emotionNote, '') AS emotionNote,
-                COALESCE(r.status, '') AS status
+                COALESCE(r.relationshipNote, '') AS relationshipNote
          FROM chat_character_affinity a
          LEFT JOIN chat_character_roster r
            ON r.chatId=a.chatId AND r.id=a.rosterId
@@ -600,13 +477,7 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         score,
         lastTurnNo: Number(row?.lastTurnNo || 0),
         role: row?.role,
-        profile: row?.profile,
         relationshipNote: row?.relationshipNote,
-        emotionNote: row?.emotionNote,
-        status: row?.status,
-        reason,
-        evidence,
-        memories: memoryTextByRoster.get(String(row?.rosterId || "")) || [],
       }),
       lastDelta: clampInt(row?.lastDelta ?? 0, -3, 3),
       reason,
@@ -619,9 +490,16 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     affinities.find((row) => row.personaName)?.personaName ||
     relations.find((row) => row.subjectKey === "persona")?.subjectName ||
     "";
-  const nodes = loadCharacterGraphNodes(chatId);
+  const nodes = loadCharacterGraphNodes(chatId).filter(
+    (node) => !node.isUnknown && Boolean(String(node.name || "").trim())
+  );
   return { personaName, nodes, relations, affinities };
 }
+
+const SYMMETRIC_RELATIONS = new Set([
+  "배우자", "연인", "친구", "절친", "소꿉친구", "같은 반 친구",
+  "동급생", "같은 학교", "동료", "동맹", "라이벌", "원수", "이웃", "지인",
+]);
 
 export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
   const lines: string[] = [
@@ -632,15 +510,16 @@ export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
     lines.push(`- ${node.name} 현재 나이: ${node.age}세`);
   }
   for (const relation of graph.relations.slice(0, 60)) {
+    if (!relation.objectName) continue;
     lines.push(
-      `- ${relation.subjectName} → ${relation.relation} → ${
-        relation.objectName || `이름 미상(${relation.objectRole})`
-      }`
+      SYMMETRIC_RELATIONS.has(relation.relation)
+        ? `- ${relation.subjectName} ↔ ${relation.objectName}: ${relation.relation}`
+        : `- ${relation.subjectName} → ${relation.relation} → ${relation.objectName}`
     );
   }
   for (const affinity of graph.affinities.slice(0, 40)) {
     lines.push(
-      `- ${affinity.characterName} ↔ ${affinity.personaName || "주인공"} 관계 성격: ${
+      `- ${affinity.characterName} ↔ ${affinity.personaName || "주인공"} 구조적 관계: ${
         affinity.relationshipLabel
       }; 호감도: ${affinity.score}/100 (${affinity.label})`
     );

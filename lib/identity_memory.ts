@@ -26,7 +26,12 @@ export type FamilyRelation =
   | "손녀" | "손자" | "자녀" | "부모"
   | "할아버지" | "할머니" | "조부모" | "손자녀"
   | "언니" | "누나" | "오빠" | "형"
-  | "동생" | "여동생" | "남동생" | "자매" | "형제" | "형제자매";
+  | "동생" | "여동생" | "남동생" | "자매" | "형제" | "형제자매"
+  | "배우자" | "연인" | "친구" | "절친" | "소꿉친구"
+  | "같은 반 친구" | "동급생" | "같은 학교" | "선배" | "후배"
+  | "동료" | "상사" | "부하 직원" | "스승" | "제자"
+  | "보호자" | "담당자" | "이웃" | "지인"
+  | "원수" | "라이벌" | "가해자" | "피해자";
 
 export type ScopedRoleAnchor = {
   subjectName: string;
@@ -269,6 +274,7 @@ export function extractScopedRoleAnchors(
             break;
           }
         }
+        if (!relatedName) continue;
         const relations: FamilyRelation[] =
           term === "부모"
             ? ["아버지", "어머니"]
@@ -296,45 +302,6 @@ export function extractScopedRoleAnchors(
 
     for (const name of names) {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const direct = new RegExp(
-        `${escaped}(?:이|의)\\s*(아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제)`,
-        "gu"
-      );
-      const scopedPronoun = new RegExp(
-        `${escaped}[^.!?\\n]{0,28}(?:그|그녀|걔)의\\s*((?:(?:아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제)[\\s,]*){1,6})`,
-        "gu"
-      );
-      const terms = [
-        ...Array.from(message.text.matchAll(direct), (match) => match[1]),
-        ...Array.from(message.text.matchAll(scopedPronoun)).flatMap((match) =>
-          Array.from(
-            String(match[1] || "").matchAll(/아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제/gu),
-            (termMatch) => termMatch[0]
-          )
-        ),
-      ];
-      for (const term of terms) {
-        const relations: FamilyRelation[] =
-          term === "부모"
-            ? ["아버지", "어머니"]
-            : term === "아빠" || term === "아버지"
-              ? ["아버지"]
-              : term === "엄마" || term === "어머니"
-                ? ["어머니"]
-                : [term as FamilyRelation];
-        for (const relation of relations) {
-          const key = `${name}:${relation}`;
-          const previous = anchors.get(key);
-          anchors.set(key, {
-            subjectName: name,
-            relation,
-            relatedName: previous?.relatedName || "",
-            slotKey: previous?.slotKey || "default",
-            sourceOrder: message.sourceOrder,
-          });
-        }
-      }
-
       const relationPatterns: Array<{ relation: FamilyRelation; pattern: string }> = [
         { relation: "아버지", pattern: "(?:아빠|아버지)" },
         { relation: "어머니", pattern: "(?:엄마|어머니)" },
@@ -358,6 +325,29 @@ export function extractScopedRoleAnchors(
         { relation: "자매", pattern: "자매" },
         { relation: "형제자매", pattern: "형제자매" },
         { relation: "형제", pattern: "형제(?!자매)" },
+        { relation: "배우자", pattern: "(?:배우자|남편|아내)" },
+        { relation: "연인", pattern: "(?:연인|애인|남자친구|여자친구|약혼자)" },
+        { relation: "같은 반 친구", pattern: "(?:같은\\s*반\\s*친구|반\\s*친구|학급\\s*친구)" },
+        { relation: "동급생", pattern: "(?:동급생|같은\\s*학년)" },
+        { relation: "같은 학교", pattern: "(?:같은\\s*학교|동문)" },
+        { relation: "소꿉친구", pattern: "소꿉친구" },
+        { relation: "절친", pattern: "(?:절친|가장\\s*친한\\s*친구)" },
+        { relation: "친구", pattern: "친구" },
+        { relation: "선배", pattern: "선배" },
+        { relation: "후배", pattern: "후배" },
+        { relation: "동료", pattern: "(?:직장\\s*)?동료" },
+        { relation: "상사", pattern: "(?:상사|관리자)" },
+        { relation: "부하 직원", pattern: "(?:부하\\s*직원|부하|직원)" },
+        { relation: "스승", pattern: "(?:스승|담임|선생님|교사|교수|멘토)" },
+        { relation: "제자", pattern: "(?:제자|담당\\s*학생)" },
+        { relation: "보호자", pattern: "(?:보호자|후견인)" },
+        { relation: "담당자", pattern: "(?:담당자|담당관)" },
+        { relation: "이웃", pattern: "이웃" },
+        { relation: "지인", pattern: "지인" },
+        { relation: "원수", pattern: "(?:원수|적대\\s*관계)" },
+        { relation: "라이벌", pattern: "(?:라이벌|경쟁자|숙적)" },
+        { relation: "가해자", pattern: "가해자" },
+        { relation: "피해자", pattern: "피해자" },
       ];
       for (const entry of relationPatterns) {
         const namedByAssignment = message.text.match(
@@ -408,6 +398,105 @@ export function extractScopedRoleAnchors(
     .slice(-160);
 }
 
+function characterProfileAnchors(sources: IdentityCharacterSource[] = []) {
+  const anchors: ScopedRoleAnchor[] = [];
+  for (const source of sources) {
+    const childName = validPersonaName(String(source?.name || ""));
+    if (!childName) continue;
+    const text = [
+      source?.role,
+      source?.profile,
+      source?.relationshipNote,
+    ]
+      .map((value) => normalizedMessageText(value).replace(/^\(자동 탐지\)\s*/u, ""))
+      .filter(Boolean)
+      .join(" ");
+    if (!text) continue;
+    const bornFrom = text.match(
+      new RegExp(
+        `(${KOREAN_OR_LATIN_NAME})(?:은|는|이|가|에게서)\\s*(?:직접\\s*)?(?:낳은|출산한|출산해\\s*낳은)[^.!?\\n]{0,40}(딸|아들)`,
+        "u"
+      )
+    );
+    const parentName = validPersonaName(String(bornFrom?.[1] || ""));
+    const relation = String(bornFrom?.[2] || "") as FamilyRelation;
+    if (!parentName || parentName === childName || !["딸", "아들"].includes(relation)) {
+      continue;
+    }
+    anchors.push({
+      subjectName: parentName,
+      relation,
+      relatedName: childName,
+      slotKey: `${relation}:${childName}`,
+      sourceOrder: 0,
+    });
+  }
+  return anchors;
+}
+
+type SchoolContext = {
+  name: string;
+  school: string;
+  grade: number;
+  classNo: number;
+};
+
+function schoolContextForSource(source: IdentityCharacterSource): SchoolContext | null {
+  const name = validPersonaName(String(source?.name || ""));
+  if (!name) return null;
+  const text = [
+    source?.role,
+    source?.profile,
+    source?.relationshipNote,
+  ]
+    .map((value) => normalizedMessageText(value).replace(/^\(자동 탐지\)\s*/u, ""))
+    .filter(Boolean)
+    .join(" ");
+  if (!text) return null;
+  const school = String(
+    text.match(/([가-힣A-Za-z0-9·._-]{2,30}(?:초등학교|중학교|고등학교|예술고등학교|예고|고교|대학교|대학))/u)?.[1] || ""
+  )
+    .replace(/\s+/g, "")
+    .trim();
+  if (!school) return null;
+  const grade = Math.max(0, Number(text.match(/(\d{1,2})\s*학년/u)?.[1] || 0));
+  const classNo = Math.max(0, Number(text.match(/(\d{1,2})\s*반/u)?.[1] || 0));
+  return { name, school, grade, classNo };
+}
+
+function characterPeerAnchors(sources: IdentityCharacterSource[] = []) {
+  const contexts = sources
+    .map(schoolContextForSource)
+    .filter(Boolean) as SchoolContext[];
+  const anchors: ScopedRoleAnchor[] = [];
+  for (let left = 0; left < contexts.length; left += 1) {
+    for (let right = left + 1; right < contexts.length; right += 1) {
+      const a = contexts[left];
+      const b = contexts[right];
+      if (a.name === b.name || a.school !== b.school) continue;
+      const relation: FamilyRelation =
+        a.grade > 0 && b.grade > 0 && a.grade === b.grade &&
+        a.classNo > 0 && b.classNo > 0 && a.classNo === b.classNo
+          ? "같은 반 친구"
+          : a.grade > 0 && b.grade > 0 && a.grade === b.grade
+            ? "동급생"
+            : "같은 학교";
+      const [subjectName, relatedName] =
+        a.name.localeCompare(b.name, "ko") <= 0
+          ? [a.name, b.name]
+          : [b.name, a.name];
+      anchors.push({
+        subjectName,
+        relation,
+        relatedName,
+        slotKey: `${a.school}:${a.grade || 0}:${a.classNo || 0}:${relatedName}`,
+        sourceOrder: 0,
+      });
+    }
+  }
+  return anchors;
+}
+
 function characterIdentityMessages(sources: IdentityCharacterSource[] = []) {
   const messages: IdentityMessageLike[] = [];
   for (const source of sources) {
@@ -417,8 +506,6 @@ function characterIdentityMessages(sources: IdentityCharacterSource[] = []) {
       source?.role,
       source?.profile,
       source?.relationshipNote,
-      source?.emotionNote,
-      source?.status,
     ]) {
       const fact = normalizedMessageText(value).replace(/^\(자동 탐지\)\s*/u, "").trim();
       if (!fact) continue;
@@ -437,16 +524,36 @@ export function deriveIdentityCanon(params: {
   const nameFacts = extractCanonicalNameFacts(params.messages);
   const inferredPersonaName = inferPersonaNameFromMessages(params.messages);
   const personaName = validPersonaName(String(params.personaName || "")) || inferredPersonaName;
-  const relationshipMessages = [
-    ...params.messages,
-    ...characterIdentityMessages(params.characterSources),
-  ];
   const knownNames = uniqueKnownNames([
     ...(params.knownNames || []),
     personaName,
     ...nameFacts.flatMap((fact) => [fact.canonicalName, ...fact.aliases]),
   ]);
-  const roleAnchors = extractScopedRoleAnchors(relationshipMessages, knownNames, personaName);
+  const supplementalAnchors = extractScopedRoleAnchors(
+    characterIdentityMessages(params.characterSources),
+    knownNames,
+    personaName
+  );
+  const profileAnchors = characterProfileAnchors(params.characterSources);
+  const peerAnchors = characterPeerAnchors(params.characterSources);
+  const explicitAnchors = extractScopedRoleAnchors(params.messages, knownNames, personaName);
+  const mergedAnchors = new Map<string, ScopedRoleAnchor>();
+  for (const anchor of [...supplementalAnchors, ...profileAnchors, ...peerAnchors, ...explicitAnchors]) {
+    if (!validPersonaName(String(anchor.relatedName || ""))) continue;
+    const key = [
+      anchor.subjectName,
+      anchor.relation,
+      String(anchor.relatedName || ""),
+    ].join("\u0000");
+    mergedAnchors.set(key, anchor);
+  }
+  const roleAnchors = [...mergedAnchors.values()]
+    .sort(
+      (a, b) =>
+        a.sourceOrder - b.sourceOrder ||
+        a.subjectName.localeCompare(b.subjectName, "ko")
+    )
+    .slice(-160);
   if (personaName) {
     for (const fact of nameFacts) {
       const key = fact.subjectKey.replace(/\s+/g, "");
@@ -490,9 +597,9 @@ export function deriveIdentityCanon(params: {
 
 export function formatIdentityCanonBlock(canon: IdentityCanon) {
   const rows: string[] = [
-    "# [인물 정체성·가족관계 정사 — 장기기억보다 우선]",
-    "- 인물 이름과 가족관계는 반드시 `(대상 인물, 관계, 상대 인물)` 단위로 구분한다. 같은 '아빠/엄마/딸/아들' 호칭이라도 대상이나 세대가 다르면 별개의 관계다.",
-    "- 이름이 없는 'A의 아버지/어머니/딸/아들'도 독립된 역할 인물이다. 이름이 나중에 밝혀지면 같은 역할 인물에 이름만 연결하고 새 인물로 중복 생성하지 않는다.",
+    "# [인물 정체성·구조적 관계 정사 — 장기기억보다 우선]",
+    "- 인물 관계는 반드시 `(대상 인물, 관계 유형, 상대 인물)` 단위로 구분한다. 가족·친구·학교·직장 관계와 감정 상태를 섞지 않는다.",
+    "- 상대 이름이 확인되지 않은 관계는 관계도 노드로 만들지 않는다. 이름이 확인된 뒤 명시적 근거와 함께 연결한다.",
     "- 등장인물의 대사 속 주장, 질문, 거짓말, 추측, 사진·편지의 발신자는 그 자체로 혈연이나 정체성 확정 근거가 아니다.",
     "- '우리/저희/내/제'는 기본적으로 소유·복수 표현이다. 사용자가 '이름은 우리'처럼 명시적으로 이름을 정한 경우가 아니면 인명으로 해석하지 않는다.",
     "- 이미 명시된 이름은 이후의 모호한 호칭, 오타, 대사 속 자칭만으로 바꾸지 않는다. 변경은 사용자의 명시적 설정 변경·정정만 인정한다.",
@@ -512,15 +619,10 @@ export function formatIdentityCanonBlock(canon: IdentityCanon) {
     }
   }
   if (canon.roleAnchors.length) {
-    rows.push("[구조화 가족관계]");
+    rows.push("[구조화 인물관계]");
     for (const anchor of canon.roleAnchors) {
-      if (anchor.relatedName) {
-        rows.push(`- ${anchor.subjectName} → ${anchor.relation} → ${anchor.relatedName}`);
-      } else {
-        rows.push(
-          `- ${anchor.subjectName} → ${anchor.relation} → 이름 미상 역할 인물. 다른 이름 있는 인물과 임의 동일시 금지.`
-        );
-      }
+      if (!anchor.relatedName) continue;
+      rows.push(`- ${anchor.subjectName} → ${anchor.relation} → ${anchor.relatedName}`);
     }
   }
   return rows.join("\n");

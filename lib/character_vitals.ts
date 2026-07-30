@@ -332,9 +332,8 @@ function deriveVitalStates(params: {
       activeFrom: params.chatCreatedAt,
     });
     const relatedName = cleanText(relation.relatedName, 80);
-    const relatedKey = relatedName
-      ? personKey(relatedName, personaName)
-      : `role:${subjectKey}:${relation.relation}:${relation.slotKey || "default"}`.toLowerCase();
+    if (!relatedName) continue;
+    const relatedKey = personKey(relatedName, personaName);
     put({
       key: relatedKey,
       name: relatedName,
@@ -507,7 +506,7 @@ export function loadCharacterGraphNodes(chatIdRaw: string) {
                 COALESCE(r.profile, '') AS profile
          FROM chat_character_vitals v
          LEFT JOIN chat_character_roster r ON r.chatId=v.chatId AND r.id=v.rosterId
-         WHERE v.chatId=?
+         WHERE v.chatId=? AND TRIM(v.personName) <> ''
          ORDER BY CASE WHEN v.personKey='persona' THEN 0 ELSE 1 END,
                   v.personName ASC, v.nodeRole ASC`
       )
@@ -518,7 +517,7 @@ export function loadCharacterGraphNodes(chatIdRaw: string) {
     return {
       id: String(row.id || ""),
       key,
-      name: name || "이름 미상",
+      name,
       rosterId: String(row.rosterId || ""),
       age: validAge(row.age),
       ageSource: String(row.ageSource || ""),

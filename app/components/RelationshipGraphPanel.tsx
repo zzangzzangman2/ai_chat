@@ -131,6 +131,15 @@ function shortLabel(value: string, fallback: string) {
   return normalized.length > 13 ? `${normalized.slice(0, 12)}…` : normalized;
 }
 
+const symmetricRelationshipTypes = new Set([
+  "배우자", "연인", "친구", "절친", "소꿉친구", "같은 반 친구",
+  "동급생", "같은 학교", "동료", "동맹", "라이벌", "원수", "이웃", "지인",
+]);
+
+function visiblePersonName(value: unknown) {
+  return String(value || "").trim().replace(/^이름\s*미상$/u, "");
+}
+
 function CenteredRelationshipGraph({
   nodes,
   relations,
@@ -164,33 +173,108 @@ function CenteredRelationshipGraph({
         updatedAt: 0,
       } satisfies GraphNode);
     const outer = nodes
-      .filter((node) => node.key !== persona.key)
+      .filter(
+        (node) =>
+          node.key !== persona.key &&
+          !node.isUnknown &&
+          Boolean(visiblePersonName(node.name))
+      )
       .slice(0, 28);
-    const rowsPerSide = Math.max(1, Math.ceil(outer.length / 2));
-    const rowGap = 96;
-    const height = Math.max(620, rowsPerSide * rowGap + 150);
-    const center = { x: 500, y: height / 2 };
-    const positions = new Map<string, { x: number; y: number }>();
-    positions.set(persona.key, center);
-    outer.forEach((node, index) => {
-      const rightSide = index % 2 === 1;
-      const row = Math.floor(index / 2);
-      const sideRows = rightSide ? Math.floor(outer.length / 2) : Math.ceil(outer.length / 2);
-      const top = (height - Math.max(0, sideRows - 1) * rowGap) / 2;
-      positions.set(node.key, {
-        x: rightSide ? 820 : 180,
-        y: top + row * rowGap,
-      });
-    });
+    const outerKeys = new Set(outer.map((node) => node.key));
+    const adjacency = new Map<string, Set<string>>(
+      outer.map((node) => [node.key, new Set<string>()])
+    );
+    for (const relation of relations) {
+      if (
+        !visiblePersonName(relation.objectName) ||
+        !outerKeys.has(relation.subjectKey) ||
+        !outerKeys.has(relation.objectKey)
+      ) {
+        continue;
+      }
+      adjacency.get(relation.subjectKey)?.add(relation.objectKey);
+      adjacency.get(relation.objectKey)?.add(relation.subjectKey);
+    }
 
     const nodeByKey = new Map(nodes.map((node) => [node.key, node]));
     nodeByKey.set(persona.key, persona);
+    const unvisited = new Set(outer.map((node) => node.key));
+    const components: GraphNode[][] = [];
+    while (unvisited.size) {
+      const start = unvisited.values().next().value as string;
+      const stack = [start];
+      const keys: string[] = [];
+      unvisited.delete(start);
+      while (stack.length) {
+        const key = stack.pop() as string;
+        keys.push(key);
+        for (const adjacent of adjacency.get(key) || []) {
+          if (!unvisited.has(adjacent)) continue;
+          unvisited.delete(adjacent);
+          stack.push(adjacent);
+        }
+      }
+      components.push(
+        keys
+          .map((key) => nodeByKey.get(key))
+          .filter(Boolean)
+          .sort((a, b) => {
+            const degree = (adjacency.get(b!.key)?.size || 0) - (adjacency.get(a!.key)?.size || 0);
+            return degree || a!.name.localeCompare(b!.name, "ko");
+          }) as GraphNode[]
+      );
+    }
+    components.sort(
+      (a, b) =>
+        b.length - a.length ||
+        String(a[0]?.name || "").localeCompare(String(b[0]?.name || ""), "ko")
+    );
+
+    const leftNodes: GraphNode[] = [];
+    const rightNodes: GraphNode[] = [];
+    for (const component of components) {
+      const target = leftNodes.length <= rightNodes.length ? leftNodes : rightNodes;
+      target.push(...component);
+    }
+    const rowGap = 126;
+    const height = Math.max(640, Math.max(leftNodes.length, rightNodes.length, 1) * rowGap + 150);
+    const center = { x: 500, y: height / 2 };
+    const positions = new Map<string, { x: number; y: number }>();
+    positions.set(persona.key, center);
+    const placeColumn = (column: GraphNode[], x: number) => {
+      const top = (height - Math.max(0, column.length - 1) * rowGap) / 2;
+      column.forEach((node, row) => {
+        positions.set(node.key, { x, y: top + row * rowGap });
+      });
+    };
+    placeColumn(leftNodes, 165);
+    placeColumn(rightNodes, 835);
+
+    const relationSummariesByKey = new Map<string, string[]>();
+    const addSummary = (key: string, value: string) => {
+      if (!key || !value) return;
+      const items = relationSummariesByKey.get(key) || [];
+      if (!items.includes(value)) items.push(value);
+      relationSummariesByKey.set(key, items);
+    };
+    for (const relation of relations) {
+      if (!visiblePersonName(relation.objectName)) continue;
+      if (symmetricRelationshipTypes.has(relation.relation)) {
+        addSummary(relation.subjectKey, `${relation.objectName} · ${relation.relation}`);
+        addSummary(relation.objectKey, `${relation.subjectName} · ${relation.relation}`);
+      } else {
+        addSummary(relation.subjectKey, `${relation.relation} · ${relation.objectName}`);
+        addSummary(relation.objectKey, `${relation.subjectName}의 ${relation.relation}`);
+      }
+    }
+
     const affinityByRoster = new Map(
       affinities.map((affinity) => [affinity.rosterId, affinity])
     );
     const actual = relations
       .filter(
         (relation) =>
+          Boolean(visiblePersonName(relation.objectName)) &&
           positions.has(relation.subjectKey) &&
           positions.has(relation.objectKey)
       )
@@ -198,7 +282,9 @@ function CenteredRelationshipGraph({
         id: relation.id,
         from: relation.subjectKey,
         to: relation.objectKey,
-        label: relation.relation,
+        relation: relation.relation,
+        fromName: relation.subjectName,
+        toName: relation.objectName,
         actual: true,
       }));
     const directlyConnected = new Set<string>();
@@ -207,23 +293,34 @@ function CenteredRelationshipGraph({
       if (edge.to === persona.key) directlyConnected.add(edge.from);
     }
     const virtual = outer
-      .filter((node) => node.rosterId && !directlyConnected.has(node.key))
+      .filter((node) => {
+        if (!node.rosterId || directlyConnected.has(node.key)) return false;
+        const affinity = affinityByRoster.get(node.rosterId);
+        return Boolean(
+          affinity &&
+          (affinity.lastTurnNo > 0 || affinity.relationshipLabel !== "관계 미정")
+        );
+      })
       .map((node) => {
         const affinity = affinityByRoster.get(node.rosterId);
         return {
           id: `persona-link-${node.key}`,
           from: persona.key,
           to: node.key,
-          label: shortLabel(affinity?.relationshipLabel || "", "관계 미정"),
+          relation: affinity?.relationshipLabel || "아는 사이",
+          fromName: persona.name,
+          toName: node.name,
           actual: false,
         };
       });
+
     return {
       persona,
       outer,
       positions,
       nodeByKey,
       affinityByRoster,
+      relationSummariesByKey,
       edges: [...virtual, ...actual],
       center,
       height,
@@ -296,54 +393,49 @@ function CenteredRelationshipGraph({
           </filter>
         </defs>
 
-        {graph.edges.map((edge) => {
+        {graph.edges.map((edge, edgeIndex) => {
           const from = graph.positions.get(edge.from);
           const to = graph.positions.get(edge.to);
           if (!from || !to) return null;
-          const points = linePoints(
-            from,
-            to,
-            edge.from === "persona" ? 104 : 88,
-            edge.to === "persona" ? 104 : 88
-          );
-          const labelRatio = edge.actual
-            ? 0.5
-            : edge.from === "persona" ? 0.68 : edge.to === "persona" ? 0.32 : 0.5;
-          const midX = points.x1 + (points.x2 - points.x1) * labelRatio;
-          const midY = points.y1 + (points.y2 - points.y1) * labelRatio;
-          const labelWidth = Math.max(48, Math.min(150, edge.label.length * 12 + 24));
+          const fromPersona = edge.from === graph.persona.key;
+          const toPersona = edge.to === graph.persona.key;
+          const sameOuterColumn =
+            edge.actual &&
+            !fromPersona &&
+            !toPersona &&
+            (from.x < graph.center.x) === (to.x < graph.center.x);
+          let path = "";
+          if (sameOuterColumn) {
+            const leftSide = from.x < graph.center.x;
+            const exit = leftSide ? -112 : 112;
+            const laneX = leftSide
+              ? 28 + (edgeIndex % 3) * 10
+              : 972 - (edgeIndex % 3) * 10;
+            path = `M ${from.x + exit} ${from.y} C ${laneX} ${from.y}, ${laneX} ${to.y}, ${to.x + exit} ${to.y}`;
+          } else {
+            const points = linePoints(
+              from,
+              to,
+              fromPersona || toPersona ? 122 : 112,
+              fromPersona || toPersona ? 122 : 112
+            );
+            path = `M ${points.x1} ${points.y1} L ${points.x2} ${points.y2}`;
+          }
           return (
-            <g key={edge.id}>
-              <line
-                {...points}
-                stroke={edge.actual ? "#f472b6" : "#818cf8"}
-                strokeWidth={edge.actual ? 2.4 : 1.7}
-                strokeDasharray={edge.actual ? undefined : "7 7"}
-                opacity={edge.actual ? 0.88 : 0.5}
-                markerEnd={`url(#${edge.actual ? "relationship-arrow-actual" : "relationship-arrow-soft"})`}
-              />
-              <g transform={`translate(${midX}, ${midY})`}>
-                <rect
-                  x={-labelWidth / 2}
-                  y={-13}
-                  width={labelWidth}
-                  height={26}
-                  rx={13}
-                  fill={edge.actual ? "rgba(131,24,67,0.92)" : "rgba(49,46,129,0.90)"}
-                  stroke={edge.actual ? "rgba(244,114,182,0.72)" : "rgba(129,140,248,0.58)"}
-                />
-                <text
-                  x="0"
-                  y="4"
-                  textAnchor="middle"
-                  fill={edge.actual ? "#fce7f3" : "#e0e7ff"}
-                  fontSize="12"
-                  fontWeight="800"
-                >
-                  {edge.label}
-                </text>
-              </g>
-            </g>
+            <path
+              key={edge.id}
+              d={path}
+              fill="none"
+              stroke={edge.actual ? "#f472b6" : "#818cf8"}
+              strokeWidth={edge.actual ? 2.5 : 1.5}
+              strokeDasharray={edge.actual ? undefined : "8 8"}
+              opacity={edge.actual ? 0.86 : 0.34}
+              markerEnd={`url(#${edge.actual ? "relationship-arrow-actual" : "relationship-arrow-soft"})`}
+            >
+              <title>
+                {edge.fromName} {edge.actual ? "→" : "↔"} {edge.toName}: {edge.relation}
+              </title>
+            </path>
           );
         })}
 
@@ -354,15 +446,21 @@ function CenteredRelationshipGraph({
           const affinity = node.rosterId
             ? graph.affinityByRoster.get(node.rosterId)
             : undefined;
-          const nodeWidth = persona ? 188 : 158;
-          const nodeHeight = persona ? 54 : 46;
+          const nodeWidth = persona ? 232 : 216;
+          const nodeHeight = persona ? 82 : 90;
           const color = persona
             ? "#67e8f9"
-            : node.isUnknown
-              ? "#94a3b8"
-              : affinityColor(affinity?.score ?? 50);
+            : affinityColor(affinity?.score ?? 50);
           const clickable = Boolean(node.rosterId);
           const active = clickable && selected?.rosterId === node.rosterId;
+          const relationItems = graph.relationSummariesByKey.get(node.key) || [];
+          const relationSummary = persona
+            ? "페르소나 중심"
+            : relationItems.length
+              ? `${relationItems[0]}${relationItems.length > 1 ? ` 외 ${relationItems.length - 1}` : ""}`
+              : affinity?.relationshipLabel && affinity.relationshipLabel !== "관계 미정"
+                ? affinity.relationshipLabel
+                : "관계 정보 없음";
           return (
             <g
               key={node.key}
@@ -401,41 +499,50 @@ function CenteredRelationshipGraph({
                 fill={
                   persona
                     ? "rgba(8,91,115,0.94)"
-                    : node.isUnknown
-                      ? "rgba(51,65,85,0.80)"
-                      : "rgba(15,23,42,0.95)"
+                    : "rgba(15,23,42,0.95)"
                 }
                 stroke={color}
                 strokeWidth={persona ? 2.5 : 1.8}
-                strokeDasharray={node.isUnknown ? "6 4" : undefined}
                 filter={persona ? "url(#relationship-node-glow)" : undefined}
               />
               <text
                 x="0"
-                y="5"
+                y={persona ? -9 : -20}
                 textAnchor="middle"
                 fill="#fff"
                 fontSize={persona ? "18" : "15"}
                 fontWeight="950"
               >
-                {node.isUnknown ? "이름 미상" : node.name}
+                {node.name}
               </text>
               <text
                 x="0"
-                y={nodeHeight / 2 + 19}
+                y={persona ? 13 : 3}
+                textAnchor="middle"
+                fill={persona ? "#a5f3fc" : "#cbd5e1"}
+                fontSize="11"
+                fontWeight="800"
+              >
+                {shortLabel(relationSummary, "관계 정보 없음")}
+              </text>
+              <line
+                x1={-nodeWidth / 2 + 18}
+                x2={nodeWidth / 2 - 18}
+                y1={persona ? 24 : 17}
+                y2={persona ? 24 : 17}
+                stroke="rgba(148,163,184,0.22)"
+              />
+              <text
+                x="0"
+                y={persona ? 38 : 36}
                 textAnchor="middle"
                 fill="#94a3b8"
                 fontSize="11"
-                fontWeight="700"
+                fontWeight="800"
               >
-                {node.age ? `${node.age}세` : "나이 미상"}
-                {affinity ? ` · ♥ ${clampScore(affinity.score)}` : ""}
+                {node.age ? `${node.age}세` : "나이 정보 없음"}
+                {!persona && affinity ? `  ·  ♥ ${clampScore(affinity.score)}` : ""}
               </text>
-              {persona ? (
-                <text x="0" y={-nodeHeight / 2 - 15} textAnchor="middle" fill="#67e8f9" fontSize="12" fontWeight="900">
-                  페르소나 중심
-                </text>
-              ) : null}
             </g>
           );
         })}
@@ -449,7 +556,6 @@ function PersonNode({
   sub,
   rosterId,
   persona,
-  unknown,
   selected,
   theme,
   onSelect,
@@ -458,7 +564,6 @@ function PersonNode({
   sub?: string;
   rosterId?: string;
   persona?: boolean;
-  unknown?: boolean;
   selected?: boolean;
   theme: Theme;
   onSelect: (person: SelectedPerson) => void;
@@ -471,7 +576,7 @@ function PersonNode({
       onClick={() => {
         if (clickable) onSelect({ name, rosterId: String(rosterId) });
       }}
-      title={clickable ? `${name}의 개별 장기기억 보기` : unknown ? "이름이 밝혀지면 같은 노드에 연결됩니다." : ""}
+      title={clickable ? `${name}의 개별 장기기억 보기` : ""}
       style={{
         width: "100%",
         minHeight: 82,
@@ -481,16 +586,12 @@ function PersonNode({
           ? "1px solid rgba(244,114,182,0.95)"
           : persona
             ? "1px solid rgba(129,140,248,0.72)"
-            : unknown
-              ? `1px dashed ${theme.borderSoft}`
-              : `1px solid ${theme.borderSoft}`,
+            : `1px solid ${theme.borderSoft}`,
         background: selected
           ? "linear-gradient(145deg, rgba(236,72,153,0.22), rgba(79,70,229,0.15))"
           : persona
             ? "linear-gradient(145deg, rgba(79,70,229,0.24), rgba(129,140,248,0.10))"
-            : unknown
-              ? "rgba(148,163,184,0.07)"
-              : theme.panel2,
+            : theme.panel2,
         color: theme.text,
         cursor: clickable ? "pointer" : "default",
         textAlign: "left",
@@ -698,7 +799,7 @@ export default function RelationshipGraphPanel({
               <span style={{ fontSize: 18, fontWeight: 950 }}>자동 관계도</span>
             </div>
             <div style={{ marginTop: 6, color: theme.muted, fontSize: 12, lineHeight: 1.5 }}>
-              이름 미상 역할도 먼저 저장하고, 실명이 밝혀지면 같은 노드에 자동 연결합니다.
+              가족·친구·학교·직장 등 구조적 관계와 감정·호감도를 분리해 자동 정리합니다.
             </div>
           </div>
           <button
@@ -768,8 +869,9 @@ export default function RelationshipGraphPanel({
 
       <div style={{ display: "grid", gap: 11 }}>
         {relations.length ? (
-          relations.map((relation) => {
-            const objectName = relation.objectName || "이름 미상";
+          relations.filter((relation) => visiblePersonName(relation.objectName)).map((relation) => {
+            const objectName = visiblePersonName(relation.objectName);
+            if (!objectName) return null;
             return (
               <div
                 key={relation.id}
@@ -814,9 +916,8 @@ export default function RelationshipGraphPanel({
                 </div>
                 <PersonNode
                   name={objectName}
-                  sub={relation.objectName ? relation.objectRole : `${relation.objectRole} · 실명 대기`}
+                  sub={relation.objectRole}
                   rosterId={relation.objectRosterId}
-                  unknown={!relation.objectName}
                   selected={selected?.rosterId === relation.objectRosterId && Boolean(relation.objectRosterId)}
                   theme={theme}
                   onSelect={selectPerson}
@@ -835,7 +936,7 @@ export default function RelationshipGraphPanel({
               fontSize: 13,
             }}
           >
-            아직 확정된 관계가 없습니다. 대화에서 “누구의 아버지/딸”처럼 관계가 나오면 자동으로 추가됩니다.
+            아직 이름이 확인된 구조적 관계가 없습니다. 가족·친구·학교·직장 관계가 명확해지면 자동으로 추가됩니다.
           </div>
         ) : null}
       </div>
