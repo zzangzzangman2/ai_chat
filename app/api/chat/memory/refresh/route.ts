@@ -391,7 +391,16 @@ async function detectCharactersFromWindow(params: {
         // gemini-3-flash-preview는 reasoning 토큰을 따로 소비하므로
         // 작은 cap을 주면 reasoning이 다 먹어버려 text가 빈 채로 MAX_TOKENS로 잘린다.
         // 추출 출력은 짧지만 reasoning 헤드룸을 충분히 확보해 둔다.
-        maxOutputTokens: 2048,
+        //
+        // (2026-07-30 실측, 현재 모델 gemini-3.6-flash 기준) 아래 thinkingBudget /
+        // maxReasoningTokens=128은 강제되지 않는다. buildThinkingConfig가 3.6-flash에서
+        // 128(<1024)을 thinkingLevel="medium"으로 매핑하고(3.6의 최저 지원 레벨),
+        // medium이 reasoning 2576~2581 토큰을 쓴다.
+        // thinking과 가시출력이 한 예산을 공유하므로 cap 2048(+medium 헤드룸≈640)에서는
+        // 848콜 중 13콜이 outputTokens≈105로 잘려 JSON이 중간에 끊겼고,
+        // extractJson이 null을 반환해 추출 결과가 조용히 버려졌다.
+        // medium reasoning(≈2.6k)과 실제 출력이 모두 들어가도록 헤드룸을 늘린다.
+        maxOutputTokens: 4096,
         maxReasoningTokens: 128,
         thinkingBudget: 128,
         temperature: 0.1,

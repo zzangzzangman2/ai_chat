@@ -50,3 +50,8 @@ next-env.d.ts
 /.dos-server-child-pid
 /.codex-next-dev.*.log
 /.dos-next.*.log
+
+# ad-hoc pre-patch backups (safe to delete once the fix is verified)
+/.*-backup-*/
+*.bak-*
+/.tmp_slow.js

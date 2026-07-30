@@ -661,6 +661,15 @@ function printWrapped(text, options = {}) {
   if (!s.endsWith("\n")) process.stdout.write("\n");
 }
 
+function stripPlainNarrationSpeakerPrefix(line) {
+  const raw = String(line || "");
+  const match = raw.match(/^(\s*)[^|:\n]{1,80}\s*\|\s*(\S[\s\S]*)$/);
+  if (!match) return raw;
+  const rhs = String(match[2] || "").trimStart();
+  if (/^["'“‘「『]/.test(rhs)) return raw;
+  return `${match[1] || ""}${rhs}`;
+}
+
 function colorNovelText(text, options = {}) {
   const src = String(text || "");
   if (!src) return "";
@@ -734,28 +743,29 @@ function colorNovelText(text, options = {}) {
         narrState.inNarration = false;
       }
       inMetaBlock = false;
-      const emphasizedDialogue = unwrapEmphasizedDialogueLine(line);
+      const bodyLine = stripPlainNarrationSpeakerPrefix(line);
+      const emphasizedDialogue = unwrapEmphasizedDialogueLine(bodyLine);
       if (emphasizedDialogue) {
         narrState.inNarration = false;
         return `${ANSI.dialogue}${emphasizedDialogue}${ANSI.reset}`;
       }
-      if (narrState.inNarration && looksLikeDialogueLine(line)) {
+      if (narrState.inNarration && looksLikeDialogueLine(bodyLine)) {
         narrState.inNarration = false;
       }
-      if (!narrState.inNarration && looksLikeDialogueLine(line) && !line.includes("*")) {
-        return `${ANSI.dialogue}${line}${ANSI.reset}`;
+      if (!narrState.inNarration && looksLikeDialogueLine(bodyLine) && !bodyLine.includes("*")) {
+        return `${ANSI.dialogue}${bodyLine}${ANSI.reset}`;
       }
-      if (defaultPlainNarration && !narrState.inNarration && !line.includes("*") && shouldDefaultToNarration(line)) {
-        return `${ANSI.narration}${line}${ANSI.reset}`;
+      if (defaultPlainNarration && !narrState.inNarration && !bodyLine.includes("*") && shouldDefaultToNarration(bodyLine)) {
+        return colorNovelInline(bodyLine, narrState, true);
       }
-      return colorNovelInline(line, narrState);
+      return colorNovelInline(bodyLine, narrState, false);
     })
     .join("\n");
   if (externalState) externalState.inMetaBlock = inMetaBlock;
   return renderedLines;
 }
 
-function colorNovelInline(text, state) {
+function colorNovelInline(text, state, defaultNarration = false) {
   const src = String(text || "");
   if (!src) return "";
   let out = "";
@@ -766,7 +776,7 @@ function colorNovelInline(text, state) {
   const quotePairs = { '"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』" };
   const flush = () => {
     if (!buf) return;
-    out += (inDialogue ? ANSI.dialogue : inNarration ? ANSI.narration : ANSI.soft) + buf + ANSI.reset;
+    out += (inDialogue ? ANSI.dialogue : inNarration || defaultNarration ? ANSI.narration : ANSI.soft) + buf + ANSI.reset;
     buf = "";
   };
   for (let i = 0; i < src.length; i += 1) {
