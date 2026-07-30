@@ -15,6 +15,7 @@ import {
   setManualRelationship,
   syncIdentityCanonRelations,
 } from "@/lib/relationship_graph";
+import { refreshRelationshipGraphIfDue } from "@/lib/relationship_graph_refresh";
 import { isInvalidRelationshipLabel } from "@/lib/relationship_context";
 
 export const runtime = "nodejs";
@@ -142,7 +143,6 @@ export async function POST(req: Request) {
     if (!access.ok) return access.res;
 
     const messages = loadMessages(chatId);
-    const roster = loadRoster(chatId);
     const settings = db
       .prepare(`SELECT personaName, personaAge FROM chat_settings WHERE chatId=?`)
       .get(chatId) as any;
@@ -155,6 +155,12 @@ export async function POST(req: Request) {
         `UPDATE chat_settings SET personaName=?, updatedAt=? WHERE chatId=?`
       ).run(personaName, Date.now(), chatId);
     }
+    const relationshipGraphRefresh = await refreshRelationshipGraphIfDue({
+      chatId,
+      personaName,
+      messages,
+    });
+    const roster = loadRoster(chatId);
     const canon = deriveIdentityCanon({
       messages,
       knownNames: roster.map((row) => String(row?.name || "")),
@@ -178,6 +184,7 @@ export async function POST(req: Request) {
       ok: true,
       chatId,
       synced,
+      relationshipGraphRefresh,
       ...graphResponse(chatId, canon.personaName),
     });
   } catch (error: any) {

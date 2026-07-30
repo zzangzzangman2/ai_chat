@@ -17,6 +17,7 @@ import {
   resetCharacterAffinitiesForTurn,
   updateCharacterAffinity,
 } from "@/lib/relationship_graph";
+import { refreshRelationshipGraphIfDue } from "@/lib/relationship_graph_refresh";
 import {
   inferCriticalCoreMemoryType,
   isCoreMemoryCandidate,
@@ -298,6 +299,12 @@ export async function POST(req: Request) {
       : inferPersonaNameFromMessages(all);
     const personaName = configuredPersonaName || inferredPersonaName || "나";
 
+    const relationshipGraphRefresh = await refreshRelationshipGraphIfDue({
+      chatId,
+      personaName,
+      messages: all,
+    });
+
     const rosterAll = db
       .prepare(
         `SELECT id, name, aliases, role, profile, relationshipNote, emotionNote, status
@@ -326,7 +333,15 @@ export async function POST(req: Request) {
       (row) => !characterNames(row).some((name) => name.toLowerCase() === personaKey)
     );
 
-    if (!roster.length) return NextResponse.json({ ok: true, skipped: true, reason: "no_registered_characters", turnNo });
+    if (!roster.length) {
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: "no_registered_characters",
+        turnNo,
+        relationshipGraphRefresh,
+      });
+    }
 
     const prevUser = userBeforeAssistant(all, assistantId);
     const sceneText = [
