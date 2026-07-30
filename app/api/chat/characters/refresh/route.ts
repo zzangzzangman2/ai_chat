@@ -17,6 +17,13 @@ import {
   resetCharacterAffinitiesForTurn,
   updateCharacterAffinity,
 } from "@/lib/relationship_graph";
+import {
+  isCoreMemoryCandidate,
+  isNearDuplicateMemory,
+  isSaturatedMemoryTheme,
+  normalizeCoreMemoryType,
+  selectCoreMemoryRows,
+} from "@/lib/character_memory_quality";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
 type MsgRow = {
@@ -328,14 +335,63 @@ export async function POST(req: Request) {
       .filter(Boolean)
       .join("\n\n");
 
+    const priorMemoryRows = (
+      db
+        .prepare(
+          `WITH ranked AS (
+             SELECT rosterId, turnNo, summary, evidence,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY rosterId
+                      ORDER BY turnNo DESC, updatedAt DESC
+                    ) AS recentRank
+             FROM chat_character_turn_memories
+             WHERE chatId=? AND turnNo<?
+           )
+           SELECT rosterId, turnNo, summary, evidence
+           FROM ranked
+           WHERE recentRank<=12
+           ORDER BY rosterId ASC, turnNo ASC`
+        )
+        .all(chatId, turnNo) as Array<{
+          rosterId?: unknown;
+          turnNo?: unknown;
+          summary?: unknown;
+          evidence?: unknown;
+        }>
+    ).map((memory) => ({
+      rosterId: String(memory?.rosterId || ""),
+      turnNo: Number(memory?.turnNo || 0),
+      summary: decryptIfPossible(String(memory?.summary || "")),
+      evidence: decryptIfPossible(String(memory?.evidence || "")),
+    }));
+    const recentMemoriesByRoster = new Map<string, typeof priorMemoryRows>();
+    for (const memory of priorMemoryRows) {
+      const rows = recentMemoriesByRoster.get(memory.rosterId) || [];
+      rows.push(memory);
+      recentMemoriesByRoster.set(memory.rosterId, rows);
+    }
+    const coreContextByRoster = new Map<string, typeof priorMemoryRows>();
+    for (const memory of selectCoreMemoryRows(priorMemoryRows, 3)) {
+      const rows = coreContextByRoster.get(memory.rosterId) || [];
+      rows.push(memory);
+      coreContextByRoster.set(memory.rosterId, rows);
+    }
+
     const characterList = roster
       .map((r: any, i: number) => {
+        const existingCoreMemories = (coreContextByRoster.get(String(r.id || "")) || [])
+          .slice(-3)
+          .map((memory) => ({
+            turn: memory.turnNo,
+            summary: cleanText(memory.summary, 140),
+          }));
         const fields = [
           `id: ${String(r.id)}`,
           `name: ${String(r.name || "")}`,
           `aliases: ${decryptIfPossible(String(r.aliases || ""))}`,
           `role: ${decryptIfPossible(String(r.role || ""))}`,
           `profile: ${decryptIfPossible(String(r.profile || "")).slice(0, 400)}`,
+          `existing_core_memories: ${JSON.stringify(existingCoreMemories)}`,
         ];
         return `${i + 1}. ${fields.join(" | ")}`;
       })
@@ -344,6 +400,12 @@ export async function POST(req: Request) {
     const system = [
       "You update a Korean novel-chat character encounter ledger.",
       "Registered characters are memory targets, but a name mention, presence, action, or reaction alone is not a saved encounter.",
+      "This ledger is durable long-term memory, not a transcript of every direct conversation.",
+      "A direct conversation can have present=true while shouldRemember=false.",
+      "Set shouldRemember=true only for a new durable identity fact, relationship/title change, promise/secret/debt, major event with lasting consequence, persistent status change, or important unresolved issue.",
+      "Routine questions, greetings, compliments, jokes, ordinary actions, and repeated anger/fear/insults/pleas/refusals must have shouldRemember=false.",
+      "Compare with existing_core_memories. If the new turn merely repeats an already stored fact, event, emotional stance, threat, or conflict, set shouldRemember=false.",
+      "For a continuing major incident, save the first meaningful onset and a later material outcome only, not every intermediate reaction.",
       "Save a character only when the persona and that character directly exchange dialogue in this exact turn.",
       "The ledger is chronological. Each saved item describes only the current turn and must not mix events from other turns.",
       "Every registered character is an isolated memory owner. Never copy a relationship, title, promise, emotion, or dialogue style from another character.",
@@ -374,22 +436,30 @@ export async function POST(req: Request) {
       "Task:",
       `- Decide which registered characters directly conversed with ${personaName} in this turn.`,
       `- Save ONLY characters who exchanged dialogue with ${personaName}: ${personaName} addressed them and/or they replied to ${personaName}.`,
+      "- For every directly conversing character, set present=true and independently decide shouldRemember.",
       "- DO NOT save a character if they are only mentioned, remembered, compared, planned to meet, referred to in rumor/history, named while absent, merely present, acting, reacting, or described without direct dialogue.",
       "- If ambiguous, omit the character.",
-      "- For saved characters, summarize THIS TURN ONLY and focus on the direct dialogue exchange with the user/player.",
+      "- shouldRemember=true only when this turn adds information that must still matter tens or hundreds of turns later.",
+      "- Valid memoryType values: identity, relationship, commitment, major_event, status_change, unresolved, none.",
+      "- importance: 0=no memory, 1=minor/temporary, 2=durable and useful, 3=critical continuity fact.",
+      "- Only importance 2 or 3 may have shouldRemember=true. Use memoryType=none and importance 0 for ordinary or repeated exchanges.",
+      "- A new name/age/family/job, marriage/breakup/friendship/enmity change, explicit promise/secret, arrest/injury/move, or an unresolved consequential decision can be remembered.",
+      "- Repeated insults, fear, anger, pleas, rejection, questioning, staring, crying, or the next step of the same ongoing confrontation are not new long-term memories.",
+      "- If shouldRemember=true, summarize THIS TURN ONLY and state the new durable fact or consequence rather than decorative actions.",
+      "- If shouldRemember=false, summary may be an empty string; still provide evidence and affinity fields for the direct exchange.",
       `- In summary/evidence, write the persona as "${personaName}". Do not write 사용자, 주인공, or 플레이어.`,
-      `- Prioritize: what ${personaName} did to or with the character, what the character said/did back, emotional residue toward ${personaName}, relationship change, unresolved tension.`,
+      `- Prioritize durable relationship change, newly revealed identity, commitment, consequence, current status, or unresolved tension involving ${personaName}.`,
       "- Keep each character's relationship and titles local to that character's JSON item; never borrow them from another registered character.",
       "- A latest persona correction outranks contradictory wording in the assistant response.",
       buildRelationshipCorrectionGuidance(sceneText),
       "- affinityDelta means the saved character's feeling toward the persona after this exact exchange: -3 major decrease, -2 decrease, -1 slight decrease, 0 unchanged, +1 slight increase, +2 increase, +3 major increase.",
       "- affinityReason must be a short Korean phrase grounded only in this turn's direct exchange.",
       "- Include the turn's order implicitly by writing it as a result of this exact turn; do not imply a later turn happened before an earlier turn.",
-      "- The summary must be exactly ONE Korean casual banmal sentence, no second sentence, and should naturally end in banmal such as ~했어/~있어/~보였어.",
+      "- When shouldRemember=true, summary must be exactly ONE Korean casual banmal sentence, no second sentence, and should naturally end in banmal such as ~했어/~있어/~보였어.",
       "- Avoid formal endings like 합니다/했습니다/습니다 and avoid detached report endings like 함/했다 when possible.",
       "",
       "Return JSON array:",
-      `[{"id":"registered id","present":true,"summary":"${personaName}와 나눈 대화를 담은 한국어 반말 한 문장","evidence":"short Korean evidence from this turn","affinityDelta":0,"affinityReason":"이 턴에서 호감도가 변한 직접 근거"}]`,
+      `[{"id":"registered id","present":true,"shouldRemember":true,"memoryType":"relationship","importance":2,"summary":"새로 생긴 핵심 관계 변화나 지속 사실을 담은 한국어 반말 한 문장","evidence":"short Korean evidence from this turn","affinityDelta":0,"affinityReason":"이 턴에서 호감도가 변한 직접 근거"}]`,
       "No markdown. No extra text.",
     ].join("\n");
 
@@ -413,6 +483,7 @@ export async function POST(req: Request) {
     const rosterById = new Map(roster.map((row: any) => [String(row.id || ""), row]));
     const now = Date.now();
     let saved = 0;
+    let evaluated = 0;
     const savedItems: any[] = [];
 
     // (최적화) DELETE + INSERT 루프를 단일 트랜잭션으로 묶어 fsync per row 회피.
@@ -437,20 +508,8 @@ export async function POST(req: Request) {
         if (item?.present !== true) continue;
         if (!prevUser || !isDirectPersonaCharacterConversation(row, prevUser.content, assistant.content)) continue;
 
-        const summary = oneSentenceSummary(item?.summary, personaName);
-        if (!summary) continue;
-        const relationshipDrift = analyzeRelationshipCorrectionDrift(sceneText, summary);
-        if (!relationshipDrift.ok) continue;
-        const identityDrift = analyzeIdentityCanonDrift({
-          sourceText: sceneText,
-          summary,
-          canon: identityCanon.canon,
-        });
-        if (!identityDrift.ok) continue;
         const evidence = cleanText(replaceGenericPersonaRefs(item?.evidence, personaName), 500);
         const name = String(row?.name || "").trim();
-
-        insertStmt.run(chatId, id, name, turnNo, encryptIfPossible(summary), encryptIfPossible(evidence), now, now);
         const affinity = updateCharacterAffinity({
           chatId,
           rosterId: id,
@@ -461,13 +520,72 @@ export async function POST(req: Request) {
           reason: cleanText(item?.affinityReason, 500),
           evidence,
         });
+        evaluated += 1;
+
+        if (item?.shouldRemember !== true) continue;
+        const summary = oneSentenceSummary(item?.summary, personaName);
+        const memoryType = normalizeCoreMemoryType(item?.memoryType);
+        if (!summary) continue;
+        if (
+          !isCoreMemoryCandidate({
+            memoryType,
+            importance: item?.importance,
+            summary,
+            evidence,
+          })
+        ) {
+          continue;
+        }
+        const recentRows = recentMemoriesByRoster.get(id) || [];
+        const recentMemoryTexts = recentRows.map(
+          (memory) => `${memory.summary} ${memory.evidence}`
+        );
+        if (
+          memoryType === "major_event" &&
+          isSaturatedMemoryTheme(
+            `${summary} ${evidence}`,
+            recentMemoryTexts,
+            2
+          )
+        ) {
+          continue;
+        }
+        if (
+          isNearDuplicateMemory(
+            summary,
+            recentRows.map((memory) => memory.summary)
+          )
+        ) {
+          continue;
+        }
+        const relationshipDrift = analyzeRelationshipCorrectionDrift(sceneText, summary);
+        if (!relationshipDrift.ok) continue;
+        const identityDrift = analyzeIdentityCanonDrift({
+          sourceText: sceneText,
+          summary,
+          canon: identityCanon.canon,
+        });
+        if (!identityDrift.ok) continue;
+
+        insertStmt.run(chatId, id, name, turnNo, encryptIfPossible(summary), encryptIfPossible(evidence), now, now);
+        recentRows.push({ rosterId: id, turnNo, summary, evidence });
+        recentMemoriesByRoster.set(id, recentRows);
         saved += 1;
-        savedItems.push({ id, name, turnNo, summary, evidence, affinity });
+        savedItems.push({
+          id,
+          name,
+          turnNo,
+          summary,
+          evidence,
+          memoryType,
+          importance: Number(item?.importance || 0),
+          affinity,
+        });
       }
     });
     writeAll(items);
 
-    return NextResponse.json({ ok: true, turnNo, saved, items: savedItems });
+    return NextResponse.json({ ok: true, turnNo, evaluated, saved, items: savedItems });
   } catch (e: any) {
     console.error("/api/chat/characters/refresh error", e);
     return bad(e?.message || "character_refresh_failed", 500);

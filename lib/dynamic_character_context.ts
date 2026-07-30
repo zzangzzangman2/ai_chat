@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import { decryptIfPossible } from "@/lib/crypto";
 import { findFocusedCharacterIds } from "@/lib/relationship_memory";
 import type { RelationshipGraphData } from "@/lib/relationship_graph";
+import { selectCoreMemoryRows } from "@/lib/character_memory_quality";
 
 type RosterRow = {
   id: string;
@@ -327,7 +328,7 @@ export function buildDynamicCharacterContext(params: {
   }));
 
   const focusedRosterIds = focusedRows.map((row) => row.id);
-  const memories =
+  const memoryCandidates =
     focusedRosterIds.length > 0
       ? (db
           .prepare(
@@ -348,11 +349,20 @@ export function buildDynamicCharacterContext(params: {
              )
              SELECT rosterId, turnNo, summary, evidence
              FROM ranked
-             WHERE firstRank=1 OR recentRank<=10
+             WHERE firstRank=1 OR recentRank<=14
              ORDER BY turnNo ASC`
           )
           .all(chatId, ...focusedRosterIds) as StoredTurnMemoryRow[])
       : [];
+  const memories = selectCoreMemoryRows(
+    memoryCandidates.map((memory) => ({
+      rosterId: cleanText(memory?.rosterId, 120),
+      turnNo: Math.max(0, Number(memory?.turnNo || 0)),
+      summary: decryptIfPossible(String(memory?.summary || "")),
+      evidence: decryptIfPossible(String(memory?.evidence || "")),
+    })),
+    4
+  );
   const eventSeen = new Set<string>();
   const majorEvents = memories
     .map((memory) => {
