@@ -29,6 +29,8 @@ export type RelationshipGraphRelation = {
   firstSeenTurn: number;
   lastSeenTurn: number;
   updatedAt: number;
+  source: "manual" | "structured" | "identity" | "contextual";
+  isManual: boolean;
 };
 
 export type CharacterAffinity = {
@@ -63,7 +65,7 @@ function cleanText(value: unknown, max = 400) {
     .slice(0, max);
 }
 
-function stableNameKey(name: string, personaName: string) {
+export function stableRelationshipNameKey(name: string, personaName: string) {
   const value = cleanText(name, 80);
   if (value && value.toLowerCase() === cleanText(personaName, 80).toLowerCase()) {
     return "persona";
@@ -130,6 +132,15 @@ const STRUCTURAL_RELATIONSHIP_RULES: Array<[label: string, pattern: RegExp]> = [
   ["지인", /지인/u],
 ];
 
+const LATEST_RELATIONSHIP_TRANSITIONS: Array<[label: string, pattern: RegExp]> = [
+  ["이혼한 전 배우자", /(?:이혼했|이혼한|이혼을\s*했|혼인\s*관계.{0,12}(?:끝|종료))/u],
+  ["헤어진 전 연인", /(?:헤어졌|결별했|연인\s*관계.{0,12}(?:끝|종료))/u],
+  ["배우자", /(?:결혼했|결혼식을|혼인했|부부가\s*되|아내가\s*되|남편이\s*되|배우자가\s*되)/u],
+  ["연인", /(?:사귀기\s*시작|연인이\s*되|연애를\s*시작|교제하기\s*시작)/u],
+  ["친구", /(?:친구가\s*되|친구로\s*지내기로)/u],
+  ["원수", /(?:원수가\s*되|철천지원수가\s*되)/u],
+];
+
 function cleanRelationshipSource(value: unknown) {
   return decryptIfPossible(String(value || ""))
     .replace(/\s+/g, " ")
@@ -149,6 +160,17 @@ export function narrativeRelationshipLabel(params: {
   reason?: unknown;
   evidence?: unknown;
 }) {
+  const latestSource = [
+    params.recentMemory,
+    params.reason,
+    params.evidence,
+  ]
+    .map(cleanRelationshipSource)
+    .filter(Boolean)
+    .join(" ");
+  for (const [label, pattern] of LATEST_RELATIONSHIP_TRANSITIONS) {
+    if (latestSource && pattern.test(latestSource)) return label;
+  }
   const structuralSource = [
     params.relationshipNote,
     params.role,
@@ -191,8 +213,8 @@ export function syncIdentityCanonRelations(params: {
       const relatedName = cleanText(anchor.relatedName, 80);
       const slotKey = cleanText(anchor.slotKey || "default", 80) || "default";
       if (!subjectName || !relation || !relatedName) return null;
-      const subjectKey = stableNameKey(subjectName, personaName);
-      const objectKey = stableNameKey(relatedName, personaName);
+      const subjectKey = stableRelationshipNameKey(subjectName, personaName);
+      const objectKey = stableRelationshipNameKey(relatedName, personaName);
       return {
         id: randomUUID(),
         chatId,
@@ -281,7 +303,12 @@ export function syncIdentityCanonRelations(params: {
       const key = `${String(row.subjectKey || "")}\u0000${String(row.relation || "")}\u0000${String(
         row.slotKey || ""
       )}`;
-      if (String(row.slotKey || "").startsWith("structured:")) continue;
+      if (
+        String(row.slotKey || "").startsWith("structured:") ||
+        String(row.slotKey || "").startsWith("manual:")
+      ) {
+        continue;
+      }
       if (!currentKeys.has(key)) {
         deleteStmt.run(String(row.id || ""), chatId);
       }
@@ -289,6 +316,154 @@ export function syncIdentityCanonRelations(params: {
   });
   write();
   return rows.length;
+}
+
+function storedRelationshipSource(slotKeyRaw: unknown) {
+  const slotKey = String(slotKeyRaw || "");
+  if (slotKey.startsWith("manual:")) return "manual" as const;
+  if (slotKey.startsWith("structured:")) return "structured" as const;
+  return "identity" as const;
+}
+
+function unorderedRelationshipPairKey(subjectKeyRaw: unknown, objectKeyRaw: unknown) {
+  return [String(subjectKeyRaw || ""), String(objectKeyRaw || "")]
+    .sort((a, b) => a.localeCompare(b, "ko"))
+    .join("\u0000");
+}
+
+const RELATIONSHIP_EVOLUTION_PRIORITY: Record<string, number> = {
+  배우자: 120,
+  부부: 120,
+  "이혼한 전 배우자": 118,
+  연인: 115,
+  "헤어진 전 연인": 112,
+  아버지: 108,
+  어머니: 108,
+  부모: 108,
+  딸: 108,
+  아들: 108,
+  자녀: 108,
+  손녀: 108,
+  손자: 108,
+  형제자매: 105,
+  원수: 102,
+  가해자: 101,
+  피해자: 101,
+  절친: 98,
+  소꿉친구: 96,
+  친구: 94,
+  동료: 90,
+  지인: 80,
+};
+
+function selectCurrentStoredRelationships(rows: RelationshipGraphRelation[]) {
+  const selected = new Map<string, RelationshipGraphRelation>();
+  for (const row of rows) {
+    const pairKey = unorderedRelationshipPairKey(row.subjectKey, row.objectKey);
+    const previous = selected.get(pairKey);
+    if (!previous) {
+      selected.set(pairKey, row);
+      continue;
+    }
+    const rowManual = Number(row.isManual);
+    const previousManual = Number(previous.isManual);
+    const rowPriority = RELATIONSHIP_EVOLUTION_PRIORITY[row.relation] || 0;
+    const previousPriority = RELATIONSHIP_EVOLUTION_PRIORITY[previous.relation] || 0;
+    const rowSort = [
+      rowManual,
+      Math.max(0, Number(row.lastSeenTurn || 0)),
+      rowPriority,
+      Math.max(0, Number(row.updatedAt || 0)),
+    ];
+    const previousSort = [
+      previousManual,
+      Math.max(0, Number(previous.lastSeenTurn || 0)),
+      previousPriority,
+      Math.max(0, Number(previous.updatedAt || 0)),
+    ];
+    const shouldReplace = rowSort.some(
+      (value, index) =>
+        value !== previousSort[index] &&
+        value > previousSort[index] &&
+        rowSort.slice(0, index).every((item, priorIndex) => item === previousSort[priorIndex])
+    );
+    if (shouldReplace) selected.set(pairKey, row);
+  }
+  return [...selected.values()];
+}
+
+export function setManualRelationship(params: {
+  chatId: string;
+  personaName: string;
+  subjectName: string;
+  objectName: string;
+  relation: string;
+  details?: string;
+  turnNo?: number;
+}) {
+  const chatId = cleanText(params.chatId, 120);
+  const personaName = cleanText(params.personaName, 80);
+  const subjectName = cleanText(params.subjectName, 80);
+  const objectName = cleanText(params.objectName, 80);
+  const relation = cleanText(params.relation, 40);
+  const details = cleanText(params.details, 500);
+  const subjectKey = stableRelationshipNameKey(subjectName, personaName);
+  const objectKey = stableRelationshipNameKey(objectName, personaName);
+  if (!chatId || !subjectName || !objectName || !relation || subjectKey === objectKey) {
+    throw new Error("invalid_manual_relationship");
+  }
+  if (isInvalidRelationshipLabel(relation)) throw new Error("invalid_relationship_label");
+  const now = Date.now();
+  const turnNo = Math.max(0, Math.trunc(Number(params.turnNo || 0)));
+  const write = db.transaction(() => {
+    db.prepare(
+      `DELETE FROM chat_character_relations
+       WHERE chatId=? AND slotKey LIKE 'manual:%'
+         AND ((subjectKey=? AND objectKey=?) OR (subjectKey=? AND objectKey=?))`
+    ).run(chatId, subjectKey, objectKey, objectKey, subjectKey);
+    db.prepare(
+      `INSERT INTO chat_character_relations
+         (id, chatId, subjectKey, subjectName, relation, slotKey, objectKey,
+          objectName, objectRole, sourceOrder, firstSeenTurn, lastSeenTurn,
+          createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      randomUUID(),
+      chatId,
+      subjectKey,
+      subjectName,
+      relation,
+      cleanText(`manual:${objectKey}`, 80),
+      objectKey,
+      objectName,
+      details || "사용자가 직접 지정한 현재 관계",
+      turnNo,
+      turnNo,
+      turnNo,
+      now,
+      now
+    );
+  });
+  write();
+}
+
+export function clearManualRelationship(params: {
+  chatId: string;
+  personaName: string;
+  subjectName: string;
+  objectName: string;
+}) {
+  const chatId = cleanText(params.chatId, 120);
+  const subjectKey = stableRelationshipNameKey(params.subjectName, params.personaName);
+  const objectKey = stableRelationshipNameKey(params.objectName, params.personaName);
+  if (!chatId || !subjectKey || !objectKey || subjectKey === objectKey) return 0;
+  return Number(
+    db.prepare(
+      `DELETE FROM chat_character_relations
+       WHERE chatId=? AND slotKey LIKE 'manual:%'
+         AND ((subjectKey=? AND objectKey=?) OR (subjectKey=? AND objectKey=?))`
+    ).run(chatId, subjectKey, objectKey, objectKey, subjectKey).changes || 0
+  );
 }
 
 export function ensureCharacterAffinityRows(params: {
@@ -510,6 +685,8 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     firstSeenTurn: Number(row?.firstSeenTurn || 0),
     lastSeenTurn: Number(row?.lastSeenTurn || 0),
     updatedAt: Number(row?.updatedAt || 0),
+    source: storedRelationshipSource(row?.slotKey),
+    isManual: String(row?.slotKey || "").startsWith("manual:"),
   }));
 
   const affinities = (
@@ -588,7 +765,7 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     relations.find((row) => row.subjectKey === "persona")?.subjectName ||
     settingsPersonaName;
   const normalizedPersona = cleanText(personaName, 80).toLocaleLowerCase("ko-KR");
-  const normalizedRelations = relations.map((row) => {
+  const normalizedRelations = selectCurrentStoredRelationships(relations.map((row) => {
     const subjectIsPersona =
       Boolean(normalizedPersona) &&
       cleanText(row.subjectName, 80).toLocaleLowerCase("ko-KR") === normalizedPersona;
@@ -602,12 +779,33 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
       objectKey: objectIsPersona ? "persona" : row.objectKey,
       objectRosterId: objectIsPersona ? "" : row.objectRosterId,
     };
-  }).filter((row) => !isInvalidRelationshipLabel(row.relation));
-  const normalizedAffinities = affinities.filter(
-    (row) =>
-      !normalizedPersona ||
-      cleanText(row.characterName, 80).toLocaleLowerCase("ko-KR") !== normalizedPersona
-  );
+  }).filter((row) => !isInvalidRelationshipLabel(row.relation)));
+  const personaRelationByName = new Map<string, string>();
+  for (const relation of normalizedRelations) {
+    if (relation.subjectKey === "persona") {
+      personaRelationByName.set(
+        cleanText(relation.objectName, 80).toLocaleLowerCase("ko-KR"),
+        relation.relation
+      );
+    } else if (relation.objectKey === "persona") {
+      personaRelationByName.set(
+        cleanText(relation.subjectName, 80).toLocaleLowerCase("ko-KR"),
+        relation.relation
+      );
+    }
+  }
+  const normalizedAffinities = affinities
+    .filter(
+      (row) =>
+        !normalizedPersona ||
+        cleanText(row.characterName, 80).toLocaleLowerCase("ko-KR") !== normalizedPersona
+    )
+    .map((row) => ({
+      ...row,
+      relationshipLabel:
+        personaRelationByName.get(cleanText(row.characterName, 80).toLocaleLowerCase("ko-KR")) ||
+        row.relationshipLabel,
+    }));
   const nodes = rawNodes.filter(
     (node) =>
       !node.isUnknown &&
@@ -672,6 +870,8 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         firstSeenTurn: 0,
         lastSeenTurn: Math.max(0, Number(affinity?.lastTurnNo || 0)),
         updatedAt: Math.max(Number(node.updatedAt || 0), Number(affinity?.updatedAt || 0)),
+        source: "contextual" as const,
+        isManual: false,
       };
     });
   return {
@@ -683,7 +883,7 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
 }
 
 const SYMMETRIC_RELATIONS = new Set([
-  "배우자", "연인", "친구", "절친", "소꿉친구", "같은 반 친구",
+  "배우자", "부부", "연인", "친구", "절친", "소꿉친구", "같은 반 친구",
   "동급생", "같은 학교", "동료", "동맹", "라이벌", "원수", "이웃", "지인",
 ]);
 

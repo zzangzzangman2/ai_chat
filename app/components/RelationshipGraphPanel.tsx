@@ -26,6 +26,8 @@ type Relation = {
   objectRole: string;
   firstSeenTurn: number;
   lastSeenTurn: number;
+  source: "manual" | "structured" | "identity" | "contextual";
+  isManual: boolean;
 };
 
 type Affinity = {
@@ -101,6 +103,17 @@ type MemoryState = {
   error: string;
 };
 
+type RelationEditorState = {
+  open: boolean;
+  subjectName: string;
+  objectName: string;
+  relation: string;
+  details: string;
+  isManual: boolean;
+  saving: boolean;
+  error: string;
+};
+
 const emptyMemoryState: MemoryState = {
   character: null,
   memories: [],
@@ -110,6 +123,442 @@ const emptyMemoryState: MemoryState = {
   loading: false,
   error: "",
 };
+
+const emptyRelationEditor: RelationEditorState = {
+  open: false,
+  subjectName: "",
+  objectName: "",
+  relation: "",
+  details: "",
+  isManual: false,
+  saving: false,
+  error: "",
+};
+
+const COMMON_RELATIONSHIPS = [
+  "부부",
+  "배우자",
+  "연인",
+  "가족",
+  "아버지",
+  "어머니",
+  "딸",
+  "아들",
+  "손녀",
+  "손자",
+  "형제자매",
+  "친구",
+  "절친",
+  "소꿉친구",
+  "같은 반 친구",
+  "동료",
+  "상사",
+  "부하 직원",
+  "스승",
+  "제자",
+  "보호자",
+  "이웃",
+  "라이벌",
+  "원수",
+  "가해자",
+  "피해자",
+  "지인",
+];
+
+function RelationshipEditorModal({
+  theme,
+  state,
+  people,
+  onChange,
+  onSubjectChange,
+  onObjectChange,
+  onClose,
+  onSave,
+  onResetAutomatic,
+}: {
+  theme: Theme;
+  state: RelationEditorState;
+  people: Array<{ name: string; job: string; isPersona: boolean }>;
+  onChange: (patch: Partial<RelationEditorState>) => void;
+  onSubjectChange: (name: string) => void;
+  onObjectChange: (name: string) => void;
+  onClose: () => void;
+  onSave: () => void;
+  onResetAutomatic: () => void;
+}) {
+  if (!state.open) return null;
+  const selectStyle = {
+    width: "100%",
+    height: 42,
+    borderRadius: 12,
+    border: `1px solid ${theme.borderSoft}`,
+    background: theme.panel2,
+    color: theme.text,
+    padding: "0 11px",
+    outline: "none",
+    fontWeight: 850,
+  } as const;
+
+  return (
+    <div
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.currentTarget === event.target && !state.saving) onClose();
+      }}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 1400,
+        display: "grid",
+        placeItems: "center",
+        padding: 16,
+        background: "rgba(2,6,23,0.76)",
+        backdropFilter: "blur(8px)",
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="인물 관계 변경"
+        style={{
+          width: "min(620px, calc(100vw - 32px))",
+          maxHeight: "min(760px, calc(100vh - 32px))",
+          overflowY: "auto",
+          borderRadius: 24,
+          border: "1px solid rgba(129,140,248,0.38)",
+          background:
+            "radial-gradient(circle at 10% 0%, rgba(99,102,241,0.22), transparent 32%), rgba(15,23,42,0.98)",
+          color: theme.text,
+          boxShadow: "0 32px 90px rgba(0,0,0,0.56)",
+        }}
+      >
+        <div
+          style={{
+            position: "sticky",
+            top: 0,
+            zIndex: 2,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: 12,
+            padding: "17px 18px 14px",
+            borderBottom: `1px solid ${theme.borderSoft}`,
+            background: "rgba(15,23,42,0.95)",
+            backdropFilter: "blur(12px)",
+          }}
+        >
+          <div style={{ display: "flex", gap: 11, minWidth: 0 }}>
+            <div
+              style={{
+                width: 38,
+                height: 38,
+                flex: "0 0 auto",
+                display: "grid",
+                placeItems: "center",
+                borderRadius: 13,
+                background: "linear-gradient(145deg, rgba(99,102,241,0.35), rgba(236,72,153,0.28))",
+                border: "1px solid rgba(165,180,252,0.34)",
+              }}
+            >
+              ↔
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 17, fontWeight: 950 }}>관계 변경</div>
+              <div style={{ marginTop: 4, color: theme.muted, fontSize: 11.5, lineHeight: 1.45 }}>
+                수동 설정은 자동 추론보다 우선합니다. 언제든 자동 갱신으로 되돌릴 수 있어요.
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={state.saving}
+            aria-label="닫기"
+            style={{
+              width: 34,
+              height: 34,
+              flex: "0 0 auto",
+              borderRadius: 11,
+              border: `1px solid ${theme.borderSoft}`,
+              background: theme.panel2,
+              color: theme.text,
+              cursor: state.saving ? "default" : "pointer",
+              fontSize: 18,
+              outline: "none",
+            }}
+          >
+            ×
+          </button>
+        </div>
+
+        <div style={{ padding: 18 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "minmax(0, 1fr) 34px minmax(0, 1fr)",
+              alignItems: "end",
+              gap: 8,
+            }}
+          >
+            <label style={{ minWidth: 0 }}>
+              <span style={{ display: "block", marginBottom: 7, color: "#c7d2fe", fontSize: 11, fontWeight: 950 }}>
+                인물 1
+              </span>
+              <select
+                value={state.subjectName}
+                onChange={(event) => onSubjectChange(event.target.value)}
+                disabled={state.saving}
+                style={selectStyle}
+              >
+                {people.map((person) => (
+                  <option key={`subject-${person.name}`} value={person.name}>
+                    {person.name}{person.job ? ` · ${person.job}` : person.isPersona ? " · 주인공" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div
+              aria-hidden
+              style={{
+                height: 42,
+                display: "grid",
+                placeItems: "center",
+                color: "#a5b4fc",
+                fontSize: 18,
+                fontWeight: 950,
+              }}
+            >
+              ↔
+            </div>
+            <label style={{ minWidth: 0 }}>
+              <span style={{ display: "block", marginBottom: 7, color: "#c7d2fe", fontSize: 11, fontWeight: 950 }}>
+                인물 2
+              </span>
+              <select
+                value={state.objectName}
+                onChange={(event) => onObjectChange(event.target.value)}
+                disabled={state.saving}
+                style={selectStyle}
+              >
+                {people.map((person) => (
+                  <option key={`object-${person.name}`} value={person.name}>
+                    {person.name}{person.job ? ` · ${person.job}` : person.isPersona ? " · 주인공" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              marginTop: 14,
+              padding: "10px 12px",
+              borderRadius: 14,
+              border: `1px solid ${state.isManual ? "rgba(244,114,182,0.36)" : "rgba(34,211,238,0.28)"}`,
+              background: state.isManual ? "rgba(236,72,153,0.09)" : "rgba(34,211,238,0.07)",
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 950 }}>
+                {state.isManual ? "직접 설정된 관계" : "대화에서 자동 추론된 관계"}
+              </div>
+              <div style={{ marginTop: 3, color: theme.muted, fontSize: 10.5 }}>
+                {state.isManual ? "AI가 임의로 덮어쓰지 않습니다." : "대화가 진행되면 연인·부부·원수 등으로 바뀔 수 있습니다."}
+              </div>
+            </div>
+            <span
+              style={{
+                flex: "0 0 auto",
+                padding: "4px 8px",
+                borderRadius: 999,
+                background: state.isManual ? "rgba(244,114,182,0.18)" : "rgba(34,211,238,0.15)",
+                color: state.isManual ? "#fbcfe8" : "#a5f3fc",
+                fontSize: 10,
+                fontWeight: 950,
+              }}
+            >
+              {state.isManual ? "수동 우선" : "자동 갱신"}
+            </span>
+          </div>
+
+          <div style={{ marginTop: 17 }}>
+            <div style={{ color: "#c7d2fe", fontSize: 11, fontWeight: 950 }}>빠른 선택</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginTop: 9 }}>
+              {COMMON_RELATIONSHIPS.map((relation) => {
+                const active = state.relation === relation;
+                return (
+                  <button
+                    key={relation}
+                    type="button"
+                    onClick={() => onChange({ relation, error: "" })}
+                    disabled={state.saving}
+                    style={{
+                      height: 30,
+                      padding: "0 10px",
+                      borderRadius: 999,
+                      border: active
+                        ? "1px solid rgba(244,114,182,0.82)"
+                        : `1px solid ${theme.borderSoft}`,
+                      background: active ? "rgba(236,72,153,0.18)" : "rgba(255,255,255,0.025)",
+                      color: active ? "#fbcfe8" : theme.text,
+                      cursor: state.saving ? "default" : "pointer",
+                      fontSize: 11,
+                      fontWeight: 900,
+                      outline: "none",
+                    }}
+                  >
+                    {relation}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <label style={{ display: "block", marginTop: 17 }}>
+            <span style={{ display: "block", marginBottom: 7, color: "#c7d2fe", fontSize: 11, fontWeight: 950 }}>
+              관계명
+            </span>
+            <input
+              value={state.relation}
+              onChange={(event) => onChange({ relation: event.target.value, error: "" })}
+              placeholder="예: 부부, 같은 반 친구, 계약 관계"
+              maxLength={40}
+              disabled={state.saving}
+              style={{
+                ...selectStyle,
+                fontWeight: 800,
+              }}
+            />
+          </label>
+
+          <label style={{ display: "block", marginTop: 14 }}>
+            <span style={{ display: "block", marginBottom: 7, color: "#c7d2fe", fontSize: 11, fontWeight: 950 }}>
+              관계 세부사항 <span style={{ color: theme.muted, fontWeight: 700 }}>(선택)</span>
+            </span>
+            <textarea
+              value={state.details}
+              onChange={(event) => onChange({ details: event.target.value, error: "" })}
+              placeholder="예: 오랜 연애 끝에 결혼했고 서로를 배우자로 대함"
+              maxLength={500}
+              disabled={state.saving}
+              style={{
+                width: "100%",
+                minHeight: 78,
+                resize: "vertical",
+                borderRadius: 13,
+                border: `1px solid ${theme.borderSoft}`,
+                background: theme.panel2,
+                color: theme.text,
+                padding: "10px 11px",
+                outline: "none",
+                lineHeight: 1.5,
+                boxSizing: "border-box",
+              }}
+            />
+          </label>
+
+          {state.error ? (
+            <div
+              style={{
+                marginTop: 12,
+                padding: "9px 11px",
+                borderRadius: 12,
+                background: "rgba(239,68,68,0.11)",
+                border: "1px solid rgba(248,113,113,0.28)",
+                color: "#fecaca",
+                fontSize: 11.5,
+              }}
+            >
+              {state.error}
+            </div>
+          ) : null}
+        </div>
+
+        <div
+          style={{
+            position: "sticky",
+            bottom: 0,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 10,
+            flexWrap: "wrap",
+            padding: "13px 18px 16px",
+            borderTop: `1px solid ${theme.borderSoft}`,
+            background: "rgba(15,23,42,0.96)",
+            backdropFilter: "blur(12px)",
+          }}
+        >
+          <button
+            type="button"
+            onClick={onResetAutomatic}
+            disabled={!state.isManual || state.saving}
+            style={{
+              height: 38,
+              padding: "0 12px",
+              borderRadius: 12,
+              border: `1px solid ${theme.borderSoft}`,
+              background: "transparent",
+              color: state.isManual ? "#a5f3fc" : theme.muted,
+              cursor: state.isManual && !state.saving ? "pointer" : "default",
+              fontWeight: 900,
+              opacity: state.isManual ? 1 : 0.55,
+              outline: "none",
+            }}
+          >
+            자동 추론으로 전환
+          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={state.saving}
+              style={{
+                height: 38,
+                padding: "0 14px",
+                borderRadius: 12,
+                border: `1px solid ${theme.borderSoft}`,
+                background: theme.panel2,
+                color: theme.text,
+                cursor: state.saving ? "default" : "pointer",
+                fontWeight: 900,
+                outline: "none",
+              }}
+            >
+              취소
+            </button>
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={state.saving || !state.relation.trim() || state.subjectName === state.objectName}
+              style={{
+                height: 38,
+                padding: "0 17px",
+                borderRadius: 12,
+                border: "1px solid rgba(244,114,182,0.72)",
+                background: "linear-gradient(135deg, rgba(99,102,241,0.88), rgba(236,72,153,0.88))",
+                color: "#fff",
+                cursor:
+                  state.saving || !state.relation.trim() || state.subjectName === state.objectName
+                    ? "default"
+                    : "pointer",
+                fontWeight: 950,
+                opacity: state.saving || !state.relation.trim() || state.subjectName === state.objectName ? 0.58 : 1,
+                outline: "none",
+              }}
+            >
+              {state.saving ? "저장 중..." : "이 관계로 저장"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -138,7 +587,7 @@ function ellipsis(value: string, max: number) {
 
 // 서로 방향이 없는 관계. 화살촉을 붙이지 않고 선으로만 잇는다.
 const SYMMETRIC_RELATIONS = new Set([
-  "배우자", "연인", "친구", "절친", "소꿉친구", "같은 반 친구",
+  "부부", "배우자", "연인", "친구", "절친", "소꿉친구", "같은 반 친구",
   "동급생", "같은 학교", "동료", "동맹", "라이벌", "원수", "이웃", "지인",
   "형제자매", "자매", "형제",
 ]);
@@ -364,6 +813,7 @@ function RelationshipMap({
   selected,
   theme,
   onSelect,
+  onEditRelation,
 }: {
   nodes: GraphNode[];
   relations: Relation[];
@@ -371,6 +821,7 @@ function RelationshipMap({
   selected: SelectedPerson | null;
   theme: Theme;
   onSelect: (person: SelectedPerson) => void;
+  onEditRelation: (relation: Relation) => void;
 }) {
   const layout = useMemo(() => {
     const personaFallback: GraphNode = {
@@ -588,6 +1039,7 @@ function RelationshipMap({
         relation: relation.relation,
         symmetric:
           SYMMETRIC_RELATIONS.has(relation.relation) || isContextualSymmetricRelationship(relation.relation),
+        row: relation,
       }));
 
     return {
@@ -773,7 +1225,23 @@ function RelationshipMap({
           const labelX = (from.x + to.x) / 2;
           const labelY = (from.y + to.y) / 2;
           return (
-            <g key={edge.id}>
+            <g
+              key={edge.id}
+              role="button"
+              tabIndex={0}
+              aria-label={`${edge.fromName}와 ${edge.toName} 관계 ${edge.relation} 변경`}
+              onClick={() => onEditRelation(edge.row)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onEditRelation(edge.row);
+                }
+              }}
+              style={{
+                cursor: "pointer",
+                outline: "none",
+              }}
+            >
               <path
                 d={path}
                 fill="none"
@@ -784,6 +1252,7 @@ function RelationshipMap({
               >
                 <title>
                   {edge.fromName} {edge.symmetric ? "↔" : "→"} {edge.toName}: {edge.relation}
+                  {" · 클릭해서 관계 변경"}
                 </title>
               </path>
               <rect
@@ -889,6 +1358,8 @@ export default function RelationshipGraphPanel({
   const memoryPanelRef = useRef<HTMLDivElement | null>(null);
   const memoryRequestRef = useRef(0);
   const [memoryState, setMemoryState] = useState<MemoryState>(emptyMemoryState);
+  const [relationEditor, setRelationEditor] =
+    useState<RelationEditorState>(emptyRelationEditor);
 
   const loadGraph = useCallback(async () => {
     if (!chatId) return;
@@ -973,6 +1444,7 @@ export default function RelationshipGraphPanel({
 
   useEffect(() => {
     memoryRequestRef.current += 1;
+    setRelationEditor(emptyRelationEditor);
     setSelected(null);
     setMemoryState(emptyMemoryState);
     void loadGraph();
@@ -1020,8 +1492,177 @@ export default function RelationshipGraphPanel({
     [relations]
   );
 
+  const relationshipPeople = useMemo(() => {
+    const people = new Map<string, { name: string; job: string; isPersona: boolean }>();
+    for (const node of nodes) {
+      const name = visiblePersonName(node.name);
+      if (!name || node.isUnknown) continue;
+      people.set(name, {
+        name,
+        job: String(node.job || "").trim(),
+        isPersona: Boolean(node.isPersona || node.key === "persona"),
+      });
+    }
+    if (personaName && !people.has(personaName)) {
+      people.set(personaName, { name: personaName, job: "", isPersona: true });
+    }
+    return [...people.values()].sort(
+      (a, b) => Number(b.isPersona) - Number(a.isPersona) || a.name.localeCompare(b.name, "ko")
+    );
+  }, [nodes, personaName]);
+
+  const relationForPair = useCallback(
+    (subjectName: string, objectName: string) => {
+      const subject = String(subjectName || "").trim().toLocaleLowerCase("ko-KR");
+      const object = String(objectName || "").trim().toLocaleLowerCase("ko-KR");
+      if (!subject || !object) return null;
+      return (
+        relationList.find((relation) => {
+          const left = String(relation.subjectName || "").trim().toLocaleLowerCase("ko-KR");
+          const right = String(relation.objectName || "").trim().toLocaleLowerCase("ko-KR");
+          return (
+            (left === subject && right === object) ||
+            (left === object && right === subject)
+          );
+        }) || null
+      );
+    },
+    [relationList]
+  );
+
+  const openRelationEditor = useCallback(
+    (relation?: Relation | null) => {
+      const fallbackSubject =
+        relationshipPeople.find((person) => person.isPersona)?.name ||
+        relationshipPeople[0]?.name ||
+        "";
+      const fallbackObject =
+        relationshipPeople.find((person) => person.name !== fallbackSubject)?.name || "";
+      const current =
+        relation || relationForPair(fallbackSubject, fallbackObject);
+      setRelationEditor({
+        open: true,
+        subjectName: current?.subjectName || fallbackSubject,
+        objectName: visiblePersonName(current?.objectName) || fallbackObject,
+        relation: current?.relation || "",
+        details: current?.isManual ? String(current.objectRole || "") : "",
+        isManual: Boolean(current?.isManual),
+        saving: false,
+        error: "",
+      });
+    },
+    [relationshipPeople, relationForPair]
+  );
+
+  const changeEditorPair = useCallback(
+    (subjectName: string, objectName: string) => {
+      const current = relationForPair(subjectName, objectName);
+      setRelationEditor((previous) => ({
+        ...previous,
+        subjectName,
+        objectName,
+        relation: current?.relation || "",
+        details: current?.isManual ? String(current.objectRole || "") : "",
+        isManual: Boolean(current?.isManual),
+        error: "",
+      }));
+    },
+    [relationForPair]
+  );
+
+  const applyRelationshipResponse = useCallback((body: GraphResponse) => {
+    setPersonaName(String(body.personaName || ""));
+    setNodes(Array.isArray(body.nodes) ? body.nodes : []);
+    setRelations(Array.isArray(body.relations) ? body.relations : []);
+    setAffinities(Array.isArray(body.affinities) ? body.affinities : []);
+  }, []);
+
+  const saveRelationship = useCallback(async () => {
+    if (!chatId || relationEditor.saving) return;
+    if (
+      !relationEditor.subjectName ||
+      !relationEditor.objectName ||
+      relationEditor.subjectName === relationEditor.objectName
+    ) {
+      setRelationEditor((previous) => ({
+        ...previous,
+        error: "서로 다른 두 인물을 선택해 주세요.",
+      }));
+      return;
+    }
+    if (!relationEditor.relation.trim()) {
+      setRelationEditor((previous) => ({ ...previous, error: "관계명을 입력해 주세요." }));
+      return;
+    }
+    setRelationEditor((previous) => ({ ...previous, saving: true, error: "" }));
+    try {
+      const response = await fetch("/api/chat/relationships", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId,
+          subjectName: relationEditor.subjectName,
+          objectName: relationEditor.objectName,
+          relation: relationEditor.relation,
+          details: relationEditor.details,
+        }),
+      });
+      const body = (await response.json().catch(() => null)) as GraphResponse | null;
+      if (!response.ok || !body?.ok) throw new Error(body?.error || "관계를 저장하지 못했습니다.");
+      applyRelationshipResponse(body);
+      setRelationEditor(emptyRelationEditor);
+    } catch (cause: any) {
+      setRelationEditor((previous) => ({
+        ...previous,
+        saving: false,
+        error: String(cause?.message || "관계를 저장하지 못했습니다."),
+      }));
+    }
+  }, [applyRelationshipResponse, chatId, relationEditor]);
+
+  const resetRelationshipAutomatic = useCallback(async () => {
+    if (!chatId || relationEditor.saving || !relationEditor.isManual) return;
+    setRelationEditor((previous) => ({ ...previous, saving: true, error: "" }));
+    try {
+      const response = await fetch("/api/chat/relationships", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId,
+          subjectName: relationEditor.subjectName,
+          objectName: relationEditor.objectName,
+        }),
+      });
+      const body = (await response.json().catch(() => null)) as GraphResponse | null;
+      if (!response.ok || !body?.ok) throw new Error(body?.error || "자동 추론으로 전환하지 못했습니다.");
+      applyRelationshipResponse(body);
+      setRelationEditor(emptyRelationEditor);
+    } catch (cause: any) {
+      setRelationEditor((previous) => ({
+        ...previous,
+        saving: false,
+        error: String(cause?.message || "자동 추론으로 전환하지 못했습니다."),
+      }));
+    }
+  }, [applyRelationshipResponse, chatId, relationEditor]);
+
+  const manualRelationCount = relations.filter((relation) => relation.isManual).length;
+
   return (
     <div style={{ display: "grid", gap: 16, minWidth: 0 }}>
+      <RelationshipEditorModal
+        theme={theme}
+        state={relationEditor}
+        people={relationshipPeople}
+        onChange={(patch) => setRelationEditor((previous) => ({ ...previous, ...patch }))}
+        onSubjectChange={(name) => changeEditorPair(name, relationEditor.objectName)}
+        onObjectChange={(name) => changeEditorPair(relationEditor.subjectName, name)}
+        onClose={() => {
+          if (!relationEditor.saving) setRelationEditor(emptyRelationEditor);
+        }}
+        onSave={() => void saveRelationship()}
+        onResetAutomatic={() => void resetRelationshipAutomatic()}
+      />
       <div
         style={{
           border: `1px solid ${theme.borderSoft}`,
@@ -1031,37 +1672,70 @@ export default function RelationshipGraphPanel({
           boxShadow: "0 18px 45px rgba(0,0,0,0.18)",
         }}
       >
-        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
-          <div>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ flex: "1 1 360px", minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
               <span style={{ fontSize: 21 }}>🕸️</span>
-              <span style={{ fontSize: 18, fontWeight: 950 }}>자동 관계도</span>
+              <span style={{ fontSize: 18, fontWeight: 950 }}>인물 관계도</span>
             </div>
             <div style={{ marginTop: 6, color: theme.muted, fontSize: 12, lineHeight: 1.5 }}>
               주인공에서 가까운 인물이 위, 먼 인물이 아래입니다. 분홍 화살표는 방향이 있는
               관계, 보라 선은 서로 대등한 관계, <b>보라 점선 상자</b>는 같은 반·같은 학교
               묶음입니다. 같은 아이의 친부·친모는 같은 줄에 나란히 놓이지만, 부모라는 사실이
-              부부를 뜻하지는 않으므로 따로 묶지 않습니다.
+              부부를 뜻하지는 않으므로 따로 묶지 않습니다. 관계 라벨을 누르면 직접 변경할 수
+              있습니다.
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => void loadGraph()}
-            disabled={loading}
-            style={{
-              height: 34,
-              padding: "0 12px",
-              borderRadius: 12,
-              border: `1px solid ${theme.borderSoft}`,
-              background: theme.panel2,
-              color: theme.text,
-              cursor: loading ? "default" : "pointer",
-              fontWeight: 900,
-              opacity: loading ? 0.65 : 1,
-            }}
-          >
-            {loading ? "동기화 중" : "새로고침"}
-          </button>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <button
+              type="button"
+              onClick={() => openRelationEditor(relationList[0])}
+              disabled={relationshipPeople.length < 2}
+              style={{
+                height: 36,
+                padding: "0 13px",
+                borderRadius: 12,
+                border: "1px solid rgba(244,114,182,0.58)",
+                background: "linear-gradient(135deg, rgba(99,102,241,0.24), rgba(236,72,153,0.18))",
+                color: "#fce7f3",
+                cursor: relationshipPeople.length >= 2 ? "pointer" : "default",
+                fontWeight: 950,
+                opacity: relationshipPeople.length >= 2 ? 1 : 0.5,
+                outline: "none",
+                whiteSpace: "nowrap",
+              }}
+            >
+              관계 변경
+            </button>
+            <button
+              type="button"
+              onClick={() => void loadGraph()}
+              disabled={loading}
+              style={{
+                height: 36,
+                padding: "0 12px",
+                borderRadius: 12,
+                border: `1px solid ${theme.borderSoft}`,
+                background: theme.panel2,
+                color: theme.text,
+                cursor: loading ? "default" : "pointer",
+                fontWeight: 900,
+                opacity: loading ? 0.65 : 1,
+                outline: "none",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {loading ? "동기화 중" : "새로고침"}
+            </button>
+          </div>
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 13 }}>
@@ -1070,6 +1744,7 @@ export default function RelationshipGraphPanel({
             `인물 ${nodes.length}`,
             `관계 ${relationList.length}`,
             `호감도 평가 ${evaluatedAffinities}/${affinities.length}`,
+            ...(manualRelationCount > 0 ? [`직접 설정 ${manualRelationCount}`] : []),
           ].map((label) => (
             <span
               key={label}
@@ -1138,6 +1813,7 @@ export default function RelationshipGraphPanel({
         selected={selected}
         theme={theme}
         onSelect={selectPerson}
+        onEditRelation={openRelationEditor}
       />
 
       <div
@@ -1187,7 +1863,9 @@ export default function RelationshipGraphPanel({
                   >
                     {relation.subjectName}
                   </button>
-                  <span
+                  <button
+                    type="button"
+                    onClick={() => openRelationEditor(relation)}
                     style={{
                       padding: "3px 9px",
                       borderRadius: 999,
@@ -1199,10 +1877,29 @@ export default function RelationshipGraphPanel({
                       fontSize: 11,
                       fontWeight: 900,
                       whiteSpace: "nowrap",
+                      cursor: "pointer",
+                      outline: "none",
                     }}
+                    title="클릭해서 관계 변경"
                   >
                     {symmetric ? "↔" : "→"} {relation.relation}
-                  </span>
+                  </button>
+                  {relation.isManual ? (
+                    <span
+                      style={{
+                        padding: "2px 7px",
+                        borderRadius: 999,
+                        background: "rgba(34,197,94,0.14)",
+                        border: "1px solid rgba(74,222,128,0.32)",
+                        color: "#bbf7d0",
+                        fontSize: 10,
+                        fontWeight: 900,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      직접 설정
+                    </span>
+                  ) : null}
                   <button
                     type="button"
                     onClick={() => {
