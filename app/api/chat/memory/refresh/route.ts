@@ -236,6 +236,29 @@ function analyzeLongMemoryBody(body: string): BodyQuality {
   return { ok: true, reason: "ok", hangul, latin, latinRatio, badMarker };
 }
 
+// 신규 생성 결과에만 적용하는 엄격한 자기검토/메타 유출 검사다.
+// 기존 저장본 복구 판단(firstBadSectionRange)은 기존 검사기를 유지해,
+// 배포만으로 과거 채팅 내용을 재작성하지 않는다.
+const GENERATED_MEMORY_SELF_REVIEW_MARKER =
+  /(?:Wait\s*,?\s*check|Let['’]?s\s+check|Total\s+length|Target\s*[~:：]|Perfect!|Character\s*&\s*Constraint\s*Check|Detailed\s+Character|All\s+in\s+list|Alphabet\s*[:：]|Markdown\s*[:：]|Labels?\s*[:：]|\b\d+\s*(?:chars?|characters?)\b|시스템\s*지침|개발자\s*프롬프트|오버라이드|요구사항\s*(?:검토|확인)|글자\s*수\s*(?:검토|확인))/i;
+
+function analyzeGeneratedLongMemoryBody(body: string): BodyQuality {
+  const base = analyzeLongMemoryBody(body);
+  if (!base.ok) return base;
+
+  const text = String(body || "").replace(/\r\n/g, "\n").trim();
+  if (GENERATED_MEMORY_SELF_REVIEW_MARKER.test(text)) {
+    return {
+      ...base,
+      ok: false,
+      reason: "model_self_review",
+      badMarker: true,
+    };
+  }
+
+  return base;
+}
+
 type NameDriftQuality = {
   ok: boolean;
   reason: string;
@@ -843,8 +866,12 @@ export async function POST(req: Request) {
     const perTurnCharsVal = normalizePerTurnChars(body?.perTurnChars ?? st?.longMemoryPerTurnChars ?? 80);
     // 손상된 구간은 기본적으로 자동 복구한다. 명시적으로 false인 관리 요청만 건너뛴다.
     const repairCorrupted = body?.repairCorrupted !== false;
-    // 디버깅/검증용: 품질 필터 실패(bad_output)여도 강제로 저장.
-    const allowBadOutputSave = Boolean(body?.allowBadOutputSave);
+    // 불량 출력 강제 저장은 로컬 개발에서 환경변수까지 명시한 경우에만 허용한다.
+    // 브라우저/DOS 클라이언트가 실수로 true를 보내도 운영 DB에는 저장되지 않는다.
+    const allowBadOutputSave =
+      process.env.NODE_ENV !== "production" &&
+      String(process.env.AI_LONG_MEMORY_DEBUG_ALLOW_BAD_OUTPUT_SAVE || "").trim() === "1" &&
+      Boolean(body?.allowBadOutputSave);
 
     // load & decrypt all messages
     const rawAll = db
@@ -1197,7 +1224,7 @@ export async function POST(req: Request) {
     });
 
     let norm = normalizeSection(sectionRaw);
-    let q = analyzeLongMemoryBody(norm.body);
+    let q = analyzeGeneratedLongMemoryBody(norm.body);
     let ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
     let relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
     let identityDrift = analyzeIdentityCanonDrift({
@@ -1224,7 +1251,7 @@ export async function POST(req: Request) {
         opts: retryOpts,
       });
       norm = normalizeSection(sectionRaw);
-      q = analyzeLongMemoryBody(norm.body);
+      q = analyzeGeneratedLongMemoryBody(norm.body);
       ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
       relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
       identityDrift = analyzeIdentityCanonDrift({
@@ -1251,7 +1278,7 @@ export async function POST(req: Request) {
       const fallbackTitle = extractSectionTitle(sectionRaw) || "요약";
       sectionRaw = `### ${fallbackTitle} (${windowStartTurn}-${windowEndTurn}턴)\n${body}`;
       norm = normalizeSection(sectionRaw);
-      q = analyzeLongMemoryBody(norm.body);
+      q = analyzeGeneratedLongMemoryBody(norm.body);
       ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
       relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
       identityDrift = analyzeIdentityCanonDrift({
@@ -1284,7 +1311,7 @@ export async function POST(req: Request) {
             opts: rescueOpts,
           });
           norm = normalizeSection(sectionRaw);
-          q = analyzeLongMemoryBody(norm.body);
+          q = analyzeGeneratedLongMemoryBody(norm.body);
           ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
           relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
           identityDrift = analyzeIdentityCanonDrift({

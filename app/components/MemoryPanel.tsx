@@ -218,7 +218,7 @@ export default function MemoryPanel({ theme: THEME, chatId, embed, turnKey }: Pr
         const res = await fetch("/api/chat/memory/refresh", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chatId, perTurnChars: effectivePer, allowBadOutputSave: true }),
+          body: JSON.stringify({ chatId, perTurnChars: effectivePer, allowBadOutputSave: false }),
           signal: ac.signal,
         });
 

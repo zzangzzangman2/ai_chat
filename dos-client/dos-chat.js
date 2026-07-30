@@ -2605,7 +2605,7 @@ async function refreshMemory(mode = "all") {
   console.log("기억 갱신 중...");
   await apiJson("/api/chat/memory/refresh", {
     method: "POST",
-    body: JSON.stringify({ chatId: state.chatId, mode, allowBadOutputSave: true }),
+    body: JSON.stringify({ chatId: state.chatId, mode, allowBadOutputSave: false }),
   });
   console.log("기억 갱신 완료");
 }
@@ -2909,7 +2909,7 @@ const elapsed = Math.round((Date.now() - started) / 1000);
             chatId: chatIdSnapshot,
             runtime: runtimeSnapshot,
             mode: memoryRefresh.mode || "all",
-            allowBadOutputSave: true,
+            allowBadOutputSave: false,
           }),
         });
       } catch {
