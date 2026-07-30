@@ -168,6 +168,10 @@ export type ChatGenOpts = {
   temperature?: number;
   topP?: number;
   topK?: number;
+  // Optional structured-output controls for extraction calls.
+  responseMimeType?: "application/json" | "text/plain" | string;
+  responseJsonSchema?: unknown;
+
 
   // When the caller specifies a "requested" max output, we keep it separately for logging/analytics.
   // (Some Gemini models treat outputBudget as totalGenerated = reasoning + candidates.)
@@ -746,6 +750,8 @@ export async function generateText(params: {
       maxOutputTokens: effectiveMaxOutputTokens,
       ...(samplingConfig ? samplingConfig : {}),
       ...(stopSequences.length ? { stopSequences } : {}),
+      ...(opts.responseMimeType ? { responseMimeType: opts.responseMimeType } : {}),
+      ...(opts.responseJsonSchema ? { responseJsonSchema: opts.responseJsonSchema } : {}),
     },
   };
 

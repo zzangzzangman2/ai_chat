@@ -217,6 +217,12 @@ export function syncIdentityCanonRelations(params: {
        lastSeenTurn=MAX(chat_character_relations.lastSeenTurn, excluded.lastSeenTurn),
        updatedAt=excluded.updatedAt`
   );
+  const deleteStructuredDuplicate = db.prepare(
+    `DELETE FROM chat_character_relations
+     WHERE chatId=? AND subjectKey=? AND relation=? AND objectKey=?
+       AND slotKey LIKE 'structured:%'`
+  );
+
   const write = db.transaction(() => {
     const currentKeys = new Set(
       rows.map((row) => `${row.subjectKey}\u0000${row.relation}\u0000${row.slotKey}`)
@@ -226,6 +232,7 @@ export function syncIdentityCanonRelations(params: {
       .all(chatId) as Array<{ id: string; subjectKey: string; relation: string; slotKey: string }>;
     const deleteStmt = db.prepare(`DELETE FROM chat_character_relations WHERE id=? AND chatId=?`);
     for (const row of rows) {
+      deleteStructuredDuplicate.run(chatId, row.subjectKey, row.relation, row.objectKey);
       stmt.run(
         row.id,
         row.chatId,
@@ -247,6 +254,7 @@ export function syncIdentityCanonRelations(params: {
       const key = `${String(row.subjectKey || "")}\u0000${String(row.relation || "")}\u0000${String(
         row.slotKey || ""
       )}`;
+      if (String(row.slotKey || "").startsWith("structured:")) continue;
       if (!currentKeys.has(key)) {
         deleteStmt.run(String(row.id || ""), chatId);
       }
@@ -511,10 +519,15 @@ export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
   }
   for (const relation of graph.relations.slice(0, 60)) {
     if (!relation.objectName) continue;
+    const details = cleanText(relation.objectRole, 500);
+    const generatedRole = `${relation.subjectName}의 ${relation.relation}`;
+    const detailSuffix =
+      details && details !== generatedRole ? `; 세부: ${details}` : "";
+
     lines.push(
       SYMMETRIC_RELATIONS.has(relation.relation)
-        ? `- ${relation.subjectName} ↔ ${relation.objectName}: ${relation.relation}`
-        : `- ${relation.subjectName} → ${relation.relation} → ${relation.objectName}`
+        ? `- ${relation.subjectName} ↔ ${relation.objectName}: ${relation.relation}${detailSuffix}`
+        : `- ${relation.subjectName} → ${relation.relation} → ${relation.objectName}${detailSuffix}`
     );
   }
   for (const affinity of graph.affinities.slice(0, 40)) {

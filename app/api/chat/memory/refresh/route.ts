@@ -15,6 +15,11 @@ import {
   inferPersonaNameFromMessages,
 } from "@/lib/identity_memory";
 import { formatRelationshipGraphBlock, loadRelationshipGraph } from "@/lib/relationship_graph";
+import {
+  applyStructuredCharacterGraph,
+  extractStructuredCharacterGraph,
+  loadStructuredCharacterIdentities,
+} from "@/lib/structured_relationship_memory";
 
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
@@ -1185,6 +1190,8 @@ export async function POST(req: Request) {
     // - 수동 등록 캐릭터는 ON CONFLICT DO NOTHING 으로 절대 안 건드림.
     // - 탐지 실패는 무시(요약 저장 결과에 영향 X).
     let autoCharactersAdded: string[] = [];
+    let autoAliasesUpdated: string[] = [];
+    let autoRelationshipsUpserted = 0;
     try {
       const existingRosterRows = db
         .prepare(`SELECT name FROM chat_character_roster WHERE chatId=?`)
@@ -1193,19 +1200,46 @@ export async function POST(req: Request) {
         existingRosterRows.map((r) => String(r?.name || "").trim()).filter(Boolean)
       );
 
-      const detected = await detectCharactersFromWindow({
+      const structuredGraph = await extractStructuredCharacterGraph({
         rawWindowText: cleanedText,
         personaName,
-        existingNames,
+        existingCharacters: loadStructuredCharacterIdentities(chatId),
         llmOpts: {
           model: summaryModel,
-          maxOutputTokens: 600,
-          maxReasoningTokens: 0,
-          thinkingBudget: 0,
+          maxOutputTokens: 4096,
+          maxReasoningTokens: 128,
+          thinkingBudget: 128,
         },
         windowStartTurn,
         windowEndTurn,
       });
+      let detected: AutoDetectedCharacter[] = [];
+      if (structuredGraph.ok) {
+        const applied = applyStructuredCharacterGraph({
+          chatId,
+          personaName,
+          graph: structuredGraph,
+          turnNo: windowEndTurn,
+        });
+        autoCharactersAdded = applied.charactersAdded;
+        autoAliasesUpdated = applied.aliasesUpdated;
+        autoRelationshipsUpserted = applied.relationshipsUpserted;
+      } else {
+        // JSON 구조화 출력 자체가 실패한 경우에만 기존 strict 이름 추출기로 복구한다.
+        detected = await detectCharactersFromWindow({
+          rawWindowText: cleanedText,
+          personaName,
+          existingNames,
+          llmOpts: {
+            model: summaryModel,
+            maxOutputTokens: 600,
+            maxReasoningTokens: 0,
+            thinkingBudget: 0,
+          },
+          windowStartTurn,
+          windowEndTurn,
+        });
+      }
 
       if (detected.length > 0) {
         const insertStmt = db.prepare(
@@ -1242,6 +1276,8 @@ export async function POST(req: Request) {
     } catch {
       // detection 실패는 silent
       autoCharactersAdded = [];
+      autoAliasesUpdated = [];
+      autoRelationshipsUpserted = 0;
     }
     // ────────────────────────────────────────────────────────────────────
 
@@ -1315,6 +1351,8 @@ export async function POST(req: Request) {
       memoryBlocksBackfilled,
       autoCharactersAdded,
       autoCharactersBackfilled,
+      autoAliasesUpdated,
+      autoRelationshipsUpserted,
       policy: {
         summaryEvery: summaryEveryVal,
         perTurnChars: perTurnCharsVal,
