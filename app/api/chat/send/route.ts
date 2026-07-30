@@ -26,6 +26,7 @@ import {
   syncIdentityCanonRelations,
 } from "@/lib/relationship_graph";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
+import { selectConservativeMemoryRows } from "@/lib/character_memory_quality";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -584,9 +585,9 @@ function buildManualCharacterRosterBlock(
 
   const detailedRows = rows.filter((row) => focusedIds.has(String(row?.id || "")));
 
-  // (최적화) 기존엔 캐릭터마다 chat_character_turn_memories를 따로 조회하던 N+1을
-  // 하나의 IN 쿼리로 합친다. 각 캐릭터의 첫 만남 1개와 최신 기억 12개만 유지한다.
-  // 오래 대화한 캐릭터가 과거 80개에 잘려 최근 일을 전혀 기억하지 못하던 문제를 막는다.
+  // 정상 동적 컨텍스트 생성이 실패하더라도 같은 보존 정책을 쓴다.
+  // 고정 개수 제한 없이 전체 이력을 읽고, 사실상 같은 요약+근거만 합쳐
+  // 오래된 사건이나 반응성 기록도 조회 단계에서 사라지지 않게 한다.
   const memoriesByRoster = new Map<string, any[]>();
   {
     const rosterIds: string[] = [];
@@ -596,30 +597,29 @@ function buildManualCharacterRosterBlock(
     }
     if (rosterIds.length > 0) {
       const placeholders = rosterIds.map(() => "?").join(",");
-      const memRows = db
+      const rawMemoryRows = db
         .prepare(
-          `WITH ranked AS (
-             SELECT rosterId, turnNo, summary,
-                    ROW_NUMBER() OVER (PARTITION BY rosterId ORDER BY turnNo ASC) AS firstRank,
-                    ROW_NUMBER() OVER (PARTITION BY rosterId ORDER BY turnNo DESC) AS recentRank
-             FROM chat_character_turn_memories
-             WHERE chatId=? AND rosterId IN (${placeholders})
-           )
-           SELECT rosterId, turnNo, summary
-           FROM ranked
-           WHERE firstRank=1 OR recentRank<=12
+          `SELECT rosterId, turnNo, summary, evidence
+           FROM chat_character_turn_memories
+           WHERE chatId=? AND rosterId IN (${placeholders})
            ORDER BY rosterId ASC, turnNo ASC`
         )
         .all(chatId, ...rosterIds) as any[];
-      for (const m of memRows) {
+      const memoryRows = selectConservativeMemoryRows(
+        rawMemoryRows.map((memory) => ({
+          ...memory,
+          rosterId: String(memory?.rosterId || ""),
+          turnNo: Math.max(0, Number(memory?.turnNo || 0)),
+          summary: decryptIfPossible(String(memory?.summary || "")),
+          evidence: decryptIfPossible(String(memory?.evidence || "")),
+        }))
+      );
+      for (const m of memoryRows) {
         const k = String(m?.rosterId || "");
         if (!k) continue;
-        let arr = memoriesByRoster.get(k);
-        if (!arr) {
-          arr = [];
-          memoriesByRoster.set(k, arr);
-        }
-        if (arr.length < 13) arr.push(m);
+        const arr = memoriesByRoster.get(k) || [];
+        arr.push(m);
+        memoriesByRoster.set(k, arr);
       }
     }
   }
@@ -640,7 +640,7 @@ function buildManualCharacterRosterBlock(
     const memoryLines = memories
       .map((m: any) => {
         const turnNo = Math.max(0, Math.floor(Number(m?.turnNo || 0)));
-        const summary = replacer(decryptIfPossible(String(m?.summary || "")).trim());
+        const summary = replacer(String(m?.summary || "").trim());
         return turnNo > 0 && summary ? `  - ${turnNo}턴: ${summary}` : "";
       })
       .filter(Boolean);
@@ -663,7 +663,7 @@ function buildManualCharacterRosterBlock(
     .map((row) => String(row?.name || "").trim())
     .filter(Boolean);
   if (!lines.length && !inactiveNames.length) return "";
-  const body = lines.join("\n\n").slice(0, 6000);
+  const body = lines.join("\n\n");
   return [
     "# (2-C) manual character registry",
     "- These are user-pinned characters to remember across the chat.",
@@ -1756,7 +1756,6 @@ ${body}`.trim();
         personaName: personaNameFinal,
         focusText: characterFocusText,
         graph: loadRelationshipGraph(cid),
-        maxJsonChars: 5200,
       });
     } catch {
       // 관계 기억 조회 실패가 본 대화 생성을 막지 않게 한다.

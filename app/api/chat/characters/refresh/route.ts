@@ -18,11 +18,12 @@ import {
   updateCharacterAffinity,
 } from "@/lib/relationship_graph";
 import {
+  inferCriticalCoreMemoryType,
   isCoreMemoryCandidate,
   isNearDuplicateMemory,
   isSaturatedMemoryTheme,
   normalizeCoreMemoryType,
-  selectCoreMemoryRows,
+  selectConservativeMemoryRows,
 } from "@/lib/character_memory_quality";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
@@ -338,18 +339,9 @@ export async function POST(req: Request) {
     const priorMemoryRows = (
       db
         .prepare(
-          `WITH ranked AS (
-             SELECT rosterId, turnNo, summary, evidence,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY rosterId
-                      ORDER BY turnNo DESC, updatedAt DESC
-                    ) AS recentRank
-             FROM chat_character_turn_memories
-             WHERE chatId=? AND turnNo<?
-           )
-           SELECT rosterId, turnNo, summary, evidence
-           FROM ranked
-           WHERE recentRank<=12
+          `SELECT rosterId, turnNo, summary, evidence
+           FROM chat_character_turn_memories
+           WHERE chatId=? AND turnNo<?
            ORDER BY rosterId ASC, turnNo ASC`
         )
         .all(chatId, turnNo) as Array<{
@@ -371,7 +363,7 @@ export async function POST(req: Request) {
       recentMemoriesByRoster.set(memory.rosterId, rows);
     }
     const coreContextByRoster = new Map<string, typeof priorMemoryRows>();
-    for (const memory of selectCoreMemoryRows(priorMemoryRows, 3)) {
+    for (const memory of selectConservativeMemoryRows(priorMemoryRows)) {
       const rows = coreContextByRoster.get(memory.rosterId) || [];
       rows.push(memory);
       coreContextByRoster.set(memory.rosterId, rows);
@@ -380,10 +372,9 @@ export async function POST(req: Request) {
     const characterList = roster
       .map((r: any, i: number) => {
         const existingCoreMemories = (coreContextByRoster.get(String(r.id || "")) || [])
-          .slice(-3)
           .map((memory) => ({
             turn: memory.turnNo,
-            summary: cleanText(memory.summary, 140),
+            summary: cleanText(memory.summary, 240),
           }));
         const fields = [
           `id: ${String(r.id)}`,
@@ -446,7 +437,7 @@ export async function POST(req: Request) {
       "- A new name/age/family/job, marriage/breakup/friendship/enmity change, explicit promise/secret, arrest/injury/move, or an unresolved consequential decision can be remembered.",
       "- Repeated insults, fear, anger, pleas, rejection, questioning, staring, crying, or the next step of the same ongoing confrontation are not new long-term memories.",
       "- If shouldRemember=true, summarize THIS TURN ONLY and state the new durable fact or consequence rather than decorative actions.",
-      "- If shouldRemember=false, summary may be an empty string; still provide evidence and affinity fields for the direct exchange.",
+      "- Always provide a one-sentence candidate summary even when shouldRemember=false; the server independently checks critical facts so important continuity is not lost.",
       `- In summary/evidence, write the persona as "${personaName}". Do not write 사용자, 주인공, or 플레이어.`,
       `- Prioritize durable relationship change, newly revealed identity, commitment, consequence, current status, or unresolved tension involving ${personaName}.`,
       "- Keep each character's relationship and titles local to that character's JSON item; never borrow them from another registered character.",
@@ -522,14 +513,24 @@ export async function POST(req: Request) {
         });
         evaluated += 1;
 
-        if (item?.shouldRemember !== true) continue;
         const summary = oneSentenceSummary(item?.summary, personaName);
-        const memoryType = normalizeCoreMemoryType(item?.memoryType);
         if (!summary) continue;
+        const modelMemoryType = normalizeCoreMemoryType(item?.memoryType);
+        const fallbackMemoryType = inferCriticalCoreMemoryType(
+          `${summary} ${evidence}`
+        );
+        const memoryType =
+          fallbackMemoryType !== "none" ? fallbackMemoryType : modelMemoryType;
+        const serverRecovered = fallbackMemoryType !== "none";
+        if (item?.shouldRemember !== true && !serverRecovered) continue;
+        const importance = Math.max(
+          Number(item?.importance || 0),
+          serverRecovered ? 3 : 0
+        );
         if (
           !isCoreMemoryCandidate({
             memoryType,
-            importance: item?.importance,
+            importance,
             summary,
             evidence,
           })
@@ -578,7 +579,7 @@ export async function POST(req: Request) {
           summary,
           evidence,
           memoryType,
-          importance: Number(item?.importance || 0),
+          importance,
           affinity,
         });
       }

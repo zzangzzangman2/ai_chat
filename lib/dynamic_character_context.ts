@@ -2,7 +2,7 @@ import { db } from "@/lib/db";
 import { decryptIfPossible } from "@/lib/crypto";
 import { findFocusedCharacterIds } from "@/lib/relationship_memory";
 import type { RelationshipGraphData } from "@/lib/relationship_graph";
-import { selectCoreMemoryRows } from "@/lib/character_memory_quality";
+import { selectConservativeMemoryRows } from "@/lib/character_memory_quality";
 
 type RosterRow = {
   id: string;
@@ -108,46 +108,16 @@ function relationTouchesFocus(
   );
 }
 
-function fitPayload(payload: DynamicCharacterPayload, maxJsonChars: number) {
-  const next: DynamicCharacterPayload = {
-    characters: [...payload.characters],
-    relationships: [...payload.relationships],
-    major_events: [...payload.major_events],
-  };
-  const length = () => JSON.stringify(next).length;
-
-  while (length() > maxJsonChars && next.major_events.length > 4) {
-    next.major_events.shift();
-  }
-  while (length() > maxJsonChars && next.relationships.length > 4) {
-    next.relationships.pop();
-  }
-  while (length() > maxJsonChars && next.major_events.length > 1) {
-    next.major_events.shift();
-  }
-  while (length() > maxJsonChars && next.characters.length > 2) {
-    const removed = next.characters.pop();
-    const removedId = String(removed?.id || "");
-    if (removedId) {
-      next.relationships = next.relationships.filter(
-        (item) => item.source_id !== removedId && item.target_id !== removedId
-      );
-    }
-  }
-  return next;
-}
-
 /**
- * Builds a lorebook-like, bounded character-memory block for the current turn.
+ * Builds a lorebook-like character-memory block for the current turn.
  * Only explicitly mentioned/recently active characters are focal; their direct
- * relations and their own long-term turn memories are injected.
+ * relations and their complete conservatively deduplicated memories are injected.
  */
 export function buildDynamicCharacterContext(params: {
   chatId: string;
   personaName: string;
   focusText: string;
   graph: RelationshipGraphData;
-  maxJsonChars?: number;
 }): DynamicCharacterContext {
   const chatId = cleanText(params.chatId, 120);
   if (!chatId) return emptyContext();
@@ -332,36 +302,22 @@ export function buildDynamicCharacterContext(params: {
     focusedRosterIds.length > 0
       ? (db
           .prepare(
-            `WITH ranked AS (
-               SELECT rosterId, turnNo, summary, evidence,
-                      ROW_NUMBER() OVER (
-                        PARTITION BY rosterId
-                        ORDER BY turnNo DESC, updatedAt DESC
-                      ) AS recentRank,
-                      ROW_NUMBER() OVER (
-                        PARTITION BY rosterId
-                        ORDER BY turnNo ASC, updatedAt ASC
-                      ) AS firstRank
-               FROM chat_character_turn_memories
-               WHERE chatId=? AND rosterId IN (${focusedRosterIds
-                 .map(() => "?")
-                 .join(",")})
-             )
-             SELECT rosterId, turnNo, summary, evidence
-             FROM ranked
-             WHERE firstRank=1 OR recentRank<=14
+            `SELECT rosterId, turnNo, summary, evidence
+             FROM chat_character_turn_memories
+             WHERE chatId=? AND rosterId IN (${focusedRosterIds
+               .map(() => "?")
+               .join(",")})
              ORDER BY turnNo ASC`
           )
           .all(chatId, ...focusedRosterIds) as StoredTurnMemoryRow[])
       : [];
-  const memories = selectCoreMemoryRows(
+  const memories = selectConservativeMemoryRows(
     memoryCandidates.map((memory) => ({
       rosterId: cleanText(memory?.rosterId, 120),
       turnNo: Math.max(0, Number(memory?.turnNo || 0)),
       summary: decryptIfPossible(String(memory?.summary || "")),
       evidence: decryptIfPossible(String(memory?.evidence || "")),
-    })),
-    4
+    }))
   );
   const eventSeen = new Set<string>();
   const majorEvents = memories
@@ -380,17 +336,13 @@ export function buildDynamicCharacterContext(params: {
         event,
       };
     })
-    .filter(Boolean)
-    .slice(-20) as Array<Record<string, unknown>>;
+    .filter(Boolean) as Array<Record<string, unknown>>;
 
-  const fitted = fitPayload(
-    {
-      characters,
-      relationships: relationshipRows,
-      major_events: majorEvents,
-    },
-    Math.max(1800, Math.min(8000, Number(params.maxJsonChars || 5200)))
-  );
+  const fitted: DynamicCharacterPayload = {
+    characters,
+    relationships: relationshipRows,
+    major_events: majorEvents,
+  };
   const focusedNames = focusedRows.map((row) => row.name);
   const includedNames = fitted.characters
     .map((character) => cleanText(character.main_name, 80))

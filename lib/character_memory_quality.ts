@@ -72,6 +72,15 @@ const DURABLE_THEMES: Array<[string, RegExp]> = [
   ["location-status", /(이사했|떠났|돌아왔|실종|발견됐|행방을\s*찾)/u],
 ];
 
+const CRITICAL_FALLBACK_PATTERNS: Array<[CoreMemoryType, RegExp]> = [
+  ["relationship", /(결혼했|부부가\s*되|배우자가\s*되|이혼했|사귀기\s*시작|연인이\s*되|헤어졌|결별했|친구가\s*되|절교했|화해했|원수가\s*되)/u],
+  ["identity", /(이름(?:은|이)\s*[가-힣A-Za-z]{2,}|나이(?:는|가)\s*(?:\d+\s*(?:살|세)|[가-힣]+\s*살)|직업(?:은|이)\s*[가-힣A-Za-z]{2,}|소속(?:은|이)\s*[가-힣A-Za-z]{2,}|(?:아버지|어머니|아빠|엄마|딸|아들|손녀|손자)(?:였|이었|이다|이야|라고\s*밝))/u],
+  ["commitment", /(약속했|맹세했|비밀을\s*(?:알려|밝혀|지키기로)|계약을\s*맺|거래를\s*하기로|빚을\s*갚기로|보답하기로)/u],
+  ["status_change", /(체포됐|구속됐|석방됐|입원했|퇴원했|수술했|임신했|출산했|이사했|전학했|퇴학당|졸업했|입학했|취업했|퇴직했|해고됐|승진했|실종됐|발견됐)/u],
+  ["major_event", /(사망했|살해당|납치당|감금됐|큰\s*사고를\s*당|중상을\s*입|체포됐|구속됐|기소됐|판결을\s*받|수술을\s*받)/u],
+  ["unresolved", /(찾기로\s*했|밝히기로\s*했|수사가\s*시작|재판을\s*앞두|행방을\s*찾|해결되지\s*않|약속을\s*지켜야)/u],
+];
+
 const TOKEN_STOP_WORDS = new Set([
   "그리고",
   "하지만",
@@ -148,6 +157,14 @@ export function isCoreMemoryCandidate(candidate: CoreMemoryCandidate) {
   return hasTypeSignal;
 }
 
+export function inferCriticalCoreMemoryType(value: unknown): CoreMemoryType {
+  const text = cleanText(value, 1600);
+  for (const [memoryType, pattern] of CRITICAL_FALLBACK_PATTERNS) {
+    if (pattern.test(text)) return memoryType;
+  }
+  return "none";
+}
+
 function normalizedMemoryText(value: unknown) {
   return cleanText(value, 1000)
     .toLocaleLowerCase("ko-KR")
@@ -214,13 +231,12 @@ export function isSaturatedMemoryTheme(
 }
 
 /**
- * Compresses legacy and newly curated memories before prompt injection.
- * It keeps the newest distinct milestones, at most two per durable theme and
- * one current transient reaction per character.
+ * Reads the complete memory history without a fixed item cap.
+ * Retrieval never classifies a memory as disposable. Only effectively identical
+ * summary/evidence rows are collapsed; age, count, and reaction type never remove it.
  */
-export function selectCoreMemoryRows<T extends CharacterMemoryQualityRow>(
-  rows: T[],
-  maxPerRoster = 6
+export function selectConservativeMemoryRows<T extends CharacterMemoryQualityRow>(
+  rows: T[]
 ) {
   const grouped = new Map<string, T[]>();
   for (const row of rows) {
@@ -235,47 +251,25 @@ export function selectCoreMemoryRows<T extends CharacterMemoryQualityRow>(
   const selected: T[] = [];
   for (const group of grouped.values()) {
     const sorted = [...group].sort(
-      (a, b) => Number(b.turnNo || 0) - Number(a.turnNo || 0)
+      (a, b) => Number(a.turnNo || 0) - Number(b.turnNo || 0)
     );
     const kept: T[] = [];
-    const themeCounts = new Map<string, number>();
-    let genericCount = 0;
-    const latestTurn = Math.max(0, Number(sorted[0]?.turnNo || 0));
+    const comparisonTexts: string[] = [];
 
     for (const row of sorted) {
-      if (kept.length >= Math.max(1, maxPerRoster)) break;
       const summary = cleanText(row.summary, 600);
       const evidence = cleanText(row.evidence, 500);
       const combined = `${summary} ${evidence}`;
-      if (
-        isNearDuplicateMemory(
-          summary,
-          kept.map((item) => cleanText(item.summary, 600))
-        )
-      ) {
-        continue;
-      }
+      const normalized = normalizedMemoryText(combined);
+      const duplicate = comparisonTexts.some(
+        (item) =>
+          normalized === normalizedMemoryText(item) ||
+          memorySimilarity(combined, item) >= 0.94
+      );
+      if (duplicate) continue;
 
-      const theme = durableMemoryTheme(combined);
-      const transientTheme = transientReactionTheme(combined);
-      const turnNo = Math.max(0, Number(row?.turnNo || 0));
-      // Non-durable reactions are useful only as the character's current
-      // emotional residue. Never revive an old greeting or ordinary exchange.
-      if (!theme && latestTurn - turnNo > 8) continue;
-
-      if (theme) {
-        const count = themeCounts.get(theme) || 0;
-        if (count >= 2) continue;
-        themeCounts.set(theme, count + 1);
-      } else if (transientTheme) {
-        const key = `transient:${transientTheme}`;
-        if ((themeCounts.get(key) || 0) >= 1) continue;
-        themeCounts.set(key, 1);
-      } else {
-        if (genericCount >= 1) continue;
-        genericCount += 1;
-      }
       kept.push(row);
+      comparisonTexts.push(combined);
     }
     selected.push(...kept);
   }
