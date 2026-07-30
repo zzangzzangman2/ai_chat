@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isContextualSymmetricRelationship } from "@/lib/relationship_context";
 
 type Theme = {
   bg: string;
@@ -48,6 +49,7 @@ type GraphNode = {
   rosterId: string;
   age: number;
   ageSource: string;
+  job: string;
   role: string;
   relationshipNote: string;
   profile: string;
@@ -66,6 +68,7 @@ type CharacterMemory = {
 type CharacterDetails = {
   id: string;
   name: string;
+  job: string;
   role: string;
   profile: string;
   relationshipNote: string;
@@ -336,7 +339,7 @@ function validateRelations(relations: Relation[], nodeByKey: Map<string, GraphNo
 /* ------------------------------------------------------------ graph canvas */
 
 const NODE_W = 186;
-const NODE_H = 74;
+const NODE_H = 82;
 const CELL_GAP = 16;
 const TIER_GAP = 124;
 const GROUP_PAD = 14;
@@ -377,6 +380,7 @@ function RelationshipMap({
       rosterId: "",
       age: 0,
       ageSource: "",
+      job: "",
       role: "페르소나",
       relationshipNote: "",
       profile: "",
@@ -582,7 +586,8 @@ function RelationshipMap({
         fromName: relation.subjectName,
         toName: visiblePersonName(relation.objectName),
         relation: relation.relation,
-        symmetric: SYMMETRIC_RELATIONS.has(relation.relation),
+        symmetric:
+          SYMMETRIC_RELATIONS.has(relation.relation) || isContextualSymmetricRelationship(relation.relation),
       }));
 
     return {
@@ -616,7 +621,7 @@ function RelationshipMap({
     const affinityLabelText = FILLER_ROLE_LABELS.has(String(affinity?.relationshipLabel || "").trim())
       ? ""
       : String(affinity?.relationshipLabel || "").trim();
-    const subtitle = isPersona ? "주인공" : ellipsis(roleLabel || affinityLabelText, 20);
+    const subtitle = isPersona ? "주인공" : ellipsis(node.job || roleLabel || affinityLabelText, 22);
 
     return (
       <g
@@ -638,6 +643,7 @@ function RelationshipMap({
         <title>
           {node.name}
           {node.age > 0 ? ` · ${node.age}세` : ""}
+          {node.job ? ` · 직업: ${node.job}` : ""}
           {node.role ? ` · ${node.role}` : ""}
         </title>
         {active ? (
@@ -662,13 +668,13 @@ function RelationshipMap({
           stroke={color}
           strokeWidth={isPersona ? 2.4 : 1.5}
         />
-        <text x="0" y={-16} textAnchor="middle" fill="#fff" fontSize="15" fontWeight="900">
+        <text x="0" y={-20} textAnchor="middle" fill="#fff" fontSize="15" fontWeight="900">
           {ellipsis(node.name, 12)}
         </text>
-        <text x="0" y={2} textAnchor="middle" fill={isPersona ? "#a5f3fc" : "#94a3b8"} fontSize="10.5" fontWeight="700">
+        <text x="0" y={1} textAnchor="middle" fill={isPersona ? "#a5f3fc" : "#94a3b8"} fontSize="10.5" fontWeight="700">
           {subtitle}
         </text>
-        <text x="0" y={22} textAnchor="middle" fill="#cbd5e1" fontSize="10.5" fontWeight="800">
+        <text x="0" y={25} textAnchor="middle" fill="#cbd5e1" fontSize="10.5" fontWeight="800">
           {node.age > 0 ? `${node.age}세` : "나이 미상"}
           {!isPersona
             ? evaluated
@@ -762,6 +768,10 @@ function RelationshipMap({
             const end = from.y < to.y ? { x: to.x, y: endY } : { x: to.x, y: to.y + NODE_H / 2 };
             path = `M ${start.x} ${start.y} C ${start.x} ${midY}, ${end.x} ${midY}, ${end.x} ${end.y}`;
           }
+          const label = ellipsis(edge.relation, 24);
+          const labelWidth = Math.min(182, Math.max(54, label.length * 10 + 18));
+          const labelX = (from.x + to.x) / 2;
+          const labelY = (from.y + to.y) / 2;
           return (
             <g key={edge.id}>
               <path
@@ -776,18 +786,25 @@ function RelationshipMap({
                   {edge.fromName} {edge.symmetric ? "↔" : "→"} {edge.toName}: {edge.relation}
                 </title>
               </path>
+              <rect
+                x={labelX - labelWidth / 2}
+                y={labelY - 10}
+                width={labelWidth}
+                height={20}
+                rx={10}
+                fill="rgba(15,23,42,0.94)"
+                stroke={edge.symmetric ? "rgba(129,140,248,0.7)" : "rgba(244,114,182,0.7)"}
+                strokeWidth="1"
+              />
               <text
-                x={(from.x + to.x) / 2}
-                y={(from.y + to.y) / 2 + 4}
+                x={labelX}
+                y={labelY + 3.5}
                 textAnchor="middle"
                 fill="#e2e8f0"
                 fontSize="10.5"
                 fontWeight="900"
-                stroke="rgba(2,6,23,0.92)"
-                strokeWidth="3.4"
-                paintOrder="stroke"
               >
-                {edge.relation}
+                {label}
               </text>
             </g>
           );
@@ -811,7 +828,7 @@ function RelationshipMap({
           }}
         >
           <span style={{ fontSize: 11, fontWeight: 900, color: theme.muted }}>
-            관계 미확인 {layout.tray.length}명
+            현재 장면 인물 {layout.tray.length}명
           </span>
           {layout.tray.map((node) => {
             const affinity = node.rosterId ? layout.affinityByRoster.get(node.rosterId) : undefined;
@@ -822,7 +839,7 @@ function RelationshipMap({
                 onClick={() => {
                   if (node.rosterId) onSelect({ name: node.name, rosterId: node.rosterId });
                 }}
-                title={node.role || node.name}
+                title={node.job || node.role || node.name}
                 style={{
                   padding: "6px 11px",
                   borderRadius: 999,
@@ -835,6 +852,8 @@ function RelationshipMap({
                   fontSize: 12,
                   fontWeight: 800,
                   cursor: node.rosterId ? "pointer" : "default",
+                  outline: "none",
+                  boxShadow: "none",
                 }}
               >
                 {node.name}
@@ -868,6 +887,7 @@ export default function RelationshipGraphPanel({
   const [affinities, setAffinities] = useState<Affinity[]>([]);
   const [selected, setSelected] = useState<SelectedPerson | null>(null);
   const memoryPanelRef = useRef<HTMLDivElement | null>(null);
+  const memoryRequestRef = useRef(0);
   const [memoryState, setMemoryState] = useState<MemoryState>(emptyMemoryState);
 
   const loadGraph = useCallback(async () => {
@@ -895,8 +915,10 @@ export default function RelationshipGraphPanel({
   }, [chatId]);
 
   const loadMemories = useCallback(
-    async (person: SelectedPerson, offset = 0) => {
+    async (person: SelectedPerson, offset = 0, requestToken?: number) => {
       if (!chatId || !person.rosterId) return;
+      const token = requestToken ?? (offset > 0 ? memoryRequestRef.current : ++memoryRequestRef.current);
+      if (token !== memoryRequestRef.current) return;
       setMemoryState((previous) => ({
         ...(offset > 0 ? previous : emptyMemoryState),
         loading: true,
@@ -910,6 +932,7 @@ export default function RelationshipGraphPanel({
           { cache: "no-store" }
         );
         const body = (await response.json().catch(() => null)) as any;
+        if (token !== memoryRequestRef.current) return;
         if (!response.ok || !body?.ok) throw new Error(body?.error || "개별 기억을 불러오지 못했습니다.");
         const incoming = Array.isArray(body.memories) ? body.memories : [];
         setMemoryState((previous) => ({
@@ -922,6 +945,7 @@ export default function RelationshipGraphPanel({
           error: "",
         }));
       } catch (cause: any) {
+        if (token !== memoryRequestRef.current) return;
         setMemoryState((previous) => ({
           ...previous,
           loading: false,
@@ -934,9 +958,12 @@ export default function RelationshipGraphPanel({
 
   const selectPerson = useCallback(
     (person: SelectedPerson) => {
+      const token = ++memoryRequestRef.current;
+      const activeElement = document.activeElement as { blur?: () => void } | null;
+      activeElement?.blur?.();
       setSelected(person);
       setMemoryState(emptyMemoryState);
-      void loadMemories(person, 0);
+      void loadMemories(person, 0, token);
       window.setTimeout(() => {
         memoryPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }, 0);
@@ -945,6 +972,7 @@ export default function RelationshipGraphPanel({
   );
 
   useEffect(() => {
+    memoryRequestRef.current += 1;
     setSelected(null);
     setMemoryState(emptyMemoryState);
     void loadGraph();
@@ -1124,7 +1152,8 @@ export default function RelationshipGraphPanel({
         <div style={{ display: "grid", gap: 7, marginTop: 11 }}>
           {relationList.length ? (
             relationList.map((relation) => {
-              const symmetric = SYMMETRIC_RELATIONS.has(relation.relation);
+              const symmetric =
+                SYMMETRIC_RELATIONS.has(relation.relation) || isContextualSymmetricRelationship(relation.relation);
               return (
                 <div
                   key={relation.id}
@@ -1255,6 +1284,8 @@ export default function RelationshipGraphPanel({
                     textAlign: "left",
                     cursor: "pointer",
                     opacity: evaluated ? 1 : 0.72,
+                    outline: "none",
+                    boxShadow: "none",
                   }}
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
@@ -1350,6 +1381,7 @@ export default function RelationshipGraphPanel({
               }}
             >
               {[
+                ["직업", memoryState.character.job],
                 ["역할", memoryState.character.role],
                 ["관계 기억", memoryState.character.relationshipNote],
                 ["감정 기억", memoryState.character.emotionNote],
@@ -1402,7 +1434,7 @@ export default function RelationshipGraphPanel({
           {memoryState.hasMore ? (
             <button
               type="button"
-              onClick={() => void loadMemories(selected, memoryState.offset)}
+              onClick={() => void loadMemories(selected, memoryState.offset, memoryRequestRef.current)}
               disabled={memoryState.loading}
               style={{
                 marginTop: 12,

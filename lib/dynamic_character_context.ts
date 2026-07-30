@@ -291,6 +291,7 @@ export function buildDynamicCharacterContext(params: {
           ? ["주인공", "페르소나"]
           : splitAliases(row?.aliases).slice(0, 8),
         ...(Number(node?.age || 0) > 0 ? { current_age: Number(node?.age) } : {}),
+        ...(node?.job ? { job: node.job } : {}),
         ...(isFocused && row?.role ? { role: row.role } : {}),
         ...(isFocused && row?.profile ? { profile: row.profile } : {}),
         ...(isFocused && row?.relationshipNote

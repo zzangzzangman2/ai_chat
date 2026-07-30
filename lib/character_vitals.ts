@@ -11,6 +11,7 @@ export type CharacterGraphNode = {
   rosterId: string;
   age: number;
   ageSource: string;
+  job: string;
   role: string;
   relationshipNote: string;
   profile: string;
@@ -520,6 +521,7 @@ export function loadCharacterGraphNodes(chatIdRaw: string) {
       name,
       rosterId: String(row.rosterId || ""),
       age: validAge(row.age),
+      job: "",
       ageSource: String(row.ageSource || ""),
       role:
         cleanText(decryptIfPossible(String(row.rosterRole || "")), 500) ||

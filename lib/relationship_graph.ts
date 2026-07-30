@@ -7,6 +7,13 @@ import {
   loadCharacterGraphNodes,
   type CharacterGraphNode,
 } from "@/lib/character_vitals";
+import {
+  contextualRelationshipLabel,
+  inferCharacterOccupation,
+  isContextualSymmetricRelationship,
+  isInvalidRelationshipLabel,
+  inferPersonaOccupationFromScenario,
+} from "@/lib/relationship_context";
 
 export type RelationshipGraphRelation = {
   id: string;
@@ -29,6 +36,9 @@ export type CharacterAffinity = {
   rosterId: string;
   personaName: string;
   characterName: string;
+  job: string;
+  memoryCount: number;
+  latestMemory: string;
   score: number;
   label: string;
   relationshipLabel: string;
@@ -130,11 +140,19 @@ export function narrativeRelationshipLabel(params: {
   score: number;
   lastTurnNo?: number;
   role?: unknown;
+  profile?: unknown;
   relationshipNote?: unknown;
+  characterJob?: unknown;
+  personaJob?: unknown;
+  recentMemory?: unknown;
+  memoryCount?: unknown;
+  reason?: unknown;
+  evidence?: unknown;
 }) {
   const structuralSource = [
     params.relationshipNote,
     params.role,
+    params.profile,
   ]
     .map(cleanRelationshipSource)
     .filter(Boolean)
@@ -142,9 +160,18 @@ export function narrativeRelationshipLabel(params: {
   for (const [label, pattern] of STRUCTURAL_RELATIONSHIP_RULES) {
     if (structuralSource && pattern.test(structuralSource)) return label;
   }
-
-  const hasInteraction = Math.max(0, Number(params.lastTurnNo || 0)) > 0;
-  return hasInteraction ? "아는 사이" : "관계 미정";
+  return contextualRelationshipLabel({
+    characterJob: params.characterJob,
+    personaJob: params.personaJob,
+    role: params.role,
+    profile: params.profile,
+    relationshipNote: params.relationshipNote,
+    recentMemory: params.recentMemory,
+    memoryCount: params.memoryCount,
+    lastTurnNo: params.lastTurnNo,
+    reason: params.reason,
+    evidence: params.evidence,
+  });
 }
 
 export function syncIdentityCanonRelations(params: {
@@ -425,6 +452,35 @@ export function updateCharacterAffinity(params: {
 export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData {
   const chatId = cleanText(chatIdRaw, 120);
   if (!chatId) return { personaName: "", nodes: [], relations: [], affinities: [] };
+  const settings = db
+    .prepare(`SELECT personaName, personaInfo FROM chat_settings WHERE chatId=?`)
+    .get(chatId) as { personaName?: unknown; personaInfo?: unknown } | undefined;
+  const settingsPersonaName = cleanText(settings?.personaName, 80);
+  const personaInfo = cleanRelationshipSource(settings?.personaInfo);
+  const personaScenario = (
+    db
+      .prepare(
+        `SELECT content
+         FROM messages
+         WHERE chatId=? AND LOWER(role)='user'
+         ORDER BY createdAt ASC, id ASC
+         LIMIT 8`
+      )
+      .all(chatId) as Array<{ content?: unknown }>
+  )
+    .map((row) => decryptIfPossible(String(row?.content || "")))
+    .join("\n");
+  const personaJob =
+    inferCharacterOccupation(personaInfo) ||
+    inferPersonaOccupationFromScenario(personaScenario);
+  const rawNodes = loadCharacterGraphNodes(chatId).map((node) => ({
+    ...node,
+    job: inferCharacterOccupation(
+      node.isPersona ? personaJob : "",
+      node.role,
+      node.profile
+    ),
+  }));
   const relations = (
     db
       .prepare(
@@ -462,7 +518,19 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         `SELECT a.id, a.rosterId, a.personaName, a.characterName, a.score, a.lastDelta,
                 a.reason, a.evidence, a.lastTurnNo, a.updatedAt,
                 COALESCE(r.role, '') AS role,
-                COALESCE(r.relationshipNote, '') AS relationshipNote
+                COALESCE(r.profile, '') AS profile,
+                COALESCE(r.relationshipNote, '') AS relationshipNote,
+                (SELECT COUNT(*)
+                   FROM chat_character_turn_memories m
+                  WHERE m.chatId=a.chatId AND m.rosterId=a.rosterId) AS memoryCount,
+                COALESCE((SELECT m.summary
+                   FROM chat_character_turn_memories m
+                  WHERE m.chatId=a.chatId AND m.rosterId=a.rosterId
+                  ORDER BY m.turnNo DESC LIMIT 1), '') AS latestMemorySummary,
+                COALESCE((SELECT m.evidence
+                   FROM chat_character_turn_memories m
+                  WHERE m.chatId=a.chatId AND m.rosterId=a.rosterId
+                  ORDER BY m.turnNo DESC LIMIT 1), '') AS latestMemoryEvidence
          FROM chat_character_affinity a
          LEFT JOIN chat_character_roster r
            ON r.chatId=a.chatId AND r.id=a.rosterId
@@ -474,18 +542,39 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     const score = clampInt(row?.score ?? 50, 0, 100);
     const reason = decryptIfPossible(String(row?.reason || ""));
     const evidence = decryptIfPossible(String(row?.evidence || ""));
+    const role = decryptIfPossible(String(row?.role || ""));
+    const profile = decryptIfPossible(String(row?.profile || ""));
+    const relationshipNote = decryptIfPossible(String(row?.relationshipNote || ""));
+    const latestMemorySummary = decryptIfPossible(String(row?.latestMemorySummary || ""));
+    const latestMemoryEvidence = decryptIfPossible(String(row?.latestMemoryEvidence || ""));
+    const latestMemory = cleanText(
+      [latestMemorySummary, latestMemoryEvidence].filter(Boolean).join(" / "),
+      600
+    );
+    const job = inferCharacterOccupation(role, profile);
+    const memoryCount = Math.max(0, Number(row?.memoryCount || 0));
     return {
       id: String(row?.id || ""),
       rosterId: String(row?.rosterId || ""),
       personaName: String(row?.personaName || ""),
       characterName: String(row?.characterName || ""),
+      job,
+      memoryCount,
+      latestMemory,
       score,
       label: affinityLabel(score),
       relationshipLabel: narrativeRelationshipLabel({
         score,
         lastTurnNo: Number(row?.lastTurnNo || 0),
-        role: row?.role,
-        relationshipNote: row?.relationshipNote,
+        role,
+        profile,
+        relationshipNote,
+        characterJob: job,
+        personaJob,
+        recentMemory: latestMemory,
+        memoryCount,
+        reason,
+        evidence,
       }),
       lastDelta: clampInt(row?.lastDelta ?? 0, -3, 3),
       reason,
@@ -494,14 +583,6 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
       updatedAt: Number(row?.updatedAt || 0),
     };
   });
-  const settingsPersonaName = cleanText(
-    (
-      db.prepare(`SELECT personaName FROM chat_settings WHERE chatId=?`).get(chatId) as
-        | { personaName?: unknown }
-        | undefined
-    )?.personaName,
-    80
-  );
   const personaName =
     affinities.find((row) => row.personaName)?.personaName ||
     relations.find((row) => row.subjectKey === "persona")?.subjectName ||
@@ -521,13 +602,13 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
       objectKey: objectIsPersona ? "persona" : row.objectKey,
       objectRosterId: objectIsPersona ? "" : row.objectRosterId,
     };
-  });
+  }).filter((row) => !isInvalidRelationshipLabel(row.relation));
   const normalizedAffinities = affinities.filter(
     (row) =>
       !normalizedPersona ||
       cleanText(row.characterName, 80).toLocaleLowerCase("ko-KR") !== normalizedPersona
   );
-  const nodes = loadCharacterGraphNodes(chatId).filter(
+  const nodes = rawNodes.filter(
     (node) =>
       !node.isUnknown &&
       Boolean(String(node.name || "").trim()) &&
@@ -535,10 +616,68 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         node.isPersona ||
         cleanText(node.name, 80).toLocaleLowerCase("ko-KR") !== normalizedPersona)
   );
+  const directPersonaNames = new Set<string>();
+  for (const relation of normalizedRelations) {
+    if (relation.subjectKey === "persona") {
+      directPersonaNames.add(cleanText(relation.objectName, 80).toLocaleLowerCase("ko-KR"));
+    }
+    if (relation.objectKey === "persona") {
+      directPersonaNames.add(cleanText(relation.subjectName, 80).toLocaleLowerCase("ko-KR"));
+    }
+  }
+  const affinityByRoster = new Map(
+    normalizedAffinities.map((affinity) => [affinity.rosterId, affinity])
+  );
+  const affinityByName = new Map(
+    normalizedAffinities.map((affinity) => [
+      cleanText(affinity.characterName, 80).toLocaleLowerCase("ko-KR"),
+      affinity,
+    ])
+  );
+  const contextualRelations = nodes
+    .filter((node) => !node.isPersona && node.key !== "persona")
+    .filter(
+      (node) =>
+        !directPersonaNames.has(cleanText(node.name, 80).toLocaleLowerCase("ko-KR"))
+    )
+    .map((node) => {
+      const affinity =
+        affinityByRoster.get(node.rosterId) ||
+        affinityByName.get(cleanText(node.name, 80).toLocaleLowerCase("ko-KR"));
+      const relation =
+        affinity?.relationshipLabel ||
+        contextualRelationshipLabel({
+          characterJob: node.job,
+          personaJob,
+          role: node.role,
+          profile: node.profile,
+          relationshipNote: node.relationshipNote,
+        });
+      const detailParts = [
+        node.job ? `직업: ${node.job}` : "",
+        affinity?.latestMemory ? `최근 개별 기억: ${cleanText(affinity.latestMemory, 260)}` : "",
+        "직업·배경·개별 장기기억을 바탕으로 자동 추론한 현재 관계",
+      ].filter(Boolean);
+      return {
+        id: `contextual:${node.rosterId || node.key}`,
+        subjectKey: "persona",
+        subjectName: personaName || "주인공",
+        subjectRosterId: "",
+        relation,
+        slotKey: `contextual:${node.rosterId || node.key}`,
+        objectKey: node.key,
+        objectName: node.name,
+        objectRosterId: node.rosterId,
+        objectRole: detailParts.join("; "),
+        firstSeenTurn: 0,
+        lastSeenTurn: Math.max(0, Number(affinity?.lastTurnNo || 0)),
+        updatedAt: Math.max(Number(node.updatedAt || 0), Number(affinity?.updatedAt || 0)),
+      };
+    });
   return {
     personaName,
     nodes,
-    relations: normalizedRelations,
+    relations: [...normalizedRelations, ...contextualRelations],
     affinities: normalizedAffinities,
   };
 }
@@ -556,6 +695,9 @@ export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
   for (const node of graph.nodes.filter((item) => item.age > 0).slice(0, 60)) {
     lines.push(`- ${node.name} 현재 나이: ${node.age}세`);
   }
+  for (const node of graph.nodes.filter((item) => item.job).slice(0, 60)) {
+    lines.push(`- ${node.name} 직업: ${node.job}`);
+  }
   for (const relation of graph.relations.slice(0, 60)) {
     if (!relation.objectName) continue;
     const details = cleanText(relation.objectRole, 500);
@@ -564,7 +706,7 @@ export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
       details && details !== generatedRole ? `; 세부: ${details}` : "";
 
     lines.push(
-      SYMMETRIC_RELATIONS.has(relation.relation)
+      SYMMETRIC_RELATIONS.has(relation.relation) || isContextualSymmetricRelationship(relation.relation)
         ? `- ${relation.subjectName} ↔ ${relation.objectName}: ${relation.relation}${detailSuffix}`
         : `- ${relation.subjectName} → ${relation.relation} → ${relation.objectName}${detailSuffix}`
     );

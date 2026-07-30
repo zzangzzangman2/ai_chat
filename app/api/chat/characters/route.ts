@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
+import { inferCharacterOccupation } from "@/lib/relationship_context";
 
 function cleanText(v: unknown, max = 4000) {
   return String(v ?? "")
@@ -74,13 +75,16 @@ function intParam(v: string | null, fallback: number, min: number, max: number) 
 }
 
 function rowForClient(row: any, memories: any[] = [], memoryCount = memories.length, personaName = "") {
+  const role = decryptIfPossible(String(row?.role || ""));
+  const profile = decryptIfPossible(String(row?.profile || ""));
   return {
     id: String(row?.id || ""),
     chatId: String(row?.chatId || ""),
     name: String(row?.name || ""),
     aliases: decryptIfPossible(String(row?.aliases || "")),
-    role: decryptIfPossible(String(row?.role || "")),
-    profile: decryptIfPossible(String(row?.profile || "")),
+    job: inferCharacterOccupation(role, profile),
+    role,
+    profile,
     relationshipNote: decryptIfPossible(String(row?.relationshipNote || "")),
     emotionNote: decryptIfPossible(String(row?.emotionNote || "")),
     status: decryptIfPossible(String(row?.status || "")),

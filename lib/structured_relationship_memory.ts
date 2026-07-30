@@ -3,6 +3,10 @@ import { randomUUID } from "crypto";
 import { generateText } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { db } from "@/lib/db";
+import {
+  inferCharacterOccupation,
+  isValidDescriptiveRelationship,
+} from "@/lib/relationship_context";
 
 export const STRUCTURED_RELATION_TYPES = [
   "아버지",
@@ -167,6 +171,11 @@ export type ExistingStructuredCharacter = {
   id: string;
   mainName: string;
   aliases: string[];
+  job: string;
+  role: string;
+  profile: string;
+  relationshipNote: string;
+  recentMemory: string;
 };
 
 export type StructuredCharacter = {
@@ -174,6 +183,7 @@ export type StructuredCharacter = {
   mainName: string;
   aliases: string[];
   profile: string;
+  job: string;
   evidence: string;
 };
 
@@ -235,21 +245,50 @@ export function loadStructuredCharacterIdentities(chatIdRaw: string) {
   if (!chatId) return [] as ExistingStructuredCharacter[];
   const rows = db
     .prepare(
-      `SELECT id, name, aliases
-       FROM chat_character_roster
+      `SELECT r.id, r.name, r.aliases, r.role, r.profile, r.relationshipNote,
+              COALESCE((SELECT m.summary
+                FROM chat_character_turn_memories m
+                WHERE m.chatId=r.chatId AND m.rosterId=r.id
+                ORDER BY m.turnNo DESC LIMIT 1), '') AS latestMemorySummary,
+              COALESCE((SELECT m.evidence
+                FROM chat_character_turn_memories m
+                WHERE m.chatId=r.chatId AND m.rosterId=r.id
+                ORDER BY m.turnNo DESC LIMIT 1), '') AS latestMemoryEvidence
+       FROM chat_character_roster r
        WHERE chatId=? AND enabled != 0
        ORDER BY updatedAt DESC, name ASC
        LIMIT 80`
-    )
-    .all(chatId) as Array<{ id?: string; name?: string; aliases?: string }>;
+    ).all(chatId) as Array<Record<string, unknown>>;
   return rows
-    .map((row) => ({
-      id: cleanText(row?.id, 120),
-      mainName: cleanText(row?.name, 80),
-      aliases: splitStoredCharacterAliases(
-        decryptIfPossible(String(row?.aliases || ""))
-      ),
-    }))
+    .map((row) => {
+      const role = cleanText(decryptIfPossible(String(row?.role || "")), 500);
+      const profile = cleanText(decryptIfPossible(String(row?.profile || "")), 1600);
+      const relationshipNote = cleanText(
+        decryptIfPossible(String(row?.relationshipNote || "")),
+        1000
+      );
+      const recentMemory = cleanText(
+        [
+          decryptIfPossible(String(row?.latestMemorySummary || "")),
+          decryptIfPossible(String(row?.latestMemoryEvidence || "")),
+        ]
+          .filter(Boolean)
+          .join(" / "),
+        800
+      );
+      return {
+        id: cleanText(row?.id, 120),
+        mainName: cleanText(row?.name, 80),
+        aliases: splitStoredCharacterAliases(
+          decryptIfPossible(String(row?.aliases || ""))
+        ),
+        job: inferCharacterOccupation(role, profile),
+        role,
+        profile,
+        relationshipNote,
+        recentMemory,
+      };
+    })
     .filter((row) => row.id && row.mainName);
 }
 
@@ -261,7 +300,7 @@ const STRUCTURED_GRAPH_SCHEMA = {
       type: "array",
       items: {
         type: "object",
-        required: ["id", "main_name", "aliases", "profile", "evidence"],
+        required: ["id", "main_name", "aliases", "profile", "job", "evidence"],
         properties: {
           id: { type: "string" },
           main_name: { type: "string" },
@@ -270,6 +309,7 @@ const STRUCTURED_GRAPH_SCHEMA = {
             items: { type: "string" },
           },
           profile: { type: "string" },
+          job: { type: "string" },
           evidence: { type: "string" },
         },
       },
@@ -376,6 +416,13 @@ export async function extractStructuredCharacterGraph(params: {
       id: item.id,
       main_name: item.mainName,
       aliases: item.aliases,
+      profile: {
+        job: item.job,
+        role: item.role,
+        background: item.profile,
+        relationship_memory: item.relationshipNote,
+        recent_individual_memory: item.recentMemory,
+      },
     })),
   ];
   const system = [
@@ -383,15 +430,19 @@ export async function extractStructuredCharacterGraph(params: {
     "아래 작업 순서를 내부적으로 따르되 분석 과정이나 생각은 출력하지 말고 최종 JSON만 출력한다.",
     "1) 인물 식별: 대화에서 실제 인물로 등장하거나 한 번이라도 이름으로 언급된 모든 인물을 찾는다.",
     "2) 호칭 통합: 같은 인물의 이름, 성/이름 축약, 직함, 애칭, 가족 호칭을 한 main_name 아래 aliases로 묶는다.",
-    "3) 관계 정의: 직접 대화가 없어도 제3자 언급으로 확인되는 구조적 관계를 relationships에 기록한다.",
-    "4) 검증: 기존 인물 레지스트리와 같은 인물은 반드시 기존 id와 main_name을 그대로 재사용한다.",
-    "5) 출력: 지정된 JSON 스키마만 출력한다. 코드펜스, 설명, 분석문은 금지한다.",
+    "3) 직업·배경·기억 결합: 대화뿐 아니라 기존 레지스트리의 job, role, background, relationship_memory, recent_individual_memory를 함께 보고 관계를 추론한다.",
+    "4) 관계 정의: 직접 대화가 없어도 제3자 언급, 직업, 배경 상황으로 확인되는 관계를 relationships에 기록한다.",
+    "5) 검증: 기존 인물 레지스트리와 같은 인물은 반드시 기존 id와 main_name을 그대로 재사용한다.",
+    "6) 출력: 지정된 JSON 스키마만 출력한다. 코드펜스, 설명, 분석문은 금지한다.",
     "",
     "중요 규칙:",
     "- relationships는 이름이 아니라 characters의 id로 연결한다.",
     "- 관계 방향은 'target_id가 source_id에게 relation에 해당한다'는 뜻이다. 예: source=아이, target=김철수, relation=아버지.",
     "- 형/누나/오빠/언니/선배/후배/대표님/주인님 같은 호칭은 동일 인물 통합과 가족·서열·직장 관계 판단에 활용한다.",
-    "- 감정(공포, 호감, 분노, 경계)은 relation이 아니다. relation에는 가족·학교·직장·사회적 지위만 쓴다.",
+    "- 각 character의 job에는 대화와 배경에서 확인되는 직업만 간결하게 기록한다. 확인되지 않으면 빈 문자열을 쓴다.",
+    "- relation에 '미확인', '알 수 없음', '관계 미정', '중립'을 쓰는 것은 엄격히 금지한다.",
+    "- 명확한 가족·학교·직장 관계가 없으면 '아이돌과 소속사 경비원', '이제 막 통성명을 한 초면', '현재 사건으로 얽힌 당사자'처럼 직업과 현재 상황을 조합한 서술형 관계를 쓴다.",
+    "- 감정(공포, 호감, 분노, 경계)은 relation이 아니다. 감정은 details에만 쓰고 relation에는 가족·학교·직장·사회적 지위 또는 현재 상황 관계를 쓴다.",
     "- aliases에는 원문에 실제 등장한 표현만 쓴다. '너/당신/그/그녀/우리' 같은 문맥 의존 대명사는 aliases에 넣지 않는다.",
     "- aliases는 evidence 한 구절 안에 main_name과 alias가 함께 있어 동일 인물임이 직접 증명될 때만 넣는다. 근거가 분리되거나 추측이면 aliases를 비운다.",
     "- 이름이 없는 역할 인물에게 새 이름을 지어내지 않는다. 이름 미상 노드도 만들지 않는다.",
@@ -523,6 +574,7 @@ export async function extractStructuredCharacterGraph(params: {
         mainName,
         aliases: safeAliases(raw, mainName, item?.aliases, evidence),
         profile: cleanText(item?.profile, 300),
+        job: inferCharacterOccupation(item?.job, item?.profile),
         evidence,
       },
       outputId
@@ -539,6 +591,7 @@ export async function extractStructuredCharacterGraph(params: {
         mainName: personaName,
         aliases: [],
         profile: "",
+        job: "",
         evidence: "",
       });
     }
@@ -549,6 +602,7 @@ export async function extractStructuredCharacterGraph(params: {
       mainName: known.mainName,
       aliases: [],
       profile: "",
+      job: known.job,
       evidence: "",
     });
   };
@@ -568,7 +622,7 @@ export async function extractStructuredCharacterGraph(params: {
       !source ||
       !target ||
       source.mainName === target.mainName ||
-      !RELATION_TYPE_SET.has(relation) ||
+      (!RELATION_TYPE_SET.has(relation) && !isValidDescriptiveRelationship(relation)) ||
       !evidence
     ) {
       rejectedRelationshipCount += 1;
@@ -659,11 +713,11 @@ export function applyStructuredCharacterGraph(params: {
   const now = Date.now();
   const rosterRows = db
     .prepare(
-      `SELECT id, name, aliases
+      `SELECT id, name, aliases, role, profile
        FROM chat_character_roster
        WHERE chatId=? AND enabled != 0`
     )
-    .all(chatId) as Array<{ id?: string; name?: string; aliases?: string }>;
+    .all(chatId) as Array<Record<string, unknown>>;
   const existingById = new Map(
     rosterRows.map((row) => [cleanText(row?.id, 120), row])
   );
@@ -723,9 +777,9 @@ export function applyStructuredCharacterGraph(params: {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
      ON CONFLICT(chatId, name) DO NOTHING`
   );
-  const updateAliases = db.prepare(
+  const updateExistingCharacter = db.prepare(
     `UPDATE chat_character_roster
-     SET aliases=?, updatedAt=?
+     SET aliases=?, role=?, profile=?, updatedAt=?
      WHERE id=? AND chatId=?`
   );
   const applyCharacters = db.transaction(() => {
@@ -739,14 +793,30 @@ export function applyStructuredCharacterGraph(params: {
         ...previous,
         ...(incoming?.aliases || []),
       ]);
-      if (previous.join("\u0000") === next.join("\u0000")) continue;
-      updateAliases.run(
+      const currentRole = cleanText(
+        decryptIfPossible(String(row?.role || "")),
+        500
+      );
+      const currentProfile = cleanText(
+        decryptIfPossible(String(row?.profile || "")),
+        2000
+      );
+      const nextRole = currentRole || incoming?.job || "";
+      const nextProfile =
+        currentProfile ||
+        (incoming?.profile ? `(자동 탐지) ${incoming.profile}` : "");
+      const aliasesChanged = previous.join("\u0000") !== next.join("\u0000");
+      const factsChanged = nextRole !== currentRole || nextProfile !== currentProfile;
+      if (!aliasesChanged && !factsChanged) continue;
+      updateExistingCharacter.run(
         encryptIfPossible(next.join(", ")),
+        encryptIfPossible(nextRole),
+        encryptIfPossible(nextProfile),
         now,
         cleanText(row?.id, 120),
         chatId
       );
-      aliasesUpdated.push(cleanText(row?.name, 80));
+      if (aliasesChanged) aliasesUpdated.push(cleanText(row?.name, 80));
     }
 
     for (const [owner, character] of incomingByName) {
@@ -759,7 +829,7 @@ export function applyStructuredCharacterGraph(params: {
         chatId,
         character.mainName,
         encryptIfPossible(aliases.join(", ")),
-        encryptIfPossible(""),
+        encryptIfPossible(character.job),
         encryptIfPossible(
           character.profile
             ? `(자동 탐지) ${character.profile}`
@@ -815,7 +885,11 @@ export function applyStructuredCharacterGraph(params: {
       const subjectName = cleanText(relationship.sourceName, 80);
       const objectName = cleanText(relationship.targetName, 80);
       const relation = cleanText(relationship.relation, 40);
-      if (!subjectName || !objectName || !RELATION_TYPE_SET.has(relation)) {
+      if (
+        !subjectName ||
+        !objectName ||
+        (!RELATION_TYPE_SET.has(relation) && !isValidDescriptiveRelationship(relation))
+      ) {
         continue;
       }
       const subjectKey = stableNameKey(subjectName, personaName);
