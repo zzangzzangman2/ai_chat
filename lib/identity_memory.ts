@@ -12,9 +12,15 @@ export type CanonicalNameFact = {
   sourceOrder: number;
 };
 
+export type FamilyRelation =
+  | "아버지" | "어머니" | "딸" | "아들"
+  | "손녀" | "손자" | "자녀";
+
 export type ScopedRoleAnchor = {
   subjectName: string;
-  relation: "아버지" | "어머니";
+  relation: FamilyRelation;
+  relatedName?: string;
+  slotKey?: string;
   sourceOrder: number;
 };
 
@@ -26,7 +32,7 @@ export type IdentityCanon = {
 
 const KOREAN_OR_LATIN_NAME = String.raw`(?:[가-힣]{2,8}|[A-Za-z][A-Za-z0-9_-]{1,19})`;
 const NAME_ASSIGNMENT_RE = new RegExp(
-  String.raw`((?:(?:우리|저희|내|제)\s*)?(?:(?:첫째|둘째|셋째|막내)\s*)?(?:딸|아들|아이|아기|애기|손녀|손자))\s*(?:의\s*)?이름\s*(?:은|이|:)?\s*(${KOREAN_OR_LATIN_NAME}(?:이야|야)?)`,
+  String.raw`((?:(?:우리|저희|내|제)\s*)?(?:(?:첫째|둘째|셋째|막내)\s*)?(?:딸|아들|아이|아기|애기|손녀|손자))\s*(?:의\s*)?이름(?:\s*(?:은|이|:)\s*|\s+)(${KOREAN_OR_LATIN_NAME}(?:이야|야)?)`,
   "gu"
 );
 const MEMORY_NAME_RE = new RegExp(
@@ -60,6 +66,11 @@ const PERSONA_NAME_STOPWORDS = new Set([
   "남편",
   "아내",
   "사람",
+  "인물",
+  "남자",
+  "여자",
+  "실제",
+  "진짜",
 ]);
 
 function stripQuotedDialogue(text: string) {
@@ -196,7 +207,7 @@ export function extractCanonicalNameFacts(messages: IdentityMessageLike[]) {
 
   return [...factsBySubject.values()]
     .sort((a, b) => a.sourceOrder - b.sourceOrder)
-    .slice(-20);
+    .slice(-120);
 }
 
 function uniqueKnownNames(values: string[]) {
@@ -214,56 +225,160 @@ function uniqueKnownNames(values: string[]) {
 
 export function extractScopedRoleAnchors(
   messages: IdentityMessageLike[],
-  knownNames: string[]
+  knownNames: string[],
+  personaNameRaw = ""
 ) {
   const anchors = new Map<string, ScopedRoleAnchor>();
   const names = uniqueKnownNames(knownNames);
   if (!names.length) return [] as ScopedRoleAnchor[];
+  const personaName = validPersonaName(personaNameRaw);
 
   for (const message of userMessages(messages)) {
-    if (!/(?:다\s*옴|등장|나타|찾아왔|도착|왔음|왔다|옴|진짜|실제|친아빠|친엄마)/u.test(message.text)) {
-      continue;
+    if (personaName) {
+      const personaRelation = /(?:우리|저희|내|제)\s*(?:(?:어린|사랑하는|유일한)\s*)?((?:첫째|둘째|셋째|막내)?\s*)(아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀)/gu;
+      for (const match of message.text.matchAll(personaRelation)) {
+        const ordinal = String(match[1] || "").replace(/\s+/g, "");
+        const term = String(match[2] || "");
+        let relatedName = "";
+        for (const candidate of names) {
+          if (candidate === personaName) continue;
+          const candidateEscaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const termEscaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const fromRole = new RegExp(
+            `(?:우리|저희|내|제)\\s*(?:(?:어린|사랑하는|유일한)\\s*)?(?:첫째|둘째|셋째|막내)?\\s*${termEscaped}(?:인|은|는|이|가|:)?\\s*${candidateEscaped}(?:은|는|이|가)?(?=\\s|[,.!?]|$)`,
+            "u"
+          );
+          const fromName = new RegExp(
+            `${candidateEscaped}(?:은|는|이|가)\\s*(?:우리|저희|내|제)\\s*(?:(?:어린|사랑하는|유일한)\\s*)?(?:첫째|둘째|셋째|막내)?\\s*${termEscaped}`,
+            "u"
+          );
+          if (fromRole.test(message.text) || fromName.test(message.text)) {
+            relatedName = candidate;
+            break;
+          }
+        }
+        const relations: FamilyRelation[] =
+          term === "부모"
+            ? ["아버지", "어머니"]
+            : term === "아빠" || term === "아버지"
+              ? ["아버지"]
+              : term === "엄마" || term === "어머니"
+                ? ["어머니"]
+                : /아이|아기|애기/u.test(term)
+                  ? ["자녀"]
+                  : [term as FamilyRelation];
+        for (const relation of relations) {
+          const slotKey = `${ordinal}${relation}` || "default";
+          const key = `${personaName}:${relation}:${slotKey}`;
+          const previous = anchors.get(key);
+          anchors.set(key, {
+            subjectName: personaName,
+            relation,
+            relatedName: relatedName || previous?.relatedName || "",
+            slotKey,
+            sourceOrder: message.sourceOrder,
+          });
+        }
+      }
     }
+
     for (const name of names) {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const direct = new RegExp(
-        `${escaped}(?:이|의)\\s*(아빠|아버지|엄마|어머니|부모)`,
+        `${escaped}(?:이|의)\\s*(아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀)`,
         "gu"
       );
       const scopedPronoun = new RegExp(
-        `${escaped}[^.!?\\n]{0,28}(?:그|그녀|걔)의\\s*((?:(?:아빠|아버지|엄마|어머니|부모)[\\s,]*){1,4})`,
+        `${escaped}[^.!?\\n]{0,28}(?:그|그녀|걔)의\\s*((?:(?:아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀)[\\s,]*){1,6})`,
         "gu"
       );
       const terms = [
         ...Array.from(message.text.matchAll(direct), (match) => match[1]),
         ...Array.from(message.text.matchAll(scopedPronoun)).flatMap((match) =>
           Array.from(
-            String(match[1] || "").matchAll(/아빠|아버지|엄마|어머니|부모/gu),
+            String(match[1] || "").matchAll(/아빠|아버지|엄마|어머니|부모|딸|아들|손녀|손자|자녀/gu),
             (termMatch) => termMatch[0]
           )
         ),
       ];
       for (const term of terms) {
-        const relations: Array<"아버지" | "어머니"> =
+        const relations: FamilyRelation[] =
           term === "부모"
             ? ["아버지", "어머니"]
             : term === "아빠" || term === "아버지"
               ? ["아버지"]
-              : ["어머니"];
+              : term === "엄마" || term === "어머니"
+                ? ["어머니"]
+                : [term as FamilyRelation];
         for (const relation of relations) {
-          anchors.set(`${name}:${relation}`, {
+          const key = `${name}:${relation}`;
+          const previous = anchors.get(key);
+          anchors.set(key, {
             subjectName: name,
             relation,
+            relatedName: previous?.relatedName || "",
+            slotKey: previous?.slotKey || "default",
             sourceOrder: message.sourceOrder,
           });
         }
+      }
+
+      const relationPatterns: Array<{ relation: FamilyRelation; pattern: string }> = [
+        { relation: "아버지", pattern: "(?:아빠|아버지)" },
+        { relation: "어머니", pattern: "(?:엄마|어머니)" },
+        { relation: "딸", pattern: "딸" },
+        { relation: "아들", pattern: "아들" },
+        { relation: "손녀", pattern: "손녀" },
+        { relation: "손자", pattern: "손자" },
+        { relation: "자녀", pattern: "자녀" },
+      ];
+      for (const entry of relationPatterns) {
+        const namedByAssignment = message.text.match(
+          new RegExp(
+            `${escaped}(?:이|의)\\s*${entry.pattern}\\s*(?:의\\s*)?이름(?:\\s*(?:은|이|:)\\s*|\\s+)((?:[가-힣]{2,8}?|[A-Za-z][A-Za-z0-9_-]{1,19}))(?=\\s*(?:이야|야|이다|입니다|이고|이며|인데|라는|라고|다|[,.!?]|$))`,
+            "u"
+          )
+        );
+        const namedByInverse = message.text.match(
+          new RegExp(
+            `(${KOREAN_OR_LATIN_NAME})(?:은|는|이|가)\\s*${escaped}(?:이|의)\\s*${entry.pattern}`,
+            "u"
+          )
+        );
+        let relatedName =
+          validPersonaName(namedByAssignment?.[1] || "") ||
+          validPersonaName(namedByInverse?.[1] || "");
+
+        if (!relatedName) {
+          for (const candidate of names) {
+            if (candidate === name) continue;
+            const candidateEscaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            if (
+              new RegExp(
+                `${escaped}(?:이|의)\\s*${entry.pattern}\\s*(?:은|는|이|가|:)\\s*${candidateEscaped}(?=\\s|[,.!?]|$)`,
+                "u"
+              ).test(message.text)
+            ) {
+              relatedName = candidate;
+              break;
+            }
+          }
+        }
+        if (!relatedName) continue;
+        anchors.set(`${name}:${entry.relation}`, {
+          subjectName: name,
+          relation: entry.relation,
+          relatedName,
+          slotKey: "default",
+          sourceOrder: message.sourceOrder,
+        });
       }
     }
   }
 
   return [...anchors.values()]
     .sort((a, b) => a.sourceOrder - b.sourceOrder || a.subjectName.localeCompare(b.subjectName, "ko"))
-    .slice(-24);
+    .slice(-160);
 }
 
 export function deriveIdentityCanon(params: {
@@ -279,7 +394,45 @@ export function deriveIdentityCanon(params: {
     personaName,
     ...nameFacts.flatMap((fact) => [fact.canonicalName, ...fact.aliases]),
   ]);
-  const roleAnchors = extractScopedRoleAnchors(params.messages, knownNames);
+  const roleAnchors = extractScopedRoleAnchors(params.messages, knownNames, personaName);
+  if (personaName) {
+    for (const fact of nameFacts) {
+      const key = fact.subjectKey.replace(/\s+/g, "");
+      const relation: FamilyRelation | "" =
+        key.includes("손녀")
+          ? "손녀"
+          : key.includes("손자")
+            ? "손자"
+            : key.includes("딸")
+              ? "딸"
+              : key.includes("아들")
+                ? "아들"
+                : /아이|아기|애기/u.test(key)
+                  ? "자녀"
+                  : "";
+      if (!relation) continue;
+      const slotKey = key || "default";
+      const existing = roleAnchors.find(
+        (anchor) =>
+          anchor.subjectName === personaName &&
+          anchor.relation === relation &&
+          (!anchor.relatedName || anchor.relatedName === fact.canonicalName)
+      );
+      if (existing) {
+        existing.relatedName = fact.canonicalName;
+        existing.slotKey = slotKey;
+        existing.sourceOrder = Math.max(existing.sourceOrder, fact.sourceOrder);
+      } else {
+        roleAnchors.push({
+          subjectName: personaName,
+          relation,
+          relatedName: fact.canonicalName,
+          slotKey,
+          sourceOrder: fact.sourceOrder,
+        });
+      }
+    }
+  }
   return { personaName, nameFacts, roleAnchors };
 }
 
@@ -287,7 +440,7 @@ export function formatIdentityCanonBlock(canon: IdentityCanon) {
   const rows: string[] = [
     "# [인물 정체성·가족관계 정사 — 장기기억보다 우선]",
     "- 인물 이름과 가족관계는 반드시 `(대상 인물, 관계, 상대 인물)` 단위로 구분한다. 같은 '아빠/엄마/딸/아들' 호칭이라도 대상이나 세대가 다르면 별개의 관계다.",
-    "- 이름이 없는 'A의 아버지/어머니'는 독립된 역할 인물이다. 사용자의 명시적 설정 확정 없이 주인공이나 다른 이름 있는 인물과 합치지 않는다.",
+    "- 이름이 없는 'A의 아버지/어머니/딸/아들'도 독립된 역할 인물이다. 이름이 나중에 밝혀지면 같은 역할 인물에 이름만 연결하고 새 인물로 중복 생성하지 않는다.",
     "- 등장인물의 대사 속 주장, 질문, 거짓말, 추측, 사진·편지의 발신자는 그 자체로 혈연이나 정체성 확정 근거가 아니다.",
     "- '우리/저희/내/제'는 기본적으로 소유·복수 표현이다. 사용자가 '이름은 우리'처럼 명시적으로 이름을 정한 경우가 아니면 인명으로 해석하지 않는다.",
     "- 이미 명시된 이름은 이후의 모호한 호칭, 오타, 대사 속 자칭만으로 바꾸지 않는다. 변경은 사용자의 명시적 설정 변경·정정만 인정한다.",
@@ -307,11 +460,15 @@ export function formatIdentityCanonBlock(canon: IdentityCanon) {
     }
   }
   if (canon.roleAnchors.length) {
-    rows.push("[서로 합치면 안 되는 역할 인물]");
+    rows.push("[구조화 가족관계]");
     for (const anchor of canon.roleAnchors) {
-      rows.push(
-        `- ${anchor.subjectName}의 ${anchor.relation}: 이름이 확정되지 않은 독립 인물로 이미 등장함. 다른 이름 있는 인물과 동일시 금지.`
-      );
+      if (anchor.relatedName) {
+        rows.push(`- ${anchor.subjectName} → ${anchor.relation} → ${anchor.relatedName}`);
+      } else {
+        rows.push(
+          `- ${anchor.subjectName} → ${anchor.relation} → 이름 미상 역할 인물. 다른 이름 있는 인물과 임의 동일시 금지.`
+        );
+      }
     }
   }
   return rows.join("\n");

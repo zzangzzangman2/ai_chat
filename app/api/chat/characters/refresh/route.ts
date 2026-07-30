@@ -11,6 +11,10 @@ import {
   buildIdentityCanonBlock,
   inferPersonaNameFromMessages,
 } from "@/lib/identity_memory";
+import {
+  resetCharacterAffinitiesForTurn,
+  updateCharacterAffinity,
+} from "@/lib/relationship_graph";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
 type MsgRow = {
@@ -335,6 +339,9 @@ export async function POST(req: Request) {
       "A title used by one character never becomes a title that another character may use.",
       "If the persona corrects or denies a relationship/title, that correction overrides the assistant response and must remain negated.",
       identityCanon.block,
+      "For each saved direct conversation, estimate only THIS TURN's change in the character's affinity toward the persona.",
+      "affinityDelta must be an integer from -3 to 3. Use 0 when the exchange does not clearly change affinity.",
+      "Do not infer affinity change from mere presence, narration, coercion, or dialogue with somebody else.",
       "Write summaries in Korean casual banmal ending with forms like ~했어, ~하고 있어, ~보였어. Do not use formal endings like ~합니다, ~했습니다, ~습니다.",
       `The persona/user/player name is "${personaName}". Always refer to the persona as "${personaName}", never as 사용자, 주인공, or 플레이어.`,
       `Focus only on direct conversation between ${personaName} and the character, because this memory will be used later to remember their shared history.`,
@@ -361,12 +368,14 @@ export async function POST(req: Request) {
       "- Keep each character's relationship and titles local to that character's JSON item; never borrow them from another registered character.",
       "- A latest persona correction outranks contradictory wording in the assistant response.",
       buildRelationshipCorrectionGuidance(sceneText),
+      "- affinityDelta means the saved character's feeling toward the persona after this exact exchange: -3 major decrease, -2 decrease, -1 slight decrease, 0 unchanged, +1 slight increase, +2 increase, +3 major increase.",
+      "- affinityReason must be a short Korean phrase grounded only in this turn's direct exchange.",
       "- Include the turn's order implicitly by writing it as a result of this exact turn; do not imply a later turn happened before an earlier turn.",
       "- The summary must be exactly ONE Korean casual banmal sentence, no second sentence, and should naturally end in banmal such as ~했어/~있어/~보였어.",
       "- Avoid formal endings like 합니다/했습니다/습니다 and avoid detached report endings like 함/했다 when possible.",
       "",
       "Return JSON array:",
-      `[{"id":"registered id","present":true,"summary":"${personaName}와 나눈 대화를 담은 한국어 반말 한 문장","evidence":"short Korean evidence from this turn"}]`,
+      `[{"id":"registered id","present":true,"summary":"${personaName}와 나눈 대화를 담은 한국어 반말 한 문장","evidence":"short Korean evidence from this turn","affinityDelta":0,"affinityReason":"이 턴에서 호감도가 변한 직접 근거"}]`,
       "No markdown. No extra text.",
     ].join("\n");
 
@@ -404,6 +413,7 @@ export async function POST(req: Request) {
          updatedAt=excluded.updatedAt`
     );
     const deleteStmt = db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo=?`);
+    resetCharacterAffinitiesForTurn(chatId, turnNo);
     const writeAll = db.transaction((entries: any[]) => {
       deleteStmt.run(chatId, turnNo);
       for (const item of entries) {
@@ -427,8 +437,18 @@ export async function POST(req: Request) {
         const name = String(row?.name || "").trim();
 
         insertStmt.run(chatId, id, name, turnNo, encryptIfPossible(summary), encryptIfPossible(evidence), now, now);
+        const affinity = updateCharacterAffinity({
+          chatId,
+          rosterId: id,
+          personaName,
+          characterName: name,
+          turnNo,
+          delta: Number(item?.affinityDelta || 0),
+          reason: cleanText(item?.affinityReason, 500),
+          evidence,
+        });
         saved += 1;
-        savedItems.push({ id, name, turnNo, summary, evidence });
+        savedItems.push({ id, name, turnNo, summary, evidence, affinity });
       }
     });
     writeAll(items);

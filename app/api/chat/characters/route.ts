@@ -293,6 +293,8 @@ export async function DELETE(req: Request) {
   if (!access.ok) return access.res;
 
   db.prepare(`DELETE FROM chat_character_turn_memories WHERE rosterId=?`).run(id);
+  db.prepare(`DELETE FROM chat_character_affinity WHERE rosterId=?`).run(id);
+  db.prepare(`DELETE FROM chat_character_vitals WHERE rosterId=?`).run(id);
   db.prepare(`DELETE FROM chat_character_roster WHERE id=?`).run(id);
   return NextResponse.json({ ok: true });
 }

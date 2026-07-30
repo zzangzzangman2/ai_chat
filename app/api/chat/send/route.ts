@@ -19,6 +19,12 @@ import {
   buildIdentityCanonBlock,
   inferPersonaNameFromMessages,
 } from "@/lib/identity_memory";
+import { syncCharacterVitals } from "@/lib/character_vitals";
+import {
+  formatRelationshipGraphBlock,
+  loadRelationshipGraph,
+  syncIdentityCanonRelations,
+} from "@/lib/relationship_graph";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -1717,7 +1723,27 @@ ${body}`.trim();
       knownNames: continuityIdentities.map((identity) => identity.name),
       personaName: personaNameFinal,
     });
-    const identityCanonBlock = identityCanon.block;
+    let relationshipGraphBlock = "";
+    try {
+      syncIdentityCanonRelations({
+        chatId: cid,
+        canon: identityCanon.canon,
+        turnNo: completedTurnCountNext,
+      });
+      syncCharacterVitals({
+        chatId: cid,
+        messages: all,
+        canon: identityCanon.canon,
+        personaName: personaNameFinal,
+        personaAge: personaAgeFinal,
+      });
+      relationshipGraphBlock = formatRelationshipGraphBlock(loadRelationshipGraph(cid));
+    } catch {
+      relationshipGraphBlock = "";
+    }
+    const identityCanonBlock = [identityCanon.block, relationshipGraphBlock]
+      .filter(Boolean)
+      .join("\n\n");
     const manualCharacterRosterBlock = buildManualCharacterRosterBlock(
       cid,
       characterFocusText,

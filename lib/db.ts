@@ -543,6 +543,73 @@ if (!hasColumn("chat_settings", "narrationColor")) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_character_turn_memories_chat_roster ON chat_character_turn_memories(chatId, rosterId, turnNo)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_character_turn_memories_roster ON chat_character_turn_memories(rosterId)`);
 
+  // 4-1-1) 채팅별 구조화 관계도
+  // 이름이 밝혀지지 않은 역할 인물도 subject/relation/slot 조합으로 먼저 보존하고,
+  // 이후 이름이 밝혀지면 같은 행의 objectName/objectKey만 승격한다.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_character_relations (
+      id TEXT PRIMARY KEY,
+      chatId TEXT NOT NULL,
+      subjectKey TEXT NOT NULL,
+      subjectName TEXT NOT NULL DEFAULT '',
+      relation TEXT NOT NULL,
+      slotKey TEXT NOT NULL DEFAULT 'default',
+      objectKey TEXT NOT NULL,
+      objectName TEXT NOT NULL DEFAULT '',
+      objectRole TEXT NOT NULL DEFAULT '',
+      sourceOrder INTEGER NOT NULL DEFAULT 0,
+      firstSeenTurn INTEGER NOT NULL DEFAULT 0,
+      lastSeenTurn INTEGER NOT NULL DEFAULT 0,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL,
+      UNIQUE(chatId, subjectKey, relation, slotKey)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_character_relations_chat
+      ON chat_character_relations(chatId, subjectName, relation, updatedAt DESC);
+  `);
+
+  // 4-1-2) 등록 인물이 주인공에게 느끼는 지속 호감도
+  // 같은 턴 재생성 시 lastDelta를 되돌린 뒤 새 delta를 반영해 중복 누적을 막는다.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_character_affinity (
+      id TEXT PRIMARY KEY,
+      chatId TEXT NOT NULL,
+      rosterId TEXT NOT NULL,
+      personaName TEXT NOT NULL DEFAULT '',
+      characterName TEXT NOT NULL DEFAULT '',
+      score INTEGER NOT NULL DEFAULT 50,
+      lastDelta INTEGER NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL DEFAULT '',
+      evidence TEXT NOT NULL DEFAULT '',
+      lastTurnNo INTEGER NOT NULL DEFAULT 0,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL,
+      UNIQUE(chatId, rosterId)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_character_affinity_chat
+      ON chat_character_affinity(chatId, score DESC, characterName ASC);
+  `);
+
+  // 4-1-3) 관계도 인물 노드의 동적 나이/표시 정보
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_character_vitals (
+      id TEXT PRIMARY KEY,
+      chatId TEXT NOT NULL,
+      personKey TEXT NOT NULL,
+      personName TEXT NOT NULL DEFAULT '',
+      rosterId TEXT NOT NULL DEFAULT '',
+      nodeRole TEXT NOT NULL DEFAULT '',
+      age INTEGER NOT NULL DEFAULT 0,
+      ageSource TEXT NOT NULL DEFAULT '',
+      sourceOrder INTEGER NOT NULL DEFAULT 0,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL,
+      UNIQUE(chatId, personKey)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_character_vitals_chat
+      ON chat_character_vitals(chatId, personName ASC);
+  `);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS message_usage (
       messageId TEXT PRIMARY KEY,
@@ -825,6 +892,15 @@ if (!hasColumn("chat_settings", "narrationColor")) {
         DELETE FROM chat_memory_blocks
         WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_memory_blocks.chatId);
 
+        DELETE FROM chat_character_relations
+        WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_character_relations.chatId);
+
+        DELETE FROM chat_character_affinity
+        WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_character_affinity.chatId);
+
+        DELETE FROM chat_character_vitals
+        WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_character_vitals.chatId);
+
         INSERT OR IGNORE INTO chat_settings (
           chatId,
           personaName, personaAge, personaGender, personaInfo,
@@ -887,6 +963,9 @@ function deleteChatDataRows(targetChatId: string) {
   db.prepare(`DELETE FROM chat_settings WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_memory_cache WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_memory_blocks WHERE chatId=?`).run(targetChatId);
+  db.prepare(`DELETE FROM chat_character_relations WHERE chatId=?`).run(targetChatId);
+  db.prepare(`DELETE FROM chat_character_affinity WHERE chatId=?`).run(targetChatId);
+  db.prepare(`DELETE FROM chat_character_vitals WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_roster WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=?`).run(targetChatId);
 }

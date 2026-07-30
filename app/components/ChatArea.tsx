@@ -42,6 +42,7 @@ import { buildInputPreviewNodes as buildInputPreviewNodesNode } from "@/app/comp
 import { computeMessageWindow } from "@/app/components/chat/ChatArea/selectors/messageWindow";
 import { MessageList } from "@/app/components/chat/ChatArea/MessageList";
 import MemoryPanel from "@/app/components/MemoryPanel";
+import RelationshipGraphPanel from "@/app/components/RelationshipGraphPanel";
 import { CHAT_MODEL_IDS, type ChatModelId, coerceChatModelId } from "@/lib/models";
 import { mergeStreamFinalContent } from "@/app/components/chat/ChatArea/streamMerge";
 
@@ -681,11 +682,12 @@ export default function ChatArea(props: {
   };
 
   // 설정 Drawer 내부 뷰(홈 -> 각 설정) 전환
-  const [settingsView, setSettingsView] = useState<"home" | "persona" | "userNote" | "model" | "room" | "memory">("home");
+  const [settingsView, setSettingsView] = useState<"home" | "persona" | "userNote" | "model" | "room" | "memory" | "relations">("home");
 
-  // Drawer 모드라도 "장기기억" 화면은 더 넓게 보이도록(좌: 장기기억, 우: 채팅) 도킹한다.
+  // Drawer 모드라도 "장기기억/관계도" 화면은 더 넓게 보이도록 도킹한다.
   // - 모바일(좁은 화면)에서는 기존처럼 drawer(overlay)로 유지
-    const isMemoryDock = effectiveSettingsOpen && settingsView === "memory" && !isMobile;
+    const isMemoryDock =
+      effectiveSettingsOpen && (settingsView === "memory" || settingsView === "relations") && !isMobile;
 
   // 페르소나 프로필(여러 개 저장/선택)
   const [profileModalOpen] = useState(false);
@@ -5867,9 +5869,11 @@ const insertNarrationMarkers = useCallback(() => {
                     ? "유저 노트"
                     : settingsView === "room"
                       ? "채팅방 설정"
-                      : settingsView === "memory"
-                        ? "장기기억"
-                        : "출력/추론"}
+                      : settingsView === "relations"
+                        ? "관계도"
+                        : settingsView === "memory"
+                          ? "장기기억"
+                          : "출력/추론"}
             </div>
           </div>
 
@@ -6024,6 +6028,7 @@ const insertNarrationMarkers = useCallback(() => {
                   { k: "persona", label: "페르소나 설정", icon: "persona", sub: "주인공" },
                   { k: "userNote", label: "유저 노트", icon: "note", sub: "메모" },
                   { k: "memory", label: "장기기억", icon: "memory", sub: "인물/저장" },
+                  { k: "relations", label: "관계도", icon: "relations", sub: "관계·호감도" },
                   { k: "model", label: "출력/추론", icon: "sliders", sub: "옵션" },
                 ] as const
               ).map((it) => (
@@ -6139,6 +6144,26 @@ const insertNarrationMarkers = useCallback(() => {
                     }}
                   >
                     <MemoryPanel key={memoryUiKey} theme={CHAT_THEME as any} chatId={chatId} embed />
+                  </div>
+                </div>
+              ) : null}
+              {settingsView === "relations" && settings && chatId ? (
+                <div style={{ maxWidth: isMemoryDock ? "100%" : 1180, margin: isMemoryDock ? 0 : "0 auto" }}>
+                  <div
+                    style={{
+                      borderRadius: 16,
+                      border: isMemoryDock ? "none" : `1px solid ${CHAT_THEME.borderStrong}`,
+                      background: isMemoryDock ? "transparent" : CHAT_THEME.panel,
+                      padding: isMemoryDock ? 0 : 14,
+                      minWidth: 0,
+                    }}
+                  >
+                    <RelationshipGraphPanel
+                      key={`relations-${memoryUiKey}`}
+                      theme={CHAT_THEME as any}
+                      chatId={chatId}
+                      turnKey={memoryUiKey}
+                    />
                   </div>
                 </div>
               ) : null}

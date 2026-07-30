@@ -126,7 +126,7 @@ export function SettingsIcon({
   name,
   size = 18,
 }: {
-  name: "persona" | "note" | "memory" | "sliders" | "pencil" | "chevronLeft";
+  name: "persona" | "note" | "memory" | "relations" | "sliders" | "pencil" | "chevronLeft";
   size?: number;
 }) {
   const common = { width: size, height: size, viewBox: "0 0 24 24", fill: "none", xmlns: "http://www.w3.org/2000/svg" } as const;
@@ -152,6 +152,17 @@ export function SettingsIcon({
           <path d="M4 7c0-2 4-4 8-4s8 2 8 4-4 4-8 4-8-2-8-4Z" stroke="currentColor" strokeWidth="2" />
           <path d="M4 7v10c0 2 4 4 8 4s8-2 8-4V7" stroke="currentColor" strokeWidth="2" />
           <path d="M4 12c0 2 4 4 8 4s8-2 8-4" stroke="currentColor" strokeWidth="2" />
+        </svg>
+      );
+    case "relations":
+      return (
+        <svg {...common}>
+          <circle cx="6" cy="7" r="3" stroke="currentColor" strokeWidth="2" />
+          <circle cx="18" cy="7" r="3" stroke="currentColor" strokeWidth="2" />
+          <circle cx="12" cy="18" r="3" stroke="currentColor" strokeWidth="2" />
+          <path d="M8.7 8.4 10.8 15" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          <path d="m15.3 8.4-2.1 6.6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          <path d="M9 7h6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
         </svg>
       );
     case "sliders":
