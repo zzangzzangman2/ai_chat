@@ -153,6 +153,45 @@ function nameIsAliasOf(candidate: string, canonicalName: string) {
   return canonicalName.endsWith(candidate) || candidate.endsWith(canonicalName);
 }
 
+function inferPersonaNameFromAddressedReply(messages: IdentityMessageLike[]) {
+  const ordered = (messages || []).map((message) => ({
+    role: String(message?.role || "").toLowerCase(),
+    text: String(message?.content || "").trim(),
+  }));
+  for (let index = 1; index < ordered.length; index += 1) {
+    const current = ordered[index];
+    if (current.role !== "user" || !current.text) continue;
+    // NPC가 직전 답변에서 한 사람을 실명으로 부르고, 사용자가 곧바로
+    // 1인칭으로 답한 경우 그 호명 대상은 사용자가 조종하는 인물이다.
+    if (
+      !/(?:^|[\s*"'“‘])(?:저는|제가|나는|내가|전|난)(?=\s|[가-힣]|[,.!?*"'”’]|$)/u.test(
+        current.text
+      )
+    ) {
+      continue;
+    }
+
+    let previousAssistant = "";
+    for (let previous = index - 1; previous >= 0; previous -= 1) {
+      if (!ordered[previous].text) continue;
+      if (!["assistant", "model"].includes(ordered[previous].role)) break;
+      previousAssistant = ordered[previous].text;
+      break;
+    }
+    if (!previousAssistant) continue;
+
+    const addressed = new Set<string>();
+    for (const match of previousAssistant.matchAll(
+      /(?:^|[\s"'“‘(])([가-힣]{2,8})\s*(?:씨|님|군|양)(?=\s|[!?,."'”’)]|$)/gu
+    )) {
+      const name = validPersonaName(match[1]);
+      if (name) addressed.add(name);
+    }
+    if (addressed.size === 1) return [...addressed][0];
+  }
+  return "";
+}
+
 export function inferPersonaNameFromMessages(messages: IdentityMessageLike[]) {
   const users = userMessages(messages);
   let earliest = "";
@@ -175,7 +214,11 @@ export function inferPersonaNameFromMessages(messages: IdentityMessageLike[]) {
     }
   }
 
-  return explicitOverride || earliest;
+  return (
+    explicitOverride ||
+    earliest ||
+    inferPersonaNameFromAddressedReply(messages)
+  );
 }
 
 export function extractCanonicalNameFacts(messages: IdentityMessageLike[]) {

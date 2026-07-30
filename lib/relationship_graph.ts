@@ -494,14 +494,53 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
       updatedAt: Number(row?.updatedAt || 0),
     };
   });
+  const settingsPersonaName = cleanText(
+    (
+      db.prepare(`SELECT personaName FROM chat_settings WHERE chatId=?`).get(chatId) as
+        | { personaName?: unknown }
+        | undefined
+    )?.personaName,
+    80
+  );
   const personaName =
     affinities.find((row) => row.personaName)?.personaName ||
     relations.find((row) => row.subjectKey === "persona")?.subjectName ||
-    "";
-  const nodes = loadCharacterGraphNodes(chatId).filter(
-    (node) => !node.isUnknown && Boolean(String(node.name || "").trim())
+    settingsPersonaName;
+  const normalizedPersona = cleanText(personaName, 80).toLocaleLowerCase("ko-KR");
+  const normalizedRelations = relations.map((row) => {
+    const subjectIsPersona =
+      Boolean(normalizedPersona) &&
+      cleanText(row.subjectName, 80).toLocaleLowerCase("ko-KR") === normalizedPersona;
+    const objectIsPersona =
+      Boolean(normalizedPersona) &&
+      cleanText(row.objectName, 80).toLocaleLowerCase("ko-KR") === normalizedPersona;
+    return {
+      ...row,
+      subjectKey: subjectIsPersona ? "persona" : row.subjectKey,
+      subjectRosterId: subjectIsPersona ? "" : row.subjectRosterId,
+      objectKey: objectIsPersona ? "persona" : row.objectKey,
+      objectRosterId: objectIsPersona ? "" : row.objectRosterId,
+    };
+  });
+  const normalizedAffinities = affinities.filter(
+    (row) =>
+      !normalizedPersona ||
+      cleanText(row.characterName, 80).toLocaleLowerCase("ko-KR") !== normalizedPersona
   );
-  return { personaName, nodes, relations, affinities };
+  const nodes = loadCharacterGraphNodes(chatId).filter(
+    (node) =>
+      !node.isUnknown &&
+      Boolean(String(node.name || "").trim()) &&
+      (!normalizedPersona ||
+        node.isPersona ||
+        cleanText(node.name, 80).toLocaleLowerCase("ko-KR") !== normalizedPersona)
+  );
+  return {
+    personaName,
+    nodes,
+    relations: normalizedRelations,
+    affinities: normalizedAffinities,
+  };
 }
 
 const SYMMETRIC_RELATIONS = new Set([

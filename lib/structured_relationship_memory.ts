@@ -255,22 +255,18 @@ export function loadStructuredCharacterIdentities(chatIdRaw: string) {
 
 const STRUCTURED_GRAPH_SCHEMA = {
   type: "object",
-  additionalProperties: false,
   required: ["characters", "relationships"],
   properties: {
     characters: {
       type: "array",
-      maxItems: 80,
       items: {
         type: "object",
-        additionalProperties: false,
         required: ["id", "main_name", "aliases", "profile", "evidence"],
         properties: {
           id: { type: "string" },
           main_name: { type: "string" },
           aliases: {
             type: "array",
-            maxItems: 20,
             items: { type: "string" },
           },
           profile: { type: "string" },
@@ -280,10 +276,8 @@ const STRUCTURED_GRAPH_SCHEMA = {
     },
     relationships: {
       type: "array",
-      maxItems: 160,
       items: {
         type: "object",
-        additionalProperties: false,
         required: [
           "source_id",
           "target_id",
@@ -294,10 +288,7 @@ const STRUCTURED_GRAPH_SCHEMA = {
         properties: {
           source_id: { type: "string" },
           target_id: { type: "string" },
-          relation: {
-            type: "string",
-            enum: [...STRUCTURED_RELATION_TYPES],
-          },
+          relation: { type: "string" },
           details: { type: "string" },
           evidence: { type: "string" },
         },
@@ -332,7 +323,12 @@ function exactEvidence(raw: string, value: unknown) {
   return evidence.length >= 2 && raw.includes(evidence) ? evidence : "";
 }
 
-function safeAliases(raw: string, mainName: string, values: unknown) {
+function safeAliases(
+  raw: string,
+  mainName: string,
+  values: unknown,
+  evidence: string
+) {
   if (!Array.isArray(values)) return [] as string[];
   const aliases = new Set<string>();
   for (const value of values) {
@@ -341,7 +337,9 @@ function safeAliases(raw: string, mainName: string, values: unknown) {
       !alias ||
       normalizedKey(alias) === normalizedKey(mainName) ||
       NON_PERSISTENT_ALIASES.has(alias) ||
-      !raw.includes(alias)
+      !raw.includes(alias) ||
+      !evidence.includes(mainName) ||
+      !evidence.includes(alias)
     ) {
       continue;
     }
@@ -395,6 +393,7 @@ export async function extractStructuredCharacterGraph(params: {
     "- 형/누나/오빠/언니/선배/후배/대표님/주인님 같은 호칭은 동일 인물 통합과 가족·서열·직장 관계 판단에 활용한다.",
     "- 감정(공포, 호감, 분노, 경계)은 relation이 아니다. relation에는 가족·학교·직장·사회적 지위만 쓴다.",
     "- aliases에는 원문에 실제 등장한 표현만 쓴다. '너/당신/그/그녀/우리' 같은 문맥 의존 대명사는 aliases에 넣지 않는다.",
+    "- aliases는 evidence 한 구절 안에 main_name과 alias가 함께 있어 동일 인물임이 직접 증명될 때만 넣는다. 근거가 분리되거나 추측이면 aliases를 비운다.",
     "- 이름이 없는 역할 인물에게 새 이름을 지어내지 않는다. 이름 미상 노드도 만들지 않는다.",
     "- evidence는 반드시 원문에서 글자 그대로 복사한 짧은 구절이어야 한다.",
     "- 동일 인물을 여러 character로 쪼개지 말고, 서로 다른 인물을 같은 호칭만으로 합치지 않는다.",
@@ -408,6 +407,7 @@ export async function extractStructuredCharacterGraph(params: {
   ].join("\n");
 
   let parsed: StructuredGraphResponseShape | null = null;
+  let responseText = "";
   try {
     const response = await generateText({
       system,
@@ -420,13 +420,28 @@ export async function extractStructuredCharacterGraph(params: {
         responseJsonSchema: STRUCTURED_GRAPH_SCHEMA,
       },
     });
-    const value = extractJsonObject(String(response?.text || ""));
+    responseText = String(response?.text || "");
+    const value = extractJsonObject(responseText);
     if (value && typeof value === "object" && !Array.isArray(value)) {
       parsed = value as StructuredGraphResponseShape;
     } else {
+      if (process.env.CHAT_DEBUG === "1") {
+        console.log(JSON.stringify({
+          tag: "structuredGraph.parse_failed",
+          window: [params.windowStartTurn, params.windowEndTurn],
+          rawTextSample: responseText.slice(0, 1200),
+        }));
+      }
       return { ok: false, characters: [], relationships: [] };
     }
-  } catch {
+  } catch (error: unknown) {
+    if (process.env.CHAT_DEBUG === "1") {
+      console.log(JSON.stringify({
+        tag: "structuredGraph.llm_error",
+        window: [params.windowStartTurn, params.windowEndTurn],
+        error: String((error as { message?: unknown })?.message || error),
+      }));
+    }
     return { ok: false, characters: [], relationships: [] };
   }
   if (!parsed) {
@@ -465,6 +480,7 @@ export async function extractStructuredCharacterGraph(params: {
   };
 
   const rawCharacters = Array.isArray(parsed?.characters) ? parsed.characters : [];
+  const characterRejects: Array<{ name: string; reason: string }> = [];
   for (let index = 0; index < rawCharacters.length; index += 1) {
     const item = rawCharacters[index];
     const outputId = cleanText(item?.id, 120) || `new_${index + 1}`;
@@ -479,24 +495,33 @@ export async function extractStructuredCharacterGraph(params: {
       outputId === "persona" ||
       Boolean(personaName && normalizedKey(proposedName) === normalizedKey(personaName));
     const mainName = isPersona ? personaName : known?.mainName || proposedName;
-    if (
-      !mainName ||
-      (!isPersona &&
-        !known &&
-        (!PERSON_NAME_PATTERN.test(mainName) ||
-          NON_CHARACTER_NAMES.has(mainName) || ROLE_LIKE_NAME_PATTERN.test(mainName))) ||
-      !evidence ||
-      (!known &&
-        !isPersona &&
-        !raw.includes(mainName))
+    let rejectReason = "";
+    if (!mainName) {
+      rejectReason = "empty_name";
+    } else if (
+      !isPersona &&
+      !known &&
+      !PERSON_NAME_PATTERN.test(mainName)
     ) {
+      rejectReason = "invalid_name_pattern";
+    } else if (!isPersona && !known && NON_CHARACTER_NAMES.has(mainName)) {
+      rejectReason = "generic_role_name";
+    } else if (!isPersona && !known && ROLE_LIKE_NAME_PATTERN.test(mainName)) {
+      rejectReason = "role_like_name";
+    } else if (!evidence) {
+      rejectReason = "evidence_not_exact";
+    } else if (!known && !isPersona && !raw.includes(mainName)) {
+      rejectReason = "name_not_in_source";
+    }
+    if (rejectReason) {
+      characterRejects.push({ name: mainName || proposedName, reason: rejectReason });
       continue;
     }
     addCharacter(
       {
         id: isPersona ? "persona" : known?.id || outputId,
         mainName,
-        aliases: safeAliases(raw, mainName, item?.aliases),
+        aliases: safeAliases(raw, mainName, item?.aliases, evidence),
         profile: cleanText(item?.profile, 300),
         evidence,
       },
@@ -529,6 +554,7 @@ export async function extractStructuredCharacterGraph(params: {
   };
 
   const relationships: StructuredRelationship[] = [];
+  let rejectedRelationshipCount = 0;
   const relationKeys = new Set<string>();
   const rawRelationships = Array.isArray(parsed?.relationships)
     ? parsed.relationships
@@ -545,6 +571,7 @@ export async function extractStructuredCharacterGraph(params: {
       !RELATION_TYPE_SET.has(relation) ||
       !evidence
     ) {
+      rejectedRelationshipCount += 1;
       continue;
     }
     const key = [
@@ -581,6 +608,20 @@ export async function extractStructuredCharacterGraph(params: {
       const key = normalizedKey(alias);
       return !canonicalNames.has(key) && (aliasOwners.get(key)?.size || 0) === 1;
     });
+  }
+
+  if (process.env.CHAT_DEBUG === "1") {
+    console.log(JSON.stringify({
+      tag: "structuredGraph.result",
+      window: [params.windowStartTurn, params.windowEndTurn],
+      rawTextSample: responseText.slice(0, 1200),
+      rawCharacterCount: rawCharacters.length,
+      acceptedCharacters: characters.map((item) => item.mainName),
+      rejectedCharacters: characterRejects.slice(0, 30),
+      rawRelationshipCount: rawRelationships.length,
+      acceptedRelationshipCount: relationships.length,
+      rejectedRelationshipCount,
+    }));
   }
 
   return {

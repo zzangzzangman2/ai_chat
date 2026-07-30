@@ -157,10 +157,10 @@ export async function GET(req: Request) {
     .prepare(
       `SELECT *
        FROM chat_character_roster
-       WHERE chatId=?
+       WHERE chatId=? AND name <> ?
        ORDER BY enabled DESC, updatedAt DESC, name ASC`
     )
-    .all(chatId) as any[];
+    .all(chatId, personaName) as any[];
 
   const counts = db
     .prepare(

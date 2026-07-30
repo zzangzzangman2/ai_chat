@@ -475,6 +475,250 @@ async function detectCharactersFromWindow(params: {
   return out;
 }
 
+const STRUCTURED_GRAPH_WINDOW_TURNS = 12;
+const AUTO_CHARACTER_BACKFILL_TURNS = 12;
+
+type StructuredGraphRefreshOutcome = {
+  attempted: boolean;
+  structuredGraphParsed: boolean;
+  structuredGraphRefreshed: boolean;
+  fallbackUsed: boolean;
+  candidateNames: string[];
+  missingCandidateNames: string[];
+  autoCharactersAdded: string[];
+  autoAliasesUpdated: string[];
+  autoRelationshipsUpserted: number;
+};
+
+async function refreshStructuredCharacterState(params: {
+  chatId: string;
+  personaName: string;
+  summaryModel: string;
+  graphWindowText: string;
+  graphWindowStartTurn: number;
+  graphWindowEndTurn: number;
+  now: number;
+}): Promise<StructuredGraphRefreshOutcome> {
+  const empty = (): StructuredGraphRefreshOutcome => ({
+    attempted: true,
+    structuredGraphParsed: false,
+    structuredGraphRefreshed: false,
+    fallbackUsed: false,
+    candidateNames: [],
+    missingCandidateNames: [],
+    autoCharactersAdded: [],
+    autoAliasesUpdated: [],
+    autoRelationshipsUpserted: 0,
+  });
+
+  try {
+    const existingRosterRows = db
+      .prepare(
+        `SELECT name FROM chat_character_roster WHERE chatId=? AND enabled != 0`
+      )
+      .all(params.chatId) as Array<{ name: string }>;
+    const existingNames = new Set<string>(
+      existingRosterRows.map((row) => String(row?.name || "").trim()).filter(Boolean)
+    );
+    const candidateNames: string[] = [];
+    const wasRosterEmpty = existingNames.size === 0;
+    const structuredGraph = await extractStructuredCharacterGraph({
+      rawWindowText: params.graphWindowText,
+      personaName: params.personaName,
+      existingCharacters: loadStructuredCharacterIdentities(params.chatId),
+      llmOpts: {
+        model: params.summaryModel,
+        maxOutputTokens: 4096,
+        maxReasoningTokens: 128,
+        thinkingBudget: 128,
+      },
+      windowStartTurn: params.graphWindowStartTurn,
+      windowEndTurn: params.graphWindowEndTurn,
+    });
+
+    const acceptedNames = new Set(
+      structuredGraph.characters
+        .filter(
+          (character) =>
+            character.id !== "persona" &&
+            String(character.mainName || "").trim() !== params.personaName
+        )
+        .map((character) => String(character.mainName || "").trim())
+        .filter(Boolean)
+    );
+    const missingCandidateNames: string[] = [];
+    const shouldUseFallback =
+      !structuredGraph.ok || wasRosterEmpty;
+
+    let autoCharactersAdded: string[] = [];
+    let autoAliasesUpdated: string[] = [];
+    let autoRelationshipsUpserted = 0;
+    if (structuredGraph.ok) {
+      const applied = applyStructuredCharacterGraph({
+        chatId: params.chatId,
+        personaName: params.personaName,
+        graph: structuredGraph,
+        turnNo: params.graphWindowEndTurn,
+      });
+      autoCharactersAdded = applied.charactersAdded;
+      autoAliasesUpdated = applied.aliasesUpdated;
+      autoRelationshipsUpserted = applied.relationshipsUpserted;
+    }
+
+    let detected: AutoDetectedCharacter[] = [];
+    if (shouldUseFallback) {
+      detected = await detectCharactersFromWindow({
+        rawWindowText: params.graphWindowText,
+        personaName: params.personaName,
+        existingNames: new Set([
+          ...existingNames,
+          ...autoCharactersAdded,
+        ]),
+        llmOpts: {
+          model: params.summaryModel,
+          maxOutputTokens: 600,
+          maxReasoningTokens: 0,
+          thinkingBudget: 0,
+        },
+        windowStartTurn: params.graphWindowStartTurn,
+        windowEndTurn: params.graphWindowEndTurn,
+      });
+    }
+
+    if (detected.length > 0) {
+      const insertStmt = db.prepare(
+        `INSERT INTO chat_character_roster
+           (id, chatId, name, aliases, role, profile, relationshipNote, emotionNote, status, enabled, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(chatId, name) DO NOTHING`
+      );
+      const inserted: string[] = [];
+      const insertMany = db.transaction((items: AutoDetectedCharacter[]) => {
+        for (const character of items) {
+          const profileText = character.profile
+            ? `(자동 탐지) ${character.profile}`
+            : "(자동 탐지)";
+          const result = insertStmt.run(
+            randomUUID(),
+            params.chatId,
+            character.name,
+            encryptIfPossible(""),
+            encryptIfPossible(""),
+            encryptIfPossible(profileText),
+            encryptIfPossible(""),
+            encryptIfPossible(""),
+            encryptIfPossible(""),
+            1,
+            params.now,
+            params.now
+          );
+          if (Number((result as { changes?: unknown })?.changes || 0) > 0) {
+            inserted.push(character.name);
+          }
+        }
+      });
+      insertMany(detected);
+      autoCharactersAdded = [...new Set([...autoCharactersAdded, ...inserted])];
+    }
+
+    const structuredGraphRefreshed =
+      structuredGraph.ok &&
+      (acceptedNames.size > 0 || structuredGraph.relationships.length > 0);
+    if (process.env.CHAT_DEBUG === "1") {
+      console.log(JSON.stringify({
+        tag: "structuredGraph.refresh",
+        chatId: params.chatId,
+        window: [params.graphWindowStartTurn, params.graphWindowEndTurn],
+        structuredGraphParsed: structuredGraph.ok,
+        structuredGraphRefreshed,
+        fallbackUsed: shouldUseFallback,
+        candidateNames,
+        missingCandidateNames,
+        autoCharactersAdded,
+        autoAliasesUpdated,
+        autoRelationshipsUpserted,
+      }));
+    }
+    return {
+      attempted: true,
+      structuredGraphParsed: structuredGraph.ok,
+      structuredGraphRefreshed,
+      fallbackUsed: shouldUseFallback,
+      candidateNames,
+      missingCandidateNames,
+      autoCharactersAdded,
+      autoAliasesUpdated,
+      autoRelationshipsUpserted,
+    };
+  } catch (error: unknown) {
+    if (process.env.CHAT_DEBUG === "1") {
+      console.log(JSON.stringify({
+        tag: "structuredGraph.refresh_error",
+        chatId: params.chatId,
+        window: [params.graphWindowStartTurn, params.graphWindowEndTurn],
+        error: String((error as { message?: unknown })?.message || error),
+      }));
+    }
+    return empty();
+  }
+}
+
+async function backfillAutoCharacterMemories(params: {
+  req: Request;
+  chatId: string;
+  autoCharactersAdded: string[];
+  turnLimit?: number;
+}) {
+  if (!params.autoCharactersAdded.length) return null;
+  const recentAssistantIds = db
+    .prepare(
+      `SELECT id FROM messages
+       WHERE chatId=? AND (role='assistant' OR role='model')
+       ORDER BY createdAt DESC, id DESC
+       LIMIT ?`
+    )
+    .all(
+      params.chatId,
+      Math.max(1, Number(params.turnLimit || AUTO_CHARACTER_BACKFILL_TURNS))
+    ) as Array<{ id: string }>;
+  const ids = recentAssistantIds.map((row) => String(row?.id || "")).filter(Boolean);
+  if (!ids.length) return null;
+
+  const origin = new URL(params.req.url).origin;
+  const refreshUrl = `${origin}/api/chat/characters/refresh`;
+  const cookieHeader = params.req.headers.get("cookie") || "";
+  let savedCount = 0;
+  // 한꺼번에 12개를 호출하면 Flash rate limit에 걸릴 수 있어 3개씩 처리한다.
+  for (let index = 0; index < ids.length; index += 3) {
+    const batch = ids.slice(index, index + 3);
+    const results = await Promise.allSettled(
+      batch.map((assistantMessageId) =>
+        fetch(refreshUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(cookieHeader ? { cookie: cookieHeader } : {}),
+          },
+          body: JSON.stringify({ chatId: params.chatId, assistantMessageId }),
+        }).then((response) => response.json().catch(() => null))
+      )
+    );
+    for (const result of results) {
+      if (
+        result.status === "fulfilled" &&
+        result.value &&
+        typeof result.value === "object"
+      ) {
+        savedCount += Math.max(
+          0,
+          Number((result.value as { saved?: unknown }).saved || 0)
+        );
+      }
+    }
+  }
+  return { turns: ids.length, savedCount };
+}
+
 function collectLikelyKoreanNames(text: string) {
   const src = String(text || "");
   const out = new Set<string>();
@@ -618,6 +862,18 @@ export async function POST(req: Request) {
     }));
 
     const completedTurnCount = countAssistantTurns(all);
+    const summaryModel = pickLongMemorySummaryModel();
+    const configuredPersonaName = String(st?.personaName || "").trim();
+    const inferredPersonaName = configuredPersonaName
+      ? ""
+      : inferPersonaNameFromMessages(all);
+    const personaName = configuredPersonaName || inferredPersonaName;
+
+    if (!configuredPersonaName && inferredPersonaName) {
+      db.prepare(
+        `UPDATE chat_settings SET personaName=?, updatedAt=? WHERE chatId=?`
+      ).run(inferredPersonaName, Date.now(), chatId);
+    }
 
     // Only summarize complete blocks.
     const boundaryEndTurn = Math.floor(completedTurnCount / summaryEveryVal) * summaryEveryVal;
@@ -682,9 +938,79 @@ export async function POST(req: Request) {
     // (Self-heal, opt-in) corrupted block repair is disabled by default to avoid token re-spend.
     const repair = repairCorrupted ? firstBadSectionRange(recentSummary, boundaryEndTurn) : null;
 
-    // If cache already covers this boundary and there is nothing to repair, skip.
+    // 이미 장기요약이 끝난 기존 채팅이라도 roster가 비어 있으면 수동 새로고침에서
+    // 마지막 12턴을 한 번 재분석한다. 관계 추출 실패가 요약 포인터 뒤에 영구히
+    // 묻히던 문제를 복구한다.
     if (summarizedEndTurn >= boundaryEndTurn && !repair) {
       persistNormalizedSummaryIfNeeded(summarizedEndTurn);
+      const rosterCount = Number(
+        (
+          db
+            .prepare(`SELECT COUNT(*) AS count FROM chat_character_roster WHERE chatId=? AND enabled != 0`)
+            .get(chatId) as { count?: unknown }
+        )?.count || 0
+      );
+      const relationshipCount = Number(
+        (
+          db
+            .prepare(`SELECT COUNT(*) AS count FROM chat_character_relations WHERE chatId=?`)
+            .get(chatId) as { count?: unknown }
+        )?.count || 0
+      );
+      const shouldRepairGraph =
+        rosterCount === 0 || (rosterCount > 1 && relationshipCount === 0);
+      if (shouldRepairGraph) {
+        const wasRosterEmpty = rosterCount === 0;
+        const graphWindowStartTurn = Math.max(
+          1,
+          boundaryEndTurn - STRUCTURED_GRAPH_WINDOW_TURNS + 1
+        );
+        const graphRangeTurns = selectMessagesForAssistantTurnRange(
+          all,
+          graphWindowStartTurn,
+          boundaryEndTurn
+        );
+        const graphWindowText = stripUrlsAndMediaMarkdown(
+          formatTurnsLocal(graphRangeTurns)
+        );
+        const graphOutcome = await refreshStructuredCharacterState({
+          chatId,
+          personaName,
+          summaryModel,
+          graphWindowText,
+          graphWindowStartTurn,
+          graphWindowEndTurn: boundaryEndTurn,
+          now: Date.now(),
+        });
+        const autoCharactersBackfilled = await backfillAutoCharacterMemories({
+          req,
+          chatId,
+          autoCharactersAdded: graphOutcome.autoCharactersAdded,
+          turnLimit: Math.min(STRUCTURED_GRAPH_WINDOW_TURNS, boundaryEndTurn),
+        }).catch(() => null);
+        const graphChanged =
+          graphOutcome.autoCharactersAdded.length > 0 ||
+          graphOutcome.autoAliasesUpdated.length > 0 ||
+          graphOutcome.autoRelationshipsUpserted > 0;
+        return NextResponse.json({
+          ok: true,
+          refreshed: graphChanged,
+          skipped: !graphChanged,
+          reason: graphChanged
+            ? wasRosterEmpty
+              ? "uptodate_graph_bootstrapped"
+              : "uptodate_graph_repaired"
+            : wasRosterEmpty
+              ? "uptodate_graph_still_empty"
+              : "uptodate_graph_no_edges_found",
+          summarizedEndTurn,
+          boundaryEndTurn,
+          normalizedSummary: didNormalizeSummary,
+          memoryBlocksBackfilled,
+          ...graphOutcome,
+          autoCharactersBackfilled,
+        });
+      }
       return NextResponse.json({
         ok: true,
         skipped: true,
@@ -783,8 +1109,6 @@ export async function POST(req: Request) {
     const rawText = formatTurnsLocal(rangeTurns);
     const cleanedText = stripUrlsAndMediaMarkdown(rawText);
 
-    const summaryModel = pickLongMemorySummaryModel();
-
     const llmOpts = {
       model: summaryModel,
       maxOutputTokens: clampInt(runtime?.maxOutputTokens ?? st?.maxOutputTokens, 256, 8192, 2048),
@@ -798,11 +1122,6 @@ export async function POST(req: Request) {
 
     // Generate a single section: "### <title> (a-b턴)\n<body>"
     const targetChars = Math.min(100000, Math.max(80, perTurnCharsVal * summaryEveryVal));
-    const configuredPersonaName = String(st?.personaName || "").trim();
-    const inferredPersonaName = configuredPersonaName
-      ? ""
-      : inferPersonaNameFromMessages(all);
-    const personaName = configuredPersonaName || inferredPersonaName;
     const identityCharacters = (db
       .prepare(
         `SELECT name, role, profile, relationshipNote, emotionNote, status
@@ -1185,29 +1504,36 @@ export async function POST(req: Request) {
     });
     memoryBlocksBackfilled += 1;
 
-    // ─── (주기적 구조화 관계도 갱신) ─────────────────────────────────────
-    // 장기기억 요약은 3턴마다 유지하되, 별도 Gemini 구조화 호출은 12턴을
-    // 모았을 때만 실행한다. 메인 채팅 응답과는 이미 분리된 background 요청이다.
-    // 같은 12턴 원문과 기존 roster/graph를 함께 사용하므로 매 턴 재추출하지 않는다.
-    const STRUCTURED_GRAPH_WINDOW_TURNS = 12;
+    // 새 채팅은 첫 완성 구간(3턴)에서 roster를 만들고, 이후에는 12턴마다
+    // 관계·별칭을 갱신한다. roster 부트스트랩이 실패한 동안에는 다음 3턴
+    // 구간에서 다시 시도해 캐릭터 기억이 영구히 0개로 고정되지 않게 한다.
+    const rosterCountBeforeGraph = Number(
+      (
+        db
+          .prepare(`SELECT COUNT(*) AS count FROM chat_character_roster WHERE chatId=? AND enabled != 0`)
+          .get(chatId) as { count?: unknown }
+      )?.count || 0
+    );
+    const isRosterBootstrap = rosterCountBeforeGraph === 0;
     const shouldRefreshStructuredGraph =
-      windowEndTurn >= STRUCTURED_GRAPH_WINDOW_TURNS &&
-      windowEndTurn % STRUCTURED_GRAPH_WINDOW_TURNS === 0;
+      isRosterBootstrap ||
+      (windowEndTurn >= STRUCTURED_GRAPH_WINDOW_TURNS &&
+        windowEndTurn % STRUCTURED_GRAPH_WINDOW_TURNS === 0);
     let autoCharactersAdded: string[] = [];
     let autoAliasesUpdated: string[] = [];
     let autoRelationshipsUpserted = 0;
+    let structuredGraphParsed = false;
     let structuredGraphRefreshed = false;
-    if (shouldRefreshStructuredGraph) try {
-      const existingRosterRows = db
-        .prepare(`SELECT name FROM chat_character_roster WHERE chatId=?`)
-        .all(chatId) as Array<{ name: string }>;
-      const existingNames = new Set<string>(
-        existingRosterRows.map((r) => String(r?.name || "").trim()).filter(Boolean)
-      );
-
+    let structuredGraphFallbackUsed = false;
+    let structuredGraphCandidateNames: string[] = [];
+    let structuredGraphMissingCandidateNames: string[] = [];
+    if (shouldRefreshStructuredGraph) {
+      const graphWindowTurnCount = isRosterBootstrap
+        ? Math.min(STRUCTURED_GRAPH_WINDOW_TURNS, windowEndTurn)
+        : STRUCTURED_GRAPH_WINDOW_TURNS;
       const graphWindowStartTurn = Math.max(
         1,
-        windowEndTurn - STRUCTURED_GRAPH_WINDOW_TURNS + 1
+        windowEndTurn - graphWindowTurnCount + 1
       );
       const graphRangeTurns = selectMessagesForAssistantTurnRange(
         all,
@@ -1217,139 +1543,31 @@ export async function POST(req: Request) {
       const graphWindowText = stripUrlsAndMediaMarkdown(
         formatTurnsLocal(graphRangeTurns)
       );
-      const structuredGraph = await extractStructuredCharacterGraph({
-        rawWindowText: graphWindowText,
+      const graphOutcome = await refreshStructuredCharacterState({
+        chatId,
         personaName,
-        existingCharacters: loadStructuredCharacterIdentities(chatId),
-        llmOpts: {
-          model: summaryModel,
-          maxOutputTokens: 4096,
-          maxReasoningTokens: 128,
-          thinkingBudget: 128,
-        },
-        windowStartTurn: graphWindowStartTurn,
-        windowEndTurn,
+        summaryModel,
+        graphWindowText,
+        graphWindowStartTurn,
+        graphWindowEndTurn: windowEndTurn,
+        now,
       });
-      let detected: AutoDetectedCharacter[] = [];
-      if (structuredGraph.ok) {
-        const applied = applyStructuredCharacterGraph({
-          chatId,
-          personaName,
-          graph: structuredGraph,
-          turnNo: windowEndTurn,
-        });
-        autoCharactersAdded = applied.charactersAdded;
-        autoAliasesUpdated = applied.aliasesUpdated;
-        autoRelationshipsUpserted = applied.relationshipsUpserted;
-        structuredGraphRefreshed = true;
-      } else {
-        // JSON 구조화 출력 자체가 실패한 경우에만 기존 strict 이름 추출기로 복구한다.
-        detected = await detectCharactersFromWindow({
-          rawWindowText: graphWindowText,
-          personaName,
-          existingNames,
-          llmOpts: {
-            model: summaryModel,
-            maxOutputTokens: 600,
-            maxReasoningTokens: 0,
-            thinkingBudget: 0,
-          },
-          windowStartTurn: graphWindowStartTurn,
-          windowEndTurn,
-        });
-      }
-
-      if (detected.length > 0) {
-        const insertStmt = db.prepare(
-          `INSERT INTO chat_character_roster
-             (id, chatId, name, aliases, role, profile, relationshipNote, emotionNote, status, enabled, createdAt, updatedAt)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(chatId, name) DO NOTHING`
-        );
-        // (최적화) WAL 모드에서 INSERT 마다 fsync 발생을 방지 — 단일 트랜잭션으로 묶음.
-        const inserted: string[] = [];
-        const insertMany = db.transaction((items: AutoDetectedCharacter[]) => {
-          for (const c of items) {
-            const profileText = c.profile ? `(자동 탐지) ${c.profile}` : "(자동 탐지)";
-            const res = insertStmt.run(
-              randomUUID(),
-              chatId,
-              c.name,
-              encryptIfPossible(""),
-              encryptIfPossible(""),
-              encryptIfPossible(profileText),
-              encryptIfPossible(""),
-              encryptIfPossible(""),
-              encryptIfPossible(""),
-              1,
-              now,
-              now
-            );
-            if (Number((res as any)?.changes || 0) > 0) inserted.push(c.name);
-          }
-        });
-        insertMany(detected);
-        autoCharactersAdded = inserted;
-      }
-    } catch {
-      // detection 실패는 silent
-      autoCharactersAdded = [];
-      autoAliasesUpdated = [];
-      autoRelationshipsUpserted = 0;
+      autoCharactersAdded = graphOutcome.autoCharactersAdded;
+      autoAliasesUpdated = graphOutcome.autoAliasesUpdated;
+      autoRelationshipsUpserted = graphOutcome.autoRelationshipsUpserted;
+      structuredGraphParsed = graphOutcome.structuredGraphParsed;
+      structuredGraphRefreshed = graphOutcome.structuredGraphRefreshed;
+      structuredGraphFallbackUsed = graphOutcome.fallbackUsed;
+      structuredGraphCandidateNames = graphOutcome.candidateNames;
+      structuredGraphMissingCandidateNames = graphOutcome.missingCandidateNames;
     }
-    // ────────────────────────────────────────────────────────────────────
 
-    // ─── (자동 캐릭터 backfill) ─────────────────────────────────────────
-    // 새로 자동 등록된 캐릭터가 있으면 직전 N턴(=AUTO_CHARACTER_BACKFILL_TURNS)에 대해
-    // /api/chat/characters/refresh를 자가 호출해 chat_character_turn_memories를 채운다.
-    // - 등록된 시점 이전 등장은 retroactive로 안 잡히는 한계를 보완 (사용자가 "/chars" 보고
-    //   '기록 0개'로 보이는 혼란 해소).
-    // - characters/refresh는 strict한 isDirectPersonaCharacterConversation 가드를 통과해야
-    //   저장하므로, 단순 등장만 한 turn은 여전히 0개일 수 있음(의도된 정책).
-    // - 실패는 silent. 갱신 응답은 영향 받지 않는다.
-    const AUTO_CHARACTER_BACKFILL_TURNS = 6;
-    let autoCharactersBackfilled: { turns: number; savedCount: number } | null = null;
-    if (autoCharactersAdded.length > 0) {
-      try {
-        const recentAssistantIds = db
-          .prepare(
-            `SELECT id FROM messages
-             WHERE chatId=? AND (role='assistant' OR role='model')
-             ORDER BY createdAt DESC, id DESC
-             LIMIT ?`
-          )
-          .all(chatId, AUTO_CHARACTER_BACKFILL_TURNS) as Array<{ id: string }>;
-        const ids = recentAssistantIds.map((r) => String(r?.id || "")).filter(Boolean);
-        if (ids.length > 0) {
-          const origin = new URL(req.url).origin;
-          const refreshUrl = `${origin}/api/chat/characters/refresh`;
-          const cookieHdr = req.headers.get("cookie") || "";
-          const results = await Promise.allSettled(
-            ids.map((assistantMessageId) =>
-              fetch(refreshUrl, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  ...(cookieHdr ? { cookie: cookieHdr } : {}),
-                },
-                body: JSON.stringify({ chatId, assistantMessageId }),
-              }).then((r) => r.json().catch(() => null))
-            )
-          );
-          let savedCount = 0;
-          for (const r of results) {
-            if (r.status === "fulfilled" && r.value && typeof r.value === "object") {
-              savedCount += Math.max(0, Number((r.value as any).saved || 0));
-            }
-          }
-          autoCharactersBackfilled = { turns: ids.length, savedCount };
-        }
-      } catch {
-        // ignore — backfill 실패가 refresh 자체를 깨지 않게
-        autoCharactersBackfilled = null;
-      }
-    }
-    // ────────────────────────────────────────────────────────────────────
+    const autoCharactersBackfilled = await backfillAutoCharacterMemories({
+      req,
+      chatId,
+      autoCharactersAdded,
+      turnLimit: Math.min(AUTO_CHARACTER_BACKFILL_TURNS, windowEndTurn),
+    }).catch(() => null);
 
     const morePending = nextEndTurn < boundaryEndTurn;
 
@@ -1371,7 +1589,11 @@ export async function POST(req: Request) {
       autoCharactersBackfilled,
       autoAliasesUpdated,
       autoRelationshipsUpserted,
+      structuredGraphParsed,
       structuredGraphRefreshed,
+      structuredGraphFallbackUsed,
+      structuredGraphCandidateNames,
+      structuredGraphMissingCandidateNames,
       structuredGraphWindowTurns: STRUCTURED_GRAPH_WINDOW_TURNS,
       policy: {
         summaryEvery: summaryEveryVal,

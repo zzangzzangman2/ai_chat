@@ -102,6 +102,11 @@ export async function POST(req: Request) {
     const personaName =
       configuredPersonaName ||
       inferPersonaNameFromMessages(messages);
+    if (!configuredPersonaName && personaName) {
+      db.prepare(
+        `UPDATE chat_settings SET personaName=?, updatedAt=? WHERE chatId=?`
+      ).run(personaName, Date.now(), chatId);
+    }
     const canon = deriveIdentityCanon({
       messages,
       knownNames: roster.map((row) => String(row?.name || "")),
