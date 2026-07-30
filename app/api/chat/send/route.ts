@@ -17,14 +17,15 @@ import {
 } from "@/lib/relationship_memory";
 import {
   buildIdentityCanonBlock,
+  formatIdentityCanonBlock,
   inferPersonaNameFromMessages,
 } from "@/lib/identity_memory";
 import { syncCharacterVitals } from "@/lib/character_vitals";
 import {
-  formatRelationshipGraphBlock,
   loadRelationshipGraph,
   syncIdentityCanonRelations,
 } from "@/lib/relationship_graph";
+import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -1729,7 +1730,14 @@ ${body}`.trim();
       personaName: personaNameFinal,
       characterSources: continuityIdentities,
     });
-    let relationshipGraphBlock = "";
+    let dynamicCharacterContext = {
+      block: "",
+      focusedRosterIds: [] as string[],
+      focusedNames: [] as string[],
+      includedNames: [] as string[],
+      relationshipCount: 0,
+      eventCount: 0,
+    };
     try {
       syncIdentityCanonRelations({
         chatId: cid,
@@ -1743,23 +1751,67 @@ ${body}`.trim();
         personaName: personaNameFinal,
         personaAge: personaAgeFinal,
       });
-      relationshipGraphBlock = formatRelationshipGraphBlock(loadRelationshipGraph(cid));
+      dynamicCharacterContext = buildDynamicCharacterContext({
+        chatId: cid,
+        personaName: personaNameFinal,
+        focusText: characterFocusText,
+        graph: loadRelationshipGraph(cid),
+        maxJsonChars: 5200,
+      });
     } catch {
-      relationshipGraphBlock = "";
+      // 관계 기억 조회 실패가 본 대화 생성을 막지 않게 한다.
     }
-    const identityCanonBlock = [identityCanon.block, relationshipGraphBlock]
-      .filter(Boolean)
-      .join("\n\n");
-    const manualCharacterRosterBlock = buildManualCharacterRosterBlock(
-      cid,
-      characterFocusText,
-      personaNameFinal
+    const focusedCanonNames = new Set(
+      [
+        personaNameFinal,
+        ...dynamicCharacterContext.focusedNames,
+        ...dynamicCharacterContext.includedNames,
+      ]
+        .map((value) => String(value || "").trim().toLocaleLowerCase("ko-KR"))
+        .filter(Boolean)
     );
+    const focusedCharacterCanonNames = new Set(
+      dynamicCharacterContext.focusedNames
+        .map((value) => String(value || "").trim().toLocaleLowerCase("ko-KR"))
+        .filter(Boolean)
+    );
+    const canonNameMatches = (value: unknown, names: Set<string>) => {
+      const text = String(value || "").trim().toLocaleLowerCase("ko-KR");
+      if (!text) return false;
+      for (const name of names) {
+        if (text === name || text.includes(name) || name.includes(text)) return true;
+      }
+      return false;
+    };
+    const canonNameMatchesFocus = (value: unknown) =>
+      canonNameMatches(value, focusedCanonNames);
+    const canonNameMatchesFocusedCharacter = (value: unknown) =>
+      canonNameMatches(value, focusedCharacterCanonNames);
+    const identityCanonForPrompt = {
+      ...identityCanon.canon,
+      nameFacts: identityCanon.canon.nameFacts.filter(
+        (fact) =>
+          canonNameMatchesFocus(fact.canonicalName) ||
+          fact.aliases.some(canonNameMatchesFocus) ||
+          canonNameMatchesFocus(fact.subject)
+      ),
+      roleAnchors: identityCanon.canon.roleAnchors.filter(
+        (anchor) =>
+          canonNameMatchesFocusedCharacter(anchor.subjectName) ||
+          canonNameMatchesFocusedCharacter(anchor.relatedName)
+      ),
+    };
+    const identityCanonBlock = formatIdentityCanonBlock(identityCanonForPrompt);
+    // 새 동적 조회가 비어 있거나 DB 조회에 실패한 경우에만 기존 등록 캐릭터
+    // 블록을 복구 경로로 사용한다. 정상 경로에서는 두 기억 블록을 중복 주입하지 않는다.
+    const manualCharacterRosterFallback = dynamicCharacterContext.block
+      ? ""
+      : buildManualCharacterRosterBlock(cid, characterFocusText, personaNameFinal);
     const historySummaryForPrompt = [
       continuityLedger.block,
       hybridMemory.currentArcText,
       relatedArchiveText,
-      manualCharacterRosterBlock,
+      manualCharacterRosterFallback,
     ]
       .filter((x) => String(x || "").trim())
       .join("\n\n");
@@ -1774,7 +1826,11 @@ ${body}`.trim();
       pickedChars: strlen(relatedArchiveText),
       continuityStates: continuityLedger.states,
       continuityChars: strlen(continuityLedger.block),
-      manualCharacterRosterChars: strlen(manualCharacterRosterBlock),
+      dynamicCharacterContextChars: strlen(dynamicCharacterContext.block),
+      dynamicCharacterFocus: dynamicCharacterContext.focusedNames,
+      dynamicRelationshipCount: dynamicCharacterContext.relationshipCount,
+      dynamicEventCount: dynamicCharacterContext.eventCount,
+      manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
       identityCanonChars: strlen(identityCanonBlock),
       identityNameFacts: identityCanon.canon.nameFacts.length,
       identityRoleAnchors: identityCanon.canon.roleAnchors.length,
@@ -2242,6 +2298,10 @@ const worldDirectorBlock = currentOocInstruction
 const cacheFriendlyLayout = String(process.env.AI_CACHE_FRIENDLY_PROMPT || "1").trim() !== "0";
 const systemRaw = (cacheFriendlyLayout
     ? [
+        dynamicCharacterContext.block
+          ? sanitizePromptCached(dynamicCharacterContext.block)
+          : "",
+        dynamicCharacterContext.block ? `` : "",
         `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
         ``,
         sanitizePromptCached(presetBlock),
@@ -2263,6 +2323,10 @@ const systemRaw = (cacheFriendlyLayout
         worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
       ]
     : [
+        dynamicCharacterContext.block
+          ? sanitizePromptCached(dynamicCharacterContext.block)
+          : "",
+        dynamicCharacterContext.block ? `` : "",
         `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
         ``,
         sanitizePromptCached(presetBlock),
@@ -2299,7 +2363,7 @@ const systemRaw = (cacheFriendlyLayout
         ].join("\n")
       : "";
     const system = currentOocPriorityBlock
-      ? `${systemWithIdentityCanon}\n\n${currentOocPriorityBlock}`
+      ? `${currentOocPriorityBlock}\n\n${systemWithIdentityCanon}`
       : systemWithIdentityCanon;
 
 		    // (변경) 상태창을 포함한 응답을 '한 번의 호출'로 생성한다.
@@ -2399,7 +2463,9 @@ const systemRaw = (cacheFriendlyLayout
     ) {
       const longMemoryChars = strlen(historySummaryForPrompt);
       const recentChars = strlen(context);
-      const rosterChars = strlen(manualCharacterRosterBlock);
+      const rosterChars = strlen(
+        dynamicCharacterContext.block || manualCharacterRosterFallback
+      );
       const contextHits: string[] = [];
       const intentHits: string[] = [];
 

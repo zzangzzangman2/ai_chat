@@ -1185,14 +1185,19 @@ export async function POST(req: Request) {
     });
     memoryBlocksBackfilled += 1;
 
-    // ─── (자동 캐릭터 탐지) ─────────────────────────────────────────────
-    // 같은 윈도우의 raw 텍스트(cleanedText)에서 신규 인물 후보를 strict 추출.
-    // - 수동 등록 캐릭터는 ON CONFLICT DO NOTHING 으로 절대 안 건드림.
-    // - 탐지 실패는 무시(요약 저장 결과에 영향 X).
+    // ─── (주기적 구조화 관계도 갱신) ─────────────────────────────────────
+    // 장기기억 요약은 3턴마다 유지하되, 별도 Gemini 구조화 호출은 12턴을
+    // 모았을 때만 실행한다. 메인 채팅 응답과는 이미 분리된 background 요청이다.
+    // 같은 12턴 원문과 기존 roster/graph를 함께 사용하므로 매 턴 재추출하지 않는다.
+    const STRUCTURED_GRAPH_WINDOW_TURNS = 12;
+    const shouldRefreshStructuredGraph =
+      windowEndTurn >= STRUCTURED_GRAPH_WINDOW_TURNS &&
+      windowEndTurn % STRUCTURED_GRAPH_WINDOW_TURNS === 0;
     let autoCharactersAdded: string[] = [];
     let autoAliasesUpdated: string[] = [];
     let autoRelationshipsUpserted = 0;
-    try {
+    let structuredGraphRefreshed = false;
+    if (shouldRefreshStructuredGraph) try {
       const existingRosterRows = db
         .prepare(`SELECT name FROM chat_character_roster WHERE chatId=?`)
         .all(chatId) as Array<{ name: string }>;
@@ -1200,8 +1205,20 @@ export async function POST(req: Request) {
         existingRosterRows.map((r) => String(r?.name || "").trim()).filter(Boolean)
       );
 
+      const graphWindowStartTurn = Math.max(
+        1,
+        windowEndTurn - STRUCTURED_GRAPH_WINDOW_TURNS + 1
+      );
+      const graphRangeTurns = selectMessagesForAssistantTurnRange(
+        all,
+        graphWindowStartTurn,
+        windowEndTurn
+      );
+      const graphWindowText = stripUrlsAndMediaMarkdown(
+        formatTurnsLocal(graphRangeTurns)
+      );
       const structuredGraph = await extractStructuredCharacterGraph({
-        rawWindowText: cleanedText,
+        rawWindowText: graphWindowText,
         personaName,
         existingCharacters: loadStructuredCharacterIdentities(chatId),
         llmOpts: {
@@ -1210,7 +1227,7 @@ export async function POST(req: Request) {
           maxReasoningTokens: 128,
           thinkingBudget: 128,
         },
-        windowStartTurn,
+        windowStartTurn: graphWindowStartTurn,
         windowEndTurn,
       });
       let detected: AutoDetectedCharacter[] = [];
@@ -1224,10 +1241,11 @@ export async function POST(req: Request) {
         autoCharactersAdded = applied.charactersAdded;
         autoAliasesUpdated = applied.aliasesUpdated;
         autoRelationshipsUpserted = applied.relationshipsUpserted;
+        structuredGraphRefreshed = true;
       } else {
         // JSON 구조화 출력 자체가 실패한 경우에만 기존 strict 이름 추출기로 복구한다.
         detected = await detectCharactersFromWindow({
-          rawWindowText: cleanedText,
+          rawWindowText: graphWindowText,
           personaName,
           existingNames,
           llmOpts: {
@@ -1236,7 +1254,7 @@ export async function POST(req: Request) {
             maxReasoningTokens: 0,
             thinkingBudget: 0,
           },
-          windowStartTurn,
+          windowStartTurn: graphWindowStartTurn,
           windowEndTurn,
         });
       }
@@ -1353,6 +1371,8 @@ export async function POST(req: Request) {
       autoCharactersBackfilled,
       autoAliasesUpdated,
       autoRelationshipsUpserted,
+      structuredGraphRefreshed,
+      structuredGraphWindowTurns: STRUCTURED_GRAPH_WINDOW_TURNS,
       policy: {
         summaryEvery: summaryEveryVal,
         perTurnChars: perTurnCharsVal,
