@@ -341,11 +341,24 @@ export function analyzeIdentityCanonDrift(params: {
   const rejectedNames: string[] = [];
 
   for (const fact of params.canon.nameFacts) {
-    const references = [fact.canonicalName, ...fact.aliases, fact.subject].filter(Boolean);
+    const references = [
+      fact.canonicalName,
+      ...fact.aliases,
+      fact.subject,
+      fact.subjectKey,
+    ].filter(Boolean);
     const relevant = references.some((value) => containsName(source, value));
     if (!relevant) continue;
 
+    const sourceHasExplicitNameAssignment =
+      [fact.subject, fact.subjectKey].some((subject) => {
+        const escaped = subject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`${escaped}\\s*(?:의\\s*)?이름`, "u").test(source);
+      }) && containsName(source, fact.canonicalName);
     const summaryReferencesEntity = references.some((value) => containsName(summary, value));
+    if (sourceHasExplicitNameAssignment && !containsName(summary, fact.canonicalName)) {
+      missingCanonicalNames.push(fact.canonicalName);
+    }
     if (summaryReferencesEntity && !containsName(summary, fact.canonicalName)) {
       missingCanonicalNames.push(fact.canonicalName);
     }
