@@ -31,6 +31,8 @@ type StoredTurnMemoryRow = {
   turnNo?: unknown;
   summary?: unknown;
   evidence?: unknown;
+  memoryType?: unknown;
+  importance?: unknown;
 };
 
 type DynamicCharacterPayload = {
@@ -302,7 +304,7 @@ export function buildDynamicCharacterContext(params: {
     focusedRosterIds.length > 0
       ? (db
           .prepare(
-            `SELECT rosterId, turnNo, summary, evidence
+            `SELECT rosterId, turnNo, summary, evidence, memoryType, importance
              FROM chat_character_turn_memories
              WHERE chatId=? AND rosterId IN (${focusedRosterIds
                .map(() => "?")
@@ -311,13 +313,20 @@ export function buildDynamicCharacterContext(params: {
           )
           .all(chatId, ...focusedRosterIds) as StoredTurnMemoryRow[])
       : [];
-  const memories = selectConservativeMemoryRows(
-    memoryCandidates.map((memory) => ({
+  const normalizedMemoryCandidates = memoryCandidates.map((memory) => ({
       rosterId: cleanText(memory?.rosterId, 120),
       turnNo: Math.max(0, Number(memory?.turnNo || 0)),
       summary: decryptIfPossible(String(memory?.summary || "")),
       evidence: decryptIfPossible(String(memory?.evidence || "")),
-    }))
+      memoryType: cleanText(memory?.memoryType, 40) || "none",
+      importance: Math.max(1, Math.min(3, Number(memory?.importance || 1))),
+    }));
+  const durableMemories = normalizedMemoryCandidates.filter((memory) => memory.importance >= 2);
+  const recentEpisodicMemories = normalizedMemoryCandidates
+    .filter((memory) => memory.importance < 2)
+    .slice(-12);
+  const memories = selectConservativeMemoryRows(
+    [...durableMemories, ...recentEpisodicMemories].sort((a, b) => a.turnNo - b.turnNo)
   );
   const eventSeen = new Set<string>();
   const majorEvents = memories
@@ -334,6 +343,8 @@ export function buildDynamicCharacterContext(params: {
         turn: Math.max(0, Number(memory?.turnNo || 0)),
         character_id: rosterId,
         event,
+        memory_type: cleanText((memory as any)?.memoryType, 40) || "none",
+        importance: Math.max(1, Math.min(3, Number((memory as any)?.importance || 1))),
       };
     })
     .filter(Boolean) as Array<Record<string, unknown>>;

@@ -23,6 +23,7 @@ import {
   isCoreMemoryCandidate,
   isNearDuplicateMemory,
   isSaturatedMemoryTheme,
+  clampMemoryImportance,
   normalizeCoreMemoryType,
   selectConservativeMemoryRows,
 } from "@/lib/character_memory_quality";
@@ -254,6 +255,43 @@ function isDirectPersonaCharacterConversation(row: any, userText: unknown, assis
   return hasSpeakerLine(assistantText, names) || hasQuotedSpeechNearName(assistantText, names);
 }
 
+function deterministicConversationItem(
+  row: any,
+  userText: unknown,
+  assistantText: unknown,
+  personaName: string
+) {
+  const id = String(row?.id || "").trim();
+  const name = cleanText(row?.name, 80);
+  if (!id || !name || !isDirectPersonaCharacterConversation(row, userText, assistantText)) return null;
+
+  const userSnippet = oneSentenceSummary(userText, personaName) || "대화를 건 일";
+  const evidenceBlock = String(assistantText || "")
+    .split(/\n\s*\n+/g)
+    .map((block) => block.trim())
+    .find((block) => textHasCharacterName(block, characterNames(row)));
+  const evidence = cleanText(
+    (evidenceBlock || String(assistantText || ""))
+      .replace(/https?:\/\/\S+/gi, "")
+      .replace(/[*_`#>]/g, " ")
+      .replace(/\s+/g, " "),
+    300
+  );
+
+  return {
+    id,
+    present: true,
+    shouldRemember: false,
+    memoryType: "unresolved",
+    importance: 1,
+    summary: `${name}은 ${personaName}의 ${userSnippet}에 직접 반응하며 대화를 이어갔어.`,
+    evidence,
+    affinityDelta: 0,
+    affinityReason: "자동 복구된 직접 대화라 호감도 변화는 보류",
+    deterministicFallback: true,
+  };
+}
+
 function oneSentenceSummary(text: unknown, personaName: string) {
   let out = cleanText(replaceGenericPersonaRefs(String(text || ""), personaName), 500)
     .replace(/\s+/g, " ")
@@ -406,8 +444,8 @@ export async function POST(req: Request) {
     const system = [
       "You update a Korean novel-chat character encounter ledger.",
       "Registered characters are memory targets, but a name mention, presence, action, or reaction alone is not a saved encounter.",
-      "This ledger is durable long-term memory, not a transcript of every direct conversation.",
-      "A direct conversation can have present=true while shouldRemember=false.",
+      "This ledger keeps both durable long-term memory and a compact episodic history of direct conversations.",
+      "A direct conversation can have present=true while shouldRemember=false; still provide an accurate one-sentence candidate summary so the server can keep it as recent episodic history.",
       "Set shouldRemember=true only for a new durable identity fact, relationship/title change, promise/secret/debt, major event with lasting consequence, persistent status change, or important unresolved issue.",
       "Routine questions, greetings, compliments, jokes, ordinary actions, and repeated anger/fear/insults/pleas/refusals must have shouldRemember=false.",
       "Compare with existing_core_memories. If the new turn merely repeats an already stored fact, event, emotional stance, threat, or conflict, set shouldRemember=false.",
@@ -470,22 +508,60 @@ export async function POST(req: Request) {
     ].join("\n");
 
     const model = String(process.env.CHARACTER_TURN_MEMORY_MODEL || "gemini-3.6-flash").trim();
-    const r = await generateText({
-      system,
-      user,
-      opts: {
-        model,
-        maxOutputTokens: 2048,
-        maxReasoningTokens: 0,
-        thinkingBudget: 0,
-        temperature: 0.1,
-        topP: 0.8,
-      },
-    });
+    let parsed: any = null;
+    let generationError = "";
+    try {
+      const r = await generateText({
+        system,
+        user,
+        opts: {
+          model,
+          maxOutputTokens: 2048,
+          maxReasoningTokens: 0,
+          thinkingBudget: 0,
+          temperature: 0.1,
+          topP: 0.8,
+        },
+      });
+      parsed = extractJson(String(r?.text || ""));
+      if (!parsed) generationError = "no_memory_json";
+    } catch (error: any) {
+      generationError = cleanText(error?.message || "character_memory_generation_failed", 300);
+    }
 
-    const parsed = extractJson(String(r?.text || ""));
-    if (!parsed) return NextResponse.json({ ok: true, skipped: true, reason: "no_memory_json", turnNo, saved: 0, items: [] });
     const items = asArray(parsed);
+    let deterministicFallbackCount = 0;
+    if (prevUser) {
+      for (const row of roster) {
+        const fallback = deterministicConversationItem(
+          row,
+          prevUser.content,
+          assistant.content,
+          personaName
+        );
+        if (!fallback) continue;
+        const existingIndex = items.findIndex(
+          (item) => String(item?.id || "").trim() === fallback.id
+        );
+        if (existingIndex >= 0 && items[existingIndex]?.present === true) continue;
+        if (existingIndex >= 0) items.splice(existingIndex, 1, fallback);
+        else items.push(fallback);
+        deterministicFallbackCount += 1;
+      }
+    }
+
+    if (!items.length) {
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: generationError || "no_direct_character_conversation",
+        turnNo,
+        evaluated: 0,
+        saved: 0,
+        items: [],
+        deterministicFallbackCount,
+      });
+    }
     const rosterById = new Map(roster.map((row: any) => [String(row.id || ""), row]));
     const now = Date.now();
     let saved = 0;
@@ -495,12 +571,14 @@ export async function POST(req: Request) {
     // (최적화) DELETE + INSERT 루프를 단일 트랜잭션으로 묶어 fsync per row 회피.
     const insertStmt = db.prepare(
       `INSERT INTO chat_character_turn_memories
-         (chatId, rosterId, characterName, turnNo, summary, evidence, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         (chatId, rosterId, characterName, turnNo, summary, evidence, memoryType, importance, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(chatId, rosterId, turnNo) DO UPDATE SET
          characterName=excluded.characterName,
          summary=excluded.summary,
          evidence=excluded.evidence,
+         memoryType=excluded.memoryType,
+         importance=excluded.importance,
          updatedAt=excluded.updatedAt`
     );
     const deleteStmt = db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo=?`);
@@ -534,29 +612,37 @@ export async function POST(req: Request) {
         const fallbackMemoryType = inferCriticalCoreMemoryType(
           `${summary} ${evidence}`
         );
-        const memoryType =
+        let memoryType =
           fallbackMemoryType !== "none" ? fallbackMemoryType : modelMemoryType;
         const serverRecovered = fallbackMemoryType !== "none";
-        if (item?.shouldRemember !== true && !serverRecovered) continue;
-        const importance = Math.max(
-          Number(item?.importance || 0),
+        const modelImportance = clampMemoryImportance(item?.importance);
+        const durableRequested = item?.shouldRemember === true || serverRecovered;
+        let importance = Math.max(
+          modelImportance,
           serverRecovered ? 3 : 0
         );
-        if (
-          !isCoreMemoryCandidate({
+        const durable =
+          durableRequested &&
+          isCoreMemoryCandidate({
             memoryType,
             importance,
             summary,
             evidence,
-          })
-        ) {
-          continue;
+          });
+
+        // 직접 대화가 실제로 있었지만 영구 정사 기준에는 못 미친 턴도
+        // 최근 에피소드 기억으로 보존한다. 중요도 1은 UI와 최근 연속성에만
+        // 사용하고, 오래 유지할 핵심 정사(2~3)와 구분한다.
+        if (!durable) {
+          importance = 1;
+          if (memoryType === "none") memoryType = "unresolved";
         }
         const recentRows = recentMemoriesByRoster.get(id) || [];
         const recentMemoryTexts = recentRows.map(
           (memory) => `${memory.summary} ${memory.evidence}`
         );
         if (
+          durable &&
           memoryType === "major_event" &&
           isSaturatedMemoryTheme(
             `${summary} ${evidence}`,
@@ -583,7 +669,18 @@ export async function POST(req: Request) {
         });
         if (!identityDrift.ok) continue;
 
-        insertStmt.run(chatId, id, name, turnNo, encryptIfPossible(summary), encryptIfPossible(evidence), now, now);
+        insertStmt.run(
+          chatId,
+          id,
+          name,
+          turnNo,
+          encryptIfPossible(summary),
+          encryptIfPossible(evidence),
+          memoryType,
+          importance,
+          now,
+          now
+        );
         recentRows.push({ rosterId: id, turnNo, summary, evidence });
         recentMemoriesByRoster.set(id, recentRows);
         saved += 1;
@@ -601,7 +698,15 @@ export async function POST(req: Request) {
     });
     writeAll(items);
 
-    return NextResponse.json({ ok: true, turnNo, evaluated, saved, items: savedItems });
+    return NextResponse.json({
+      ok: true,
+      turnNo,
+      evaluated,
+      saved,
+      items: savedItems,
+      deterministicFallbackCount,
+      generationError: generationError || undefined,
+    });
   } catch (e: any) {
     console.error("/api/chat/characters/refresh error", e);
     return bad(e?.message || "character_refresh_failed", 500);

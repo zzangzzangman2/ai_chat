@@ -375,6 +375,41 @@ export function isOocMetaInstruction(text: string): boolean {
     .some((line) => /^\s*(?:\[\s*|\(\(\s*)?ooc\b(?:\s*[:：]|\s|\]|\)\)|$)/i.test(line));
 }
 
+export function hasExplicitNovelNarration(text: string): boolean {
+  return /\*[^*\n]+\*/u.test(String(text || ""));
+}
+
+function splitNovelUserChannels(text: string): string {
+  const source = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!source) return '""';
+
+  const out: string[] = [];
+  const pushDialogue = (value: string) => {
+    const chunks = String(value || "")
+      .split(/\n{2,}|\n/g)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean);
+    for (const chunk of chunks) out.push(ensureQuoted(chunk));
+  };
+
+  // 사용자는 한 입력 안에서 `*지문* 대사 *지문*`을 자연스럽게 섞어 쓴다.
+  // 입력 전체의 첫/끝 문자만 검사하면 닫힌 지문 뒤의 대사까지 한 덩어리로
+  // 따옴표 처리되므로, 닫힌 *...* 구간을 기준으로 채널을 분리한다.
+  const narration = /\*[^*\n]+\*/gu;
+  let cursor = 0;
+  let matched = false;
+  for (const match of source.matchAll(narration)) {
+    const index = Number(match.index || 0);
+    pushDialogue(source.slice(cursor, index));
+    out.push(String(match[0] || "").trim());
+    cursor = index + String(match[0] || "").length;
+    matched = true;
+  }
+  pushDialogue(source.slice(cursor));
+
+  return (matched ? out.join("\n\n") : ensureQuoted(source)).trim();
+}
+
 export function buildUserLineForMode(userText: string, personaName: string, mode: "chat" | "novel"): string {
   const rawUserText = String(userText || "").trim();
   // OOC는 캐릭터의 대사가 아니라 사이트 전역 메타 지시다.
@@ -394,7 +429,7 @@ export function buildUserLineForMode(userText: string, personaName: string, mode
     return `${speaker} | ${content}`;
   }
   // novel: 기본은 큰따옴표(대사)로 보내되, 사용자가 명시한 형식은 보존한다.
-  // - *지문* 은 지문으로 그대로 전달
+  // - 한 입력 안의 *지문* / 대사를 구간별로 분리해 그대로 전달
   // - ```ANY_LABEL ...``` 메타 패널은 그대로 전달
   // - 이미 따옴표로 감싼 대사는 유지(끝따옴표만 보정)
   const stripped = String(stripSpeakerPrefixLine(rawUserText) || "").trim();
@@ -403,11 +438,7 @@ export function buildUserLineForMode(userText: string, personaName: string, mode
   // fenced meta block (any label) - preserve as-is
   if (/^```/.test(stripped)) return stripped;
 
-  // narration explicitly marked
-  if (stripped.startsWith("*") && stripped.endsWith("*")) return stripped;
-
-  // default: dialogue
-  return ensureQuoted(stripped);
+  return splitNovelUserChannels(stripped);
 }
 
 export function stripNamePrefixFromNarration(line: string) {

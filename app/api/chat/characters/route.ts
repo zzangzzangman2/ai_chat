@@ -64,6 +64,8 @@ function memoryRowForClient(row: any, personaName = "") {
     turnNo: Number(row?.turnNo || 0),
     summary: replaceGenericPersonaRefs(decryptIfPossible(String(row?.summary || "")), personaName),
     evidence: replaceGenericPersonaRefs(decryptIfPossible(String(row?.evidence || "")), personaName),
+    memoryType: cleanText(row?.memoryType, 40) || "none",
+    importance: Math.max(1, Math.min(3, Number(row?.importance || 1))),
     updatedAt: Number(row?.updatedAt || 0),
   };
 }
@@ -135,7 +137,7 @@ export async function GET(req: Request) {
     );
     const rows = db
       .prepare(
-        `SELECT rosterId, turnNo, summary, evidence, updatedAt
+        `SELECT rosterId, turnNo, summary, evidence, memoryType, importance, updatedAt
          FROM chat_character_turn_memories
          WHERE chatId=? AND rosterId=?
          ORDER BY turnNo ASC
@@ -186,7 +188,7 @@ export async function GET(req: Request) {
 
   const memories = db
     .prepare(
-      `SELECT rosterId, turnNo, summary, evidence, updatedAt
+      `SELECT rosterId, turnNo, summary, evidence, memoryType, importance, updatedAt
        FROM chat_character_turn_memories
        WHERE chatId=?
        ORDER BY turnNo ASC`

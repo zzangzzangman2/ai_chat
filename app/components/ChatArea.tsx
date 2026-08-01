@@ -688,6 +688,10 @@ export default function ChatArea(props: {
   // - 모바일(좁은 화면)에서는 기존처럼 drawer(overlay)로 유지
     const isMemoryDock =
       effectiveSettingsOpen && (settingsView === "memory" || settingsView === "relations") && !isMobile;
+    // 관계도는 독립 캔버스로 본다. 데스크톱에서는 채팅 컬럼을
+    // 잠시 숨겨 긴 관계 라벨과 많은 인물이 충분한 폭을 쓰게 한다.
+    const isRelationshipFocus =
+      effectiveSettingsOpen && settingsView === "relations" && !isMobile;
 
   // 페르소나 프로필(여러 개 저장/선택)
   const [profileModalOpen] = useState(false);
@@ -4353,6 +4357,7 @@ const lastAssistantSuggestSummaryRef = useRef<string>("");
         // 탭 전환이나 일시적인 네트워크 오류로 요청 하나가 빠져도 최대 3회 재시도한다.
         void (async () => {
           const wait = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+          let lastRefreshError = "";
           const refreshOnce = async () => {
             for (let attempt = 0; attempt < 3; attempt += 1) {
               try {
@@ -4368,11 +4373,15 @@ const lastAssistantSuggestSummaryRef = useRef<string>("");
                   }),
                   keepalive: true,
                 });
-                if (!res.ok) throw new Error(`memory_refresh_http_${res.status}`);
+                if (!res.ok) throw new Error(`장기기억 갱신 HTTP ${res.status}`);
                 const body = (await res.json().catch(() => null)) as any;
-                if (!body || body.ok === false) throw new Error("memory_refresh_invalid_response");
+                if (!body || body.ok === false) {
+                  throw new Error(String(body?.error || "장기기억 갱신 응답이 올바르지 않습니다."));
+                }
+                lastRefreshError = "";
                 return body;
-              } catch {
+              } catch (cause: any) {
+                lastRefreshError = String(cause?.message || "장기기억 갱신에 실패했습니다.");
                 if (attempt >= 2) return null;
                 await wait(600 * (attempt + 1));
               }
@@ -4382,12 +4391,22 @@ const lastAssistantSuggestSummaryRef = useRef<string>("");
 
           for (let windowIndex = 0; windowIndex < 8; windowIndex += 1) {
             const body = await refreshOnce();
-            if (!body) break;
+            if (!body) {
+              try {
+                window.dispatchEvent(
+                  new CustomEvent("mate:memory-refreshed", {
+                    detail: { chatId: refreshChatId, kind: "summary", error: lastRefreshError },
+                  })
+                );
+              } catch {}
+              break;
+            }
             try {
               window.dispatchEvent(
                 new CustomEvent("mate:memory-refreshed", {
                   detail: {
                     chatId: refreshChatId,
+                    kind: "summary",
                     refreshed: !!body?.refreshed,
                     skipped: !!body?.skipped,
                     reason: String(body?.reason || ""),
@@ -4417,12 +4436,38 @@ const lastAssistantSuggestSummaryRef = useRef<string>("");
           body: JSON.stringify({ chatId: refreshChatId, assistantMessageId: mid }),
           keepalive: true,
         })
-          .then(() => {
+          .then(async (response) => {
+            const body = (await response.json().catch(() => null)) as any;
+            if (!response.ok || !body || body.ok === false) {
+              throw new Error(String(body?.error || `개별 기억 갱신 HTTP ${response.status}`));
+            }
             try {
-              window.dispatchEvent(new CustomEvent("mate:memory-refreshed", { detail: { chatId: refreshChatId } }));
+              window.dispatchEvent(
+                new CustomEvent("mate:memory-refreshed", {
+                  detail: {
+                    chatId: refreshChatId,
+                    kind: "character",
+                    saved: Math.max(0, Number(body?.saved || 0)),
+                    evaluated: Math.max(0, Number(body?.evaluated || 0)),
+                    reason: String(body?.reason || ""),
+                  },
+                })
+              );
             } catch {}
           })
-          .catch(() => {});
+          .catch((cause: any) => {
+            try {
+              window.dispatchEvent(
+                new CustomEvent("mate:memory-refreshed", {
+                  detail: {
+                    chatId: refreshChatId,
+                    kind: "character",
+                    error: String(cause?.message || "개별 기억 갱신에 실패했습니다."),
+                  },
+                })
+              );
+            } catch {}
+          });
       } catch {}
     },
     [chatId]
@@ -5700,10 +5745,12 @@ const insertNarrationMarkers = useCallback(() => {
         display: isMemoryDock ? "grid" : settingsUiMode === "drawer" ? "block" : "grid",
         // 장기기억 도킹은 우측 패널을 충분히 넓게 잡고, 채팅 영역/입력창과 겹치지 않게 한다.
         // (환경에 따라 settingsUiMode가 drawer가 아니어도 도킹이 켜지므로 폭은 확실히 확보)
-        gridTemplateColumns: isMemoryDock
+        gridTemplateColumns: isRelationshipFocus
+          ? "minmax(0, 1fr)"
+          : isMemoryDock
           ? "minmax(360px, 1fr) minmax(520px, 1040px)"
           : (settingsUiMode === "drawer" ? "1fr" : (effectiveSettingsOpen ? "360px 1fr" : "0px 1fr")),
-        gap: isMemoryDock ? 16 : (settingsUiMode === "drawer" ? 0 : 16),
+        gap: isRelationshipFocus ? 0 : isMemoryDock ? 16 : (settingsUiMode === "drawer" ? 0 : 16),
         height: rootViewportHeight,
         minHeight: rootViewportHeight,
         minWidth: 0,
@@ -5812,7 +5859,7 @@ const insertNarrationMarkers = useCallback(() => {
       <div
         style={{
           position: isMemoryDock ? ("relative" as const) : settingsUiMode === "drawer" ? ("fixed" as const) : ("relative" as const),
-          gridColumn: isMemoryDock ? 2 : undefined,
+          gridColumn: isRelationshipFocus ? 1 : isMemoryDock ? 2 : undefined,
           top: isMemoryDock ? undefined : settingsUiMode === "drawer" ? 64 : undefined,
           right: isMemoryDock ? undefined : settingsUiMode === "drawer" ? 12 : undefined,
           bottom: isMemoryDock ? undefined : settingsUiMode === "drawer" ? 12 : undefined,
@@ -5826,7 +5873,13 @@ const insertNarrationMarkers = useCallback(() => {
 
           border: effectiveSettingsOpen ? `1px solid ${CHAT_THEME.borderStrong}` : "1px solid transparent",
           borderRadius: 16,
-          padding: effectiveSettingsOpen ? (isMemoryDock ? "12px 12px 18px" : 14) : 0,
+          padding: effectiveSettingsOpen
+            ? isRelationshipFocus
+              ? "14px 20px 24px"
+              : isMemoryDock
+                ? "12px 12px 18px"
+                : 14
+            : 0,
           overflow: effectiveSettingsOpen ? "auto" : "hidden",
           overscrollBehavior: "contain" as any,
           scrollbarGutter: "stable" as any,
@@ -6677,7 +6730,7 @@ const insertNarrationMarkers = useCallback(() => {
           padding: 0,
           overflow: "hidden",
           color: CHAT_THEME.text,
-          display: "flex",
+          display: isRelationshipFocus ? "none" : "flex",
           flexDirection: "column",
           // 부모 컨테이너 높이를 그대로 따르게 해서 모바일/키보드 환경에서 과대 높이로 잘리지 않게 한다.
           height: "100%",

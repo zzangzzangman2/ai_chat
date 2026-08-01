@@ -580,9 +580,13 @@ export default function MemoryPanel({ theme: THEME, chatId, embed, turnKey }: Pr
     if (!chatId) return;
     const onMemoryRefreshed = (ev: Event) => {
       if (dirty || editing || refreshing || saving) return;
-      const detail = (ev as CustomEvent<{ chatId?: string }>).detail;
+      const detail = (ev as CustomEvent<{ chatId?: string; error?: string }>).detail;
       const refreshedChatId = String(detail?.chatId || "");
       if (!refreshedChatId || refreshedChatId !== chatId) return;
+      if (detail?.error) {
+        setErr(`자동 기억 갱신 오류: ${String(detail.error)}`);
+        return;
+      }
       load();
       loadCharacters();
     };

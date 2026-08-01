@@ -92,6 +92,65 @@ function formatTurnsLocal(turns: Array<{ role: string; content: string }>) {
     .join("\n\n");
 }
 
+function deterministicMemorySnippet(value: unknown, maxChars: number) {
+  const normalized = stripUrlsAndMediaMarkdown(String(value || ""), { keepHeadings: false })
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/^\s*[^|\n]{1,40}\s*\|\s*/gm, "")
+    .replace(/[\*_`#>\[\]]+/g, " ")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "";
+  const limit = Math.max(36, Math.floor(maxChars));
+  if (normalized.length <= limit) {
+    return /[.!?…。]$/u.test(normalized) ? normalized : `${normalized}.`;
+  }
+  const head = normalized.slice(0, limit);
+  const sentenceEnd = Math.max(
+    head.lastIndexOf("."),
+    head.lastIndexOf("!"),
+    head.lastIndexOf("?"),
+    head.lastIndexOf("。"),
+    head.lastIndexOf("…")
+  );
+  if (sentenceEnd >= Math.floor(limit * 0.55)) return head.slice(0, sentenceEnd + 1).trim();
+  return `${head.trim()}…`;
+}
+
+function buildDeterministicMemorySection(params: {
+  turns: Array<{ role: string; content: string }>;
+  startTurn: number;
+  endTurn: number;
+  targetChars: number;
+}) {
+  const completedTurns: Array<{ userText: string; assistantText: string }> = [];
+  let pendingUserText = "";
+  for (const turn of params.turns) {
+    const role = String(turn?.role || "").toLowerCase();
+    if (role === "user") {
+      pendingUserText = String(turn?.content || "");
+      continue;
+    }
+    if (role !== "assistant" && role !== "model") continue;
+    completedTurns.push({
+      userText: pendingUserText,
+      assistantText: String(turn?.content || ""),
+    });
+    pendingUserText = "";
+  }
+  const perTurn = Math.max(48, Math.floor(params.targetChars / Math.max(1, completedTurns.length)) - 10);
+  const rows = completedTurns
+    .map((turn, index) => {
+      // 모델 출력이 사용자 지문·설정 정정을 거슬렀을 수 있으므로,
+      // 결정론적 최후 보존본은 해당 턴의 사용자 원문을 우선한다.
+      const snippet = deterministicMemorySnippet(turn.userText || turn.assistantText, perTurn);
+      return snippet ? `${params.startTurn + index}턴: ${snippet}` : "";
+    })
+    .filter(Boolean);
+  const body = rows.join(" ") || "해당 구간의 대화 원문은 보존되었으며 다음 갱신에서 다시 분석한다.";
+  return `### 대화 자동 보존 (${params.startTurn}-${params.endTurn}턴)\n${body}`;
+}
+
 function formatMemoryBlockSection(section: { startTurn: number; endTurn: number; title: string; body: string }) {
   return `### ${section.title} (${section.startTurn}-${section.endTurn}턴)\n${section.body}`.trim();
 }
@@ -1212,16 +1271,28 @@ export async function POST(req: Request) {
       return { clean, body };
     };
 
+    const generationErrors: string[] = [];
+    const runSummaryAttempt = async (label: string, run: () => Promise<string>) => {
+      try {
+        return String((await run()) || "");
+      } catch (error: any) {
+        generationErrors.push(`${label}:${String(error?.message || error || "failed").slice(0, 180)}`);
+        return "";
+      }
+    };
+
     // 1) fast path (downshifted model, stable sampling)
-    let sectionRaw = await summarizeLongMemorySectionKorean({
-      text: cleanedText,
-      startTurn: windowStartTurn,
-      endTurn: windowEndTurn,
-      targetChars,
-      guidance: baseGuidance,
-      personaName,
-      opts: { ...llmOpts, noDownshift: true },
-    });
+    let sectionRaw = await runSummaryAttempt("primary", () =>
+      summarizeLongMemorySectionKorean({
+        text: cleanedText,
+        startTurn: windowStartTurn,
+        endTurn: windowEndTurn,
+        targetChars,
+        guidance: baseGuidance,
+        personaName,
+        opts: { ...llmOpts, noDownshift: true },
+      })
+    );
 
     let norm = normalizeSection(sectionRaw);
     let q = analyzeGeneratedLongMemoryBody(norm.body);
@@ -1241,15 +1312,17 @@ export async function POST(req: Request) {
         temperature: 0.15,
         topP: 0.9,
       };
-      sectionRaw = await summarizeLongMemorySectionKorean({
-        text: cleanedText,
-        startTurn: windowStartTurn,
-        endTurn: windowEndTurn,
-        targetChars,
-        guidance: strictGuidance,
-        personaName,
-        opts: retryOpts,
-      });
+      sectionRaw = await runSummaryAttempt("strict", () =>
+        summarizeLongMemorySectionKorean({
+          text: cleanedText,
+          startTurn: windowStartTurn,
+          endTurn: windowEndTurn,
+          targetChars,
+          guidance: strictGuidance,
+          personaName,
+          opts: retryOpts,
+        })
+      );
       norm = normalizeSection(sectionRaw);
       q = analyzeGeneratedLongMemoryBody(norm.body);
       ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
@@ -1269,12 +1342,14 @@ export async function POST(req: Request) {
         temperature: 0.1,
         topP: 0.9,
       };
-      const body = await summarizeLongMemoryKorean({
-        text: cleanedText,
-        targetChars,
-        guidance: strictGuidance,
-        opts: retryOpts,
-      });
+      const body = await runSummaryAttempt("body_fallback", () =>
+        summarizeLongMemoryKorean({
+          text: cleanedText,
+          targetChars,
+          guidance: strictGuidance,
+          opts: retryOpts,
+        })
+      );
       const fallbackTitle = extractSectionTitle(sectionRaw) || "요약";
       sectionRaw = `### ${fallbackTitle} (${windowStartTurn}-${windowEndTurn}턴)\n${body}`;
       norm = normalizeSection(sectionRaw);
@@ -1293,15 +1368,15 @@ export async function POST(req: Request) {
     if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
       const fallbackModel = pickLongMemorySummaryFallbackModel();
       if (fallbackModel) {
-        try {
-          const rescueOpts = {
-            ...llmOpts,
-            model: fallbackModel,
-            noDownshift: true,
-            temperature: 0.1,
-            topP: 0.9,
-          };
-          sectionRaw = await summarizeLongMemorySectionKorean({
+        const rescueOpts = {
+          ...llmOpts,
+          model: fallbackModel,
+          noDownshift: true,
+          temperature: 0.1,
+          topP: 0.9,
+        };
+        const rescued = await runSummaryAttempt("fallback_model", () =>
+          summarizeLongMemorySectionKorean({
             text: cleanedText,
             startTurn: windowStartTurn,
             endTurn: windowEndTurn,
@@ -1309,7 +1384,10 @@ export async function POST(req: Request) {
             guidance: strictGuidance,
             personaName,
             opts: rescueOpts,
-          });
+          })
+        );
+        if (rescued) {
+          sectionRaw = rescued;
           norm = normalizeSection(sectionRaw);
           q = analyzeGeneratedLongMemoryBody(norm.body);
           ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
@@ -1319,10 +1397,40 @@ export async function POST(req: Request) {
             summary: norm.body,
             canon: identityCanon.canon,
           });
-        } catch {
-          // Keep original failure reasons and let bad_output path handle.
         }
       }
+    }
+
+    // 한 구간의 모델 거부·빈 응답·품질 실패 때문에 이후 모든 구간이 영원히
+    // 막히지 않도록, 실제 저장된 assistant 원문에서 결정론적 보존 요약을 만든다.
+    let deterministicFallbackUsed = false;
+    let deterministicFallbackReason = "";
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
+      deterministicFallbackReason = [
+        !q.ok ? `quality:${q.reason}` : "",
+        !ndrift.ok ? `name:${ndrift.reason}` : "",
+        !relationshipDrift.ok ? `relationship:${relationshipDrift.reason}` : "",
+        !identityDrift.ok ? `identity:${identityDrift.reason}` : "",
+        ...generationErrors,
+      ]
+        .filter(Boolean)
+        .join(" | ");
+      sectionRaw = buildDeterministicMemorySection({
+        turns: rangeTurns,
+        startTurn: windowStartTurn,
+        endTurn: windowEndTurn,
+        targetChars,
+      });
+      norm = normalizeSection(sectionRaw);
+      q = analyzeGeneratedLongMemoryBody(norm.body);
+      ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
+      relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
+      identityDrift = analyzeIdentityCanonDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        canon: identityCanon.canon,
+      });
+      deterministicFallbackUsed = true;
     }
 
     let forcedBadOutputSaved = false;
@@ -1515,6 +1623,9 @@ export async function POST(req: Request) {
       meta: {
         source: "memory_refresh",
         forcedBadOutputSaved,
+        deterministicFallbackUsed,
+        deterministicFallbackReason,
+        generationErrors,
         quality: q,
         nameDrift: ndrift,
         relationshipDrift,
@@ -1601,6 +1712,8 @@ export async function POST(req: Request) {
       boundaryEndTurn,
       morePending,
       forcedBadOutputSaved,
+      deterministicFallbackUsed,
+      deterministicFallbackReason,
       quality: q,
       nameDrift: ndrift,
       relationshipDrift,

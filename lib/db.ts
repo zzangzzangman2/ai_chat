@@ -535,11 +535,19 @@ if (!hasColumn("chat_settings", "narrationColor")) {
       turnNo INTEGER NOT NULL,
       summary TEXT NOT NULL DEFAULT '',
       evidence TEXT NOT NULL DEFAULT '',
+      memoryType TEXT NOT NULL DEFAULT 'major_event',
+      importance INTEGER NOT NULL DEFAULT 2,
       createdAt INTEGER NOT NULL,
       updatedAt INTEGER NOT NULL,
       UNIQUE(chatId, rosterId, turnNo)
     );
   `);
+  if (!hasColumn("chat_character_turn_memories", "memoryType")) {
+    db.exec(`ALTER TABLE chat_character_turn_memories ADD COLUMN memoryType TEXT NOT NULL DEFAULT 'major_event'`);
+  }
+  if (!hasColumn("chat_character_turn_memories", "importance")) {
+    db.exec(`ALTER TABLE chat_character_turn_memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 2`);
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_character_turn_memories_chat_roster ON chat_character_turn_memories(chatId, rosterId, turnNo)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_character_turn_memories_roster ON chat_character_turn_memories(rosterId)`);
 

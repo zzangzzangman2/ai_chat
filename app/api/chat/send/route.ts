@@ -50,6 +50,7 @@ import {
   formatStoryTurnsForMode,
   buildUserLineForMode,
   isOocMetaInstruction,
+  hasExplicitNovelNarration,
   ensurePrefix,
   stripNamePrefixFromNarration,
   stripDialogueWrappedNarration,
@@ -561,20 +562,25 @@ function buildManualCharacterRosterBlock(
       const placeholders = rosterIds.map(() => "?").join(",");
       const rawMemoryRows = db
         .prepare(
-          `SELECT rosterId, turnNo, summary, evidence
+          `SELECT rosterId, turnNo, summary, evidence, memoryType, importance
            FROM chat_character_turn_memories
            WHERE chatId=? AND rosterId IN (${placeholders})
            ORDER BY rosterId ASC, turnNo ASC`
         )
         .all(chatId, ...rosterIds) as any[];
-      const memoryRows = selectConservativeMemoryRows(
-        rawMemoryRows.map((memory) => ({
+      const normalizedMemoryRows = rawMemoryRows.map((memory) => ({
           ...memory,
           rosterId: String(memory?.rosterId || ""),
           turnNo: Math.max(0, Number(memory?.turnNo || 0)),
           summary: decryptIfPossible(String(memory?.summary || "")),
           evidence: decryptIfPossible(String(memory?.evidence || "")),
-        }))
+          importance: Math.max(1, Math.min(3, Number(memory?.importance || 1))),
+        }));
+      const memoryRows = selectConservativeMemoryRows(
+        [
+          ...normalizedMemoryRows.filter((memory) => memory.importance >= 2),
+          ...normalizedMemoryRows.filter((memory) => memory.importance < 2).slice(-12),
+        ].sort((a, b) => a.turnNo - b.turnNo)
       );
       for (const m of memoryRows) {
         const k = String(m?.rosterId || "");
@@ -892,6 +898,7 @@ export async function POST(req: Request) {
 
 	    const userText = effectiveUserText;
     const currentOocInstruction = isOocMetaInstruction(userText) ? userText : "";
+    const hasCurrentUserNarration = !currentOocInstruction && hasExplicitNovelNarration(userText);
 	    if (!userText) return bad("메시지를 입력해 주세요.");
 
 	    if (!LOCAL_POINTS_DISABLED) {
@@ -2267,7 +2274,7 @@ const formatGuide = buildFormatGuide({
           metaTemplateFence: metaFenceTemplateHint ? metaFenceTemplateHint : undefined,
         });
 const recentExpressionAvoidanceBlock = buildRecentExpressionAvoidanceBlock(tail);
-const worldDirectorBlock = currentOocInstruction
+const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
   ? ""
   : buildWorldDirectorBlock({
       messages: tail,
@@ -2341,6 +2348,15 @@ const systemRaw = (cacheFriendlyLayout
     const systemWithIdentityCanon = identityCanonBlock
       ? `${systemBase}\n\n${sanitizePromptCached(identityCanonBlock)}`
       : systemBase;
+    const currentNarrationPriorityBlock = hasCurrentUserNarration
+      ? [
+          `# [CURRENT USER NARRATION — COMPLETED SCENE FACT]`,
+          `- 최신 사용자 입력의 *...* 구간은 현재 턴에 이미 일어난 관찰 가능한 사건·행동·장면 변화다.`,
+          `- 이를 시도, 상상, 오해, 실패, 취소된 행동으로 바꾸거나 NPC가 선제적으로 막았다고 재작성하지 않는다.`,
+          `- 사용자 지문을 반복하지 말고 그 직후의 NPC 반응과 실제 결과부터 이어간다.`,
+          `- 지문 밖의 일반 문장은 주인공 대사다. 지문만으로 고정된 이름·혈연·과거 정사를 바꾸지 않으며, 그런 변경은 OOC/설정/정정 표식을 따른다.`,
+        ].join("\n")
+      : "";
     const currentOocPriorityBlock = currentOocInstruction
       ? [
           `# [CURRENT OOC OVERRIDE — ABSOLUTE HIGHEST STORY PRIORITY]`,
@@ -2351,9 +2367,11 @@ const systemRaw = (cacheFriendlyLayout
           currentOocInstruction,
         ].join("\n")
       : "";
-    const system = currentOocPriorityBlock
-      ? `${currentOocPriorityBlock}\n\n${systemWithIdentityCanon}`
-      : systemWithIdentityCanon;
+    // 현재 턴 전용 규칙은 고정 프롬프트 뒤에 둔다. 같은 system role 안에서도
+    // 최신 지문/OOC가 오래된 작품·기억 규칙에 묻히지 않게 한다.
+    const system = [systemWithIdentityCanon, currentNarrationPriorityBlock, currentOocPriorityBlock]
+      .filter(Boolean)
+      .join("\n\n");
 
 		    // (변경) 상태창을 포함한 응답을 '한 번의 호출'로 생성한다.
 	    // - Gemini 3 Pro는 streaming 중간에 fenced(STATUS/INFO)가 반쪽으로 보이는 문제가 컸지만,

@@ -64,6 +64,8 @@ type CharacterMemory = {
   turnNo: number;
   summary: string;
   evidence?: string;
+  memoryType?: string;
+  importance?: number;
   updatedAt?: number;
 };
 
@@ -585,6 +587,14 @@ function ellipsis(value: string, max: number) {
   return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
 }
 
+function compactGraphRelation(value: string) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "관계";
+  if (/(?:대화를 나누며 )?알아가는 사이$/u.test(text)) return "알아가는 사이";
+  if (/이제 막 서로를 알게 된 초면$/u.test(text)) return "초면";
+  return ellipsis(text, 15);
+}
+
 // 서로 방향이 없는 관계. 화살촉을 붙이지 않고 선으로만 잇는다.
 const SYMMETRIC_RELATIONS = new Set([
   "부부", "배우자", "연인", "친구", "절친", "소꿉친구", "같은 반 친구",
@@ -789,12 +799,12 @@ function validateRelations(relations: Relation[], nodeByKey: Map<string, GraphNo
 
 const NODE_W = 186;
 const NODE_H = 82;
-const CELL_GAP = 16;
-const TIER_GAP = 124;
+const CELL_GAP = 44;
+const TIER_GAP = 176;
 const GROUP_PAD = 14;
 const GROUP_LABEL_H = 24;
 const GROUP_MAX_COLS = 4;
-const CANVAS_W = 1040;
+const CANVAS_W = 1320;
 
 type Cell =
   | { kind: "node"; key: string; width: number; height: number; node: GraphNode }
@@ -988,7 +998,7 @@ function RelationshipMap({
     const positions = new Map<string, { x: number; y: number }>();
     const groupBoxes: Array<{ cell: Cell; x: number; y: number }> = [];
     const tiers = [...cellsByTier.keys()].sort((a, b) => a - b);
-    let cursorY = 70;
+    let cursorY = 96;
     let contentWidth = CANVAS_W;
 
     for (const tier of tiers) {
@@ -1023,7 +1033,7 @@ function RelationshipMap({
       cursorY += rowHeight + TIER_GAP;
     }
 
-    const height = Math.max(360, cursorY - TIER_GAP + 70);
+    const height = Math.max(620, cursorY - TIER_GAP + 110);
     const affinityByRoster = new Map(
       affinities.map((affinity) => [affinity.rosterId, affinity])
     );
@@ -1147,14 +1157,21 @@ function RelationshipMap({
         borderRadius: 22,
         overflowX: "auto",
         background:
-          "radial-gradient(circle at 50% 6%, rgba(34,211,238,0.10), transparent 34%), rgba(255,255,255,0.018)",
+          "radial-gradient(circle at 50% 4%, rgba(34,211,238,0.12), transparent 32%), radial-gradient(circle, rgba(148,163,184,0.12) 1px, transparent 1px), rgba(255,255,255,0.018)",
+        backgroundSize: "auto, 28px 28px, auto",
         boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04), 0 20px 45px rgba(0,0,0,0.16)",
       }}
     >
       <svg
         viewBox={`0 0 ${layout.width} ${layout.height}`}
         aria-label="인물 관계도"
-        style={{ display: "block", width: "100%", minWidth: 720, height: "auto" }}
+        style={{
+          display: "block",
+          width: "100%",
+          minWidth: Math.max(960, layout.width),
+          minHeight: 620,
+          height: "auto",
+        }}
       >
         <defs>
           <marker
@@ -1200,7 +1217,7 @@ function RelationshipMap({
           );
         })}
 
-        {layout.edges.map((edge) => {
+        {layout.edges.map((edge, edgeIndex) => {
           const from = layout.positions.get(edge.from);
           const to = layout.positions.get(edge.to);
           if (!from || !to) return null;
@@ -1220,10 +1237,19 @@ function RelationshipMap({
             const end = from.y < to.y ? { x: to.x, y: endY } : { x: to.x, y: to.y + NODE_H / 2 };
             path = `M ${start.x} ${start.y} C ${start.x} ${midY}, ${end.x} ${midY}, ${end.x} ${end.y}`;
           }
-          const label = ellipsis(edge.relation, 24);
-          const labelWidth = Math.min(182, Math.max(54, label.length * 10 + 18));
-          const labelX = (from.x + to.x) / 2;
-          const labelY = (from.y + to.y) / 2;
+          const label = compactGraphRelation(edge.relation);
+          const labelWidth = Math.min(152, Math.max(54, label.length * 10 + 18));
+          const fromIsPersona = edge.from === layout.persona.key;
+          const toIsPersona = edge.to === layout.persona.key;
+          const personaEdge = fromIsPersona || toIsPersona;
+          const characterPoint = fromIsPersona ? to : toIsPersona ? from : null;
+          // 주인공에서 여러 인물로 퍼지는 선은 중간에 긴 라벨을
+          // 모아두지 않고, 각 인물 카드 위에 붙여 서로 겹치지 않게 한다.
+          const labelX = personaEdge && characterPoint ? characterPoint.x : (from.x + to.x) / 2;
+          const labelY =
+            personaEdge && characterPoint
+              ? characterPoint.y - NODE_H / 2 - 24
+              : (from.y + to.y) / 2 + (edgeIndex % 2 === 0 ? -14 : 14);
           return (
             <g
               key={edge.id}
@@ -1459,11 +1485,18 @@ export default function RelationshipGraphPanel({
     const onRefresh = (event: Event) => {
       const detail = (event as CustomEvent)?.detail || {};
       if (String(detail?.chatId || "") !== String(chatId || "")) return;
+      if (detail?.error) {
+        setError(`기억 갱신 오류: ${String(detail.error)}`);
+        return;
+      }
       void loadGraph();
+      if (detail?.kind === "character" && selected?.rosterId) {
+        void loadMemories(selected, 0);
+      }
     };
     window.addEventListener("mate:memory-refreshed", onRefresh as EventListener);
     return () => window.removeEventListener("mate:memory-refreshed", onRefresh as EventListener);
-  }, [chatId, loadGraph]);
+  }, [chatId, loadGraph, loadMemories, selected]);
 
   const selectedAffinity = useMemo(
     () =>
@@ -1687,11 +1720,8 @@ export default function RelationshipGraphPanel({
               <span style={{ fontSize: 18, fontWeight: 950 }}>인물 관계도</span>
             </div>
             <div style={{ marginTop: 6, color: theme.muted, fontSize: 12, lineHeight: 1.5 }}>
-              주인공에서 가까운 인물이 위, 먼 인물이 아래입니다. 분홍 화살표는 방향이 있는
-              관계, 보라 선은 서로 대등한 관계, <b>보라 점선 상자</b>는 같은 반·같은 학교
-              묶음입니다. 같은 아이의 친부·친모는 같은 줄에 나란히 놓이지만, 부모라는 사실이
-              부부를 뜻하지는 않으므로 따로 묶지 않습니다. 관계 라벨을 누르면 직접 변경할 수
-              있습니다.
+              주인공을 중심으로 가까운 인물부터 배치합니다. 분홍 화살표는 방향이 있는
+              관계, 보라 선은 서로 대등한 관계입니다. 선의 관계명을 누르면 직접 변경할 수 있어요.
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
@@ -2118,11 +2148,16 @@ export default function RelationshipGraphPanel({
                 }}
               >
                 <div style={{ color: "#c7d2fe", fontSize: 11, fontWeight: 950 }}>{memory.turnNo}턴</div>
+                <div style={{ marginTop: 4, color: theme.muted, fontSize: 10, fontWeight: 800 }}>
+                  {Number(memory.importance || 1) >= 2 ? "핵심 장기기억" : "최근 대화 기억"}
+                </div>
                 <div style={{ marginTop: 5, fontSize: 13, lineHeight: 1.55, wordBreak: "keep-all" }}>{memory.summary}</div>
               </div>
             ))}
             {!memoryState.loading && !memoryState.memories.length ? (
-              <div style={{ color: theme.muted, fontSize: 13 }}>아직 저장된 턴별 대화 기억은 없습니다. 위 인물 설정과 관계 기억은 채팅에 계속 반영됩니다.</div>
+              <div style={{ color: theme.muted, fontSize: 13 }}>
+                원본 대화는 정상 저장되어 있습니다. 아직 이 인물에게 연결된 개별 기억이 없습니다.
+              </div>
             ) : null}
           </div>
           {memoryState.loading ? (
