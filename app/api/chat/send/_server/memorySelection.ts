@@ -30,6 +30,48 @@ const STOPWORDS = new Set([
 
 const SEMANTIC_SEARCH_GROUPS: Array<{ pattern: RegExp; tokens: string[] }> = [
   {
+    // Korean prompts are frequently written without spaces (for example,
+    // "순찰조들이랑인사"). Match meaningful stems inside those compounds so
+    // an active watch can still find summaries phrased as "형사가 상주 감시".
+    pattern: /(감시|주시|지켜보|망보|동향|상주|잠복|순찰|보초|밀착\s*(?:감시|경호|수사))/u,
+    tokens: [
+      "감시",
+      "주시",
+      "지켜보",
+      "망보",
+      "동향",
+      "상주",
+      "잠복",
+      "순찰",
+      "보초",
+      "밀착",
+    ],
+  },
+  {
+    pattern: /(경찰|형사|순경|수사관|수사대|순찰대|순찰조|감시조|신변\s*보호팀)/u,
+    tokens: ["경찰", "형사", "순경", "수사관", "수사", "순찰", "감시조", "사복"],
+  },
+  {
+    pattern: /(경호|호위|신변\s*보호|보호\s*(?:대상|조치|중|팀)|보안\s*(?:요원|팀)|경비\s*(?:원|대|팀)|지키(?:고|는|던|려)|보초)/u,
+    tokens: ["경호", "호위", "신변 보호", "신변보호", "보호", "보안", "경비", "보초", "지키", "요원"],
+  },
+  {
+    pattern: /(추적|미행|뒤쫓|쫓아|따라붙|수배|추격|탐문)/u,
+    tokens: ["추적", "미행", "뒤쫓", "쫓아", "따라붙", "수배", "추격", "탐문", "잠복", "감시"],
+  },
+  {
+    pattern: /(구금|구속|수감|투옥|억류|연행|체포|가택\s*연금|유치장|구치소|교도소)/u,
+    tokens: ["구금", "구속", "수감", "투옥", "억류", "연행", "체포", "가택 연금", "가택연금", "유치장", "구치소", "교도소"],
+  },
+  {
+    pattern: /(알리바이|위장|변장|눈속임|은폐|속였|속인|속여|속이고|속이는|속이려)/u,
+    tokens: ["알리바이", "위장", "변장", "눈속임", "은폐", "속이", "속였", "속인", "도주", "탈출"],
+  },
+  {
+    pattern: /(몰래.{0,16}(?:들어|나가|빠져|침입|잠입)|잠입|침입|무단\s*진입|숨어들|빠져나|도주|탈출|뒷문)/u,
+    tokens: ["몰래", "잠입", "침입", "무단", "진입", "숨어", "빠져나", "도주", "탈출", "뒷문"],
+  },
+  {
     pattern: /(약속|맹세|서약|다짐|합의|정했|하기로|지키기로)/u,
     tokens: ["약속", "맹세", "서약", "다짐", "합의", "하기로", "지키기로"],
   },
@@ -58,8 +100,8 @@ const SEMANTIC_SEARCH_GROUPS: Array<{ pattern: RegExp; tokens: string[] }> = [
     tokens: ["실종", "사라졌", "행방", "찾기로", "찾아야"],
   },
   {
-    pattern: /(부상|다쳤|병원|입원|수술|치료)/u,
-    tokens: ["부상", "다쳤", "병원", "입원", "수술", "치료"],
+    pattern: /(부상|다쳤|병원|입원|퇴원|수술|치료|회복|요양)/u,
+    tokens: ["부상", "다쳤", "병원", "입원", "퇴원", "수술", "치료", "회복", "요양"],
   },
   {
     pattern: /(비밀|숨겼|고백|밝혔|정체)/u,
@@ -88,6 +130,10 @@ function stripKoreanParticle(token: string) {
 }
 
 export function memorySearchTokens(text: string) {
+  return buildMemorySearchTokens(text, true);
+}
+
+function buildMemorySearchTokens(text: string, includeSemantic: boolean) {
   const src = String(text || "").toLowerCase();
   const hits = src.match(/[가-힣a-z0-9]{2,}/g) || [];
   const primaryLine = src.split("\n", 1)[0] || "";
@@ -114,13 +160,15 @@ export function memorySearchTokens(text: string) {
   // Reserve the front of the token budget for the current request and its
   // semantic expansions before recent dialogue can consume all 80 slots.
   addHits(primaryHits);
-  for (const group of SEMANTIC_SEARCH_GROUPS) {
-    if (!group.pattern.test(src)) continue;
-    for (const token of group.tokens) {
-      add(token);
+  if (includeSemantic) {
+    for (const group of SEMANTIC_SEARCH_GROUPS) {
+      if (!group.pattern.test(src)) continue;
+      for (const token of group.tokens) {
+        add(token);
+        if (out.length >= 80) break;
+      }
       if (out.length >= 80) break;
     }
-    if (out.length >= 80) break;
   }
   if (out.length < 80) addHits(hits);
   return out;
@@ -144,6 +192,156 @@ function explicitTurnRanges(text: string): Array<{ start: number; end: number }>
 
 function rangesOverlap(a: { start: number; end: number }, b: TurnRange) {
   return a.start <= b.endTurn && b.startTurn <= a.end;
+}
+
+function collapseParticleTokenVariants(tokens: string[]) {
+  const tokenSet = new Set(tokens);
+  return tokens.filter((token) => {
+    const stripped = stripKoreanParticle(token);
+    return stripped === token || !tokenSet.has(stripped);
+  });
+}
+
+type SemanticSearchGroup = (typeof SEMANTIC_SEARCH_GROUPS)[number];
+type SemanticSpan = { start: number; end: number };
+type SemanticConcept = { groups: SemanticSearchGroup[] };
+
+function semanticSpansOverlap(a: SemanticSpan, b: SemanticSpan) {
+  return a.start < b.end && b.start < a.end;
+}
+
+function connectedComponents<T>(
+  items: T[],
+  connected: (a: T, b: T) => boolean
+) {
+  const parents = items.map((_, index) => index);
+  const find = (index: number): number => {
+    if (parents[index] !== index) parents[index] = find(parents[index]);
+    return parents[index];
+  };
+  const union = (a: number, b: number) => {
+    const rootA = find(a);
+    const rootB = find(b);
+    if (rootA !== rootB) parents[rootB] = rootA;
+  };
+
+  for (let a = 0; a < items.length; a += 1) {
+    for (let b = a + 1; b < items.length; b += 1) {
+      if (connected(items[a], items[b])) union(a, b);
+    }
+  }
+
+  const components = new Map<number, T[]>();
+  items.forEach((item, index) => {
+    const root = find(index);
+    const component = components.get(root) || [];
+    component.push(item);
+    components.set(root, component);
+  });
+  return [...components.values()];
+}
+
+function regexMatchSpans(text: string, pattern: RegExp) {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  const matcher = new RegExp(pattern.source, flags);
+  const spans: SemanticSpan[] = [];
+  for (const match of text.matchAll(matcher)) {
+    const start = match.index;
+    const value = match[0] || "";
+    if (start === undefined || !value) continue;
+    spans.push({ start, end: start + value.length });
+  }
+  return spans;
+}
+
+function collapseOverlappingSpans(spans: SemanticSpan[]) {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  const collapsed: SemanticSpan[] = [];
+  for (const span of sorted) {
+    const previous = collapsed[collapsed.length - 1];
+    if (!previous || !semanticSpansOverlap(previous, span)) {
+      collapsed.push({ ...span });
+      continue;
+    }
+    previous.start = Math.min(previous.start, span.start);
+    previous.end = Math.max(previous.end, span.end);
+  }
+  return collapsed;
+}
+
+function matchedSemanticConcepts(
+  text: string,
+  excludedGroups: ReadonlySet<SemanticSearchGroup> = new Set()
+) {
+  const src = String(text || "").toLowerCase();
+  const activations = SEMANTIC_SEARCH_GROUPS
+    .filter((group) => !excludedGroups.has(group))
+    .map((group) => ({ group, spans: regexMatchSpans(src, group.pattern) }))
+    .filter((activation) => activation.spans.length > 0);
+
+  // A single surface expression can activate several broad synonym groups.
+  // For example, "순찰조" activates both watch and police, while "부부"
+  // activates both relationship and marriage. Their query spans overlap, so
+  // they are one user concept and must earn at most one semantic score.
+  return connectedComponents(activations, (a, b) =>
+    a.spans.some((spanA) =>
+      b.spans.some((spanB) => semanticSpansOverlap(spanA, spanB))
+    )
+  ).map(
+    (component): SemanticConcept => ({
+      groups: component.map((activation) => activation.group),
+    })
+  );
+}
+
+function semanticTokenSpans(haystack: string, groups: SemanticSearchGroup[]) {
+  const tokens = [
+    ...new Set(
+      groups.flatMap((group) => group.tokens.map((token) => token.toLowerCase()))
+    ),
+  ];
+  const spans: SemanticSpan[] = [];
+  for (const token of tokens) {
+    let from = 0;
+    while (from < haystack.length) {
+      const start = haystack.indexOf(token, from);
+      if (start < 0) break;
+      spans.push({ start, end: start + token.length });
+      from = start + Math.max(1, token.length);
+    }
+  }
+  return collapseOverlappingSpans(spans);
+}
+
+function semanticConceptMatchesInText(
+  haystack: string,
+  concepts: SemanticConcept[]
+) {
+  const matches = concepts
+    .map((concept) => ({
+      groups: concept.groups,
+      spans: semanticTokenSpans(haystack, concept.groups),
+    }))
+    .filter((match) => match.spans.length > 0);
+
+  // Distinct query concepts can still hit the same candidate substring. A
+  // candidate containing only "순찰" must not satisfy both "감시" and
+  // "형사" independently. Merge those candidate-side overlaps as well.
+  return connectedComponents(matches, (a, b) =>
+    a.spans.some((spanA) =>
+      b.spans.some((spanB) => semanticSpansOverlap(spanA, spanB))
+    )
+  ).map((component) => {
+    const groups = [...new Set(component.flatMap((match) => match.groups))];
+    const spans = collapseOverlappingSpans(
+      component.flatMap((match) => match.spans)
+    );
+    return {
+      groups,
+      count: spans.length,
+      first: Math.min(...spans.map((span) => span.start)),
+    };
+  });
 }
 
 export type MemoryRetrievalCandidate = {
@@ -174,10 +372,26 @@ export function rankMemoryRetrievalCandidates<T extends MemoryRetrievalCandidate
   maxItems: number;
   maxChars: number;
 }): Array<RankedMemoryRetrievalCandidate<T>> {
-  const primaryTokens = memorySearchTokens(params.primaryQueryText);
+  // `memorySearchTokens` intentionally keeps both the surface form and its
+  // particle-stripped form for FTS recall. During ranking they represent one
+  // fact, however: "이춘복은" + "이춘복" must not turn a name-only hit into
+  // the two-match threshold used by the foundational-event anchor.
+  const primaryTokens = collapseParticleTokenVariants(
+    buildMemorySearchTokens(params.primaryQueryText, false)
+  );
   const primaryTokenSet = new Set(primaryTokens);
-  const contextTokens = memorySearchTokens(params.contextQueryText || "").filter(
-    (token) => !primaryTokenSet.has(token)
+  const contextTokens = collapseParticleTokenVariants(
+    buildMemorySearchTokens(params.contextQueryText || "", false)
+  ).filter((token) => !primaryTokenSet.has(token));
+  const primarySemanticConcepts = matchedSemanticConcepts(
+    params.primaryQueryText
+  );
+  const primarySemanticGroupSet = new Set(
+    primarySemanticConcepts.flatMap((concept) => concept.groups)
+  );
+  const contextSemanticConcepts = matchedSemanticConcepts(
+    params.contextQueryText || "",
+    primarySemanticGroupSet
   );
   const explicitRanges = explicitTurnRanges(
     [params.primaryQueryText, params.contextQueryText || ""].filter(Boolean).join("\n")
@@ -189,10 +403,12 @@ export function rankMemoryRetrievalCandidates<T extends MemoryRetrievalCandidate
       let primaryMatches = 0;
       let primaryScore = 0;
       let contextScore = 0;
+      const matchedPrimaryTokens = new Set<string>();
 
       for (const token of primaryTokens) {
         const first = hay.indexOf(token);
         if (first < 0) continue;
+        matchedPrimaryTokens.add(token);
         primaryMatches += 1;
         primaryScore += token.length >= 3 ? 12 : 8;
         if (first < 120) primaryScore += 2;
@@ -204,6 +420,33 @@ export function rankMemoryRetrievalCandidates<T extends MemoryRetrievalCandidate
         if (first < 0) continue;
         contextScore += token.length >= 3 ? 3 : 1;
         if (first < 120) contextScore += 1;
+      }
+
+      // Synonyms improve recall, but one activated semantic group is still one
+      // concept. Without this cap, a single word such as "순찰" expanded into
+      // many matches and stole the foundational-event slot from exact facts.
+      for (const semantic of semanticConceptMatchesInText(
+        hay,
+        primarySemanticConcepts
+      )) {
+        const alreadyCountedBySurface = [...matchedPrimaryTokens].some((token) =>
+          semantic.groups.some((group) =>
+            group.tokens.some((semanticToken) =>
+              token.includes(semanticToken.toLowerCase()) ||
+              semanticToken.toLowerCase().includes(token)
+            )
+          )
+        );
+        if (!alreadyCountedBySurface) primaryMatches += 1;
+        primaryScore += 8 + Math.min(8, Math.max(0, semantic.count - 1) * 2);
+        if (semantic.first < 120) primaryScore += 2;
+      }
+      for (const semantic of semanticConceptMatchesInText(
+        hay,
+        contextSemanticConcepts
+      )) {
+        contextScore += 2 + Math.min(3, Math.max(0, semantic.count - 1));
+        if (semantic.first < 120) contextScore += 1;
       }
 
       const explicitMatch = explicitRanges.some((range) =>

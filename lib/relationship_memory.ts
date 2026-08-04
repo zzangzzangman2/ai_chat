@@ -74,8 +74,21 @@ export function findFocusedCharacterIds(rows: CharacterScopeRow[], focusText: st
   if (!haystack.trim()) return ids;
 
   for (const row of rows) {
-    const names = [String(row.name || "").trim(), ...parseAliases(String(row.aliases || ""))].filter(Boolean);
-    if (names.some((name) => haystack.includes(name.toLowerCase()))) ids.add(String(row.id || ""));
+    const canonicalName = String(row.name || "").trim().toLowerCase();
+    const aliases = parseAliases(String(row.aliases || ""))
+      .map((name) => name.trim().toLowerCase())
+      // One-character aliases collide with ordinary word fragments. Keep them
+      // stored, but do not use them for automatic current-turn focus.
+      .filter((name) => name.length >= 2);
+    const canonicalMentioned =
+      canonicalName.length >= 2
+        ? haystack.includes(canonicalName)
+        : canonicalName.length === 1
+          ? haystack.split(/[^\p{L}\p{N}]+/gu).includes(canonicalName)
+          : false;
+    if (canonicalMentioned || aliases.some((name) => haystack.includes(name))) {
+      ids.add(String(row.id || ""));
+    }
   }
   return ids;
 }

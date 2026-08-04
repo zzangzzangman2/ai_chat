@@ -34,6 +34,7 @@ import { isChatDebug, dbg } from "./_server/debug";
 import { estimateCost } from "./_server/billing";
 import { resolvePersona, persistPersonaIfMissing, type PersonaOverride } from "./_server/persona";
 import {
+  extractSummarySections,
   strlenSummary,
   normalizeStoredMemorySummary,
   getSummarizedEndTurn,
@@ -1633,22 +1634,64 @@ ${body}`.trim();
       maxBlocks: 5,
       maxChars: 1800,
     });
-    const relatedArchiveText =
-      String(indexedRelatedMemory.blockText || "").trim() ||
-      hybridMemory.relatedArchiveText;
+    const indexedArchiveText = String(indexedRelatedMemory.blockText || "").trim();
+    const hybridArchiveText = String(hybridMemory.relatedArchiveText || "").trim();
+    let relatedArchiveText = indexedArchiveText || hybridArchiveText;
+    if (indexedArchiveText && hybridArchiveText) {
+      const indexedRanges = new Set(
+        indexedRelatedMemory.blocks.map(
+          (block) => `${block.startTurn}:${block.endTurn}`
+        )
+      );
+      const hybridSupplementCandidates = extractSummarySections(hybridArchiveText)
+        .filter(
+          (section) =>
+            !indexedRanges.has(`${section.startTurn}:${section.endTurn}`)
+        )
+        .map((section) => {
+          const range =
+            section.startTurn === section.endTurn
+              ? `${section.endTurn}턴`
+              : `${section.startTurn}-${section.endTurn}턴`;
+          const text = `### ${section.title} (${range})\n${section.body}`.trim();
+          return {
+            section,
+            text,
+            startTurn: section.startTurn,
+            endTurn: section.endTurn,
+          };
+        });
+      const hybridSupplements = rankMemoryRetrievalCandidates({
+        candidates: hybridSupplementCandidates,
+        primaryQueryText: userText,
+        contextQueryText: memoryQueryText,
+        maxItems: 3,
+        maxChars: 1200,
+      });
+      if (hybridSupplements.length > 0) {
+        relatedArchiveText = [
+          indexedArchiveText,
+          "# (2-B2) 누락 구간 보완 장기기억",
+          "- 인덱스 검색과 겹치지 않는 원인·후속 사건만 전체 요약에서 보완한다.",
+          hybridSupplements.map((item) => item.text).join("\n\n"),
+        ].join("\n\n");
+      }
+    }
     const characterFocusText = userText;
     const recentCharacterFocusText = tail
       .slice(-4)
       .map((m: any) => String(m?.content || ""))
       .join("\n");
-    const continuityIdentities = (db
+    // The active-state ledger must see the full enabled roster, including the
+    // persona. The narrower NPC-only list remains for identity canon/world
+    // direction so a large cast cannot bloat those unrelated prompt blocks.
+    const continuityLedgerIdentities = (db
       .prepare(
         `SELECT name, aliases, role, profile, relationshipNote,
                 emotionNote, status
          FROM chat_character_roster
          WHERE chatId=? AND enabled != 0
-         ORDER BY updatedAt DESC, name ASC
-         LIMIT 40`
+         ORDER BY updatedAt DESC, name ASC`
       )
       .all(cid) as any[]).map((row) => ({
         name: String(row?.name || ""),
@@ -1658,7 +1701,8 @@ ${body}`.trim();
         relationshipNote: decryptIfPossible(String(row?.relationshipNote || "")),
         emotionNote: decryptIfPossible(String(row?.emotionNote || "")),
         status: decryptIfPossible(String(row?.status || "")),
-      }))
+      }));
+    const continuityIdentities = continuityLedgerIdentities
       .filter((identity) => {
         const personaKey = personaNameFinal.trim().toLowerCase();
         if (!personaKey) return true;
@@ -1668,11 +1712,13 @@ ${body}`.trim();
           .map((value) => value.trim().toLowerCase())
           .filter(Boolean)
           .includes(personaKey);
-      });
+      })
+      .slice(0, 40);
     const continuityLedger = buildContinuityLedgerBlock({
       historySummary,
-      identities: continuityIdentities,
+      identities: continuityLedgerIdentities,
       userText,
+      focusNames: [personaNameFinal],
     });
     const identityCanon = buildIdentityCanonBlock({
       messages: all,
@@ -1706,6 +1752,7 @@ ${body}`.trim();
         personaName: personaNameFinal,
         focusText: characterFocusText,
         recentFocusText: recentCharacterFocusText,
+        priorityNames: continuityLedger.promptStates.map((state) => state.name),
         graph: loadRelationshipGraph(cid),
       });
     } catch (error) {
@@ -1718,6 +1765,7 @@ ${body}`.trim();
     const focusedCanonNames = new Set(
       [
         personaNameFinal,
+        ...continuityLedger.promptStates.map((state) => state.name),
         ...dynamicCharacterContext.focusedNames,
         ...dynamicCharacterContext.includedNames,
       ]
@@ -1725,7 +1773,10 @@ ${body}`.trim();
         .filter(Boolean)
     );
     const focusedCharacterCanonNames = new Set(
-      dynamicCharacterContext.focusedNames
+      [
+        ...continuityLedger.promptStates.map((state) => state.name),
+        ...dynamicCharacterContext.focusedNames,
+      ]
         .map((value) => String(value || "").trim().toLocaleLowerCase("ko-KR"))
         .filter(Boolean)
     );
@@ -1775,7 +1826,6 @@ ${body}`.trim();
       }
     }
     const historySummaryForPrompt = [
-      continuityLedger.block,
       hybridMemory.currentArcText,
       relatedArchiveText,
       manualCharacterRosterFallback,
@@ -1807,8 +1857,12 @@ ${body}`.trim();
       indexedMemoryBlocks: indexedRelatedMemory.blocks.length,
       currentArcChars: strlen(hybridMemory.currentArcText),
       pickedChars: strlen(relatedArchiveText),
-      continuityStates: continuityLedger.states,
+      continuityStates: continuityLedger.promptStates,
+      continuityStateCount: continuityLedger.states.length,
+      continuityPromptStateCount: continuityLedger.promptStates.length,
       continuityChars: strlen(continuityLedger.block),
+      continuityIdentityCount: continuityLedgerIdentities.length,
+      canonIdentityCount: continuityIdentities.length,
       dynamicCharacterContextChars: strlen(dynamicCharacterContext.block),
       dynamicCharacterFocus: dynamicCharacterContext.focusedNames,
       dynamicRelationshipCount: dynamicCharacterContext.relationshipCount,
@@ -2340,6 +2394,7 @@ const systemRaw = (cacheFriendlyLayout
           `# [CURRENT USER NARRATION — COMPLETED SCENE FACT]`,
           `- 최신 사용자 입력의 *...* 구간은 현재 턴에 이미 일어난 관찰 가능한 사건·행동·장면 변화다.`,
           `- 이를 시도, 상상, 오해, 실패, 취소된 행동으로 바꾸거나 NPC가 선제적으로 막았다고 재작성하지 않는다.`,
+          `- 완료된 행동 자체는 존중하되, 그 행동만으로 진행 중인 감시·경호·추적·구금·입원·담당 상태가 자동 해제되지는 않는다. 연속성 장부에 남은 담당자의 관찰·발각·후속 반응을 함께 반영한다.`,
           `- 사용자 지문을 반복하지 말고 그 직후의 NPC 반응과 실제 결과부터 이어간다.`,
           `- 지문 밖의 일반 문장은 주인공 대사다. 지문만으로 고정된 이름·혈연·과거 정사를 바꾸지 않으며, 그런 변경은 OOC/설정/정정 표식을 따른다.`,
         ].join("\n")
@@ -2356,7 +2411,15 @@ const systemRaw = (cacheFriendlyLayout
       : "";
     // 현재 턴 전용 규칙은 고정 프롬프트 뒤에 둔다. 같은 system role 안에서도
     // 최신 지문/OOC가 오래된 작품·기억 규칙에 묻히지 않게 한다.
-    const system = [systemWithIdentityCanon, currentNarrationPriorityBlock, currentOocPriorityBlock]
+    const continuityPriorityBlock = continuityLedger.block
+      ? sanitizePromptCached(continuityLedger.block)
+      : "";
+    const system = [
+      systemWithIdentityCanon,
+      currentNarrationPriorityBlock,
+      continuityPriorityBlock,
+      currentOocPriorityBlock,
+    ]
       .filter(Boolean)
       .join("\n\n");
 
@@ -2391,6 +2454,16 @@ const systemRaw = (cacheFriendlyLayout
 	          identityCanonBlock ? sanitizePromptCached(identityCanonBlock) : "",
 	          ``,
 	          "※ (중요) 이 이어쓰기 호출에서는 fenced 코드블록(```...```) 출력 금지. STATUS/INFO/메타 블록도 출력하지 마라.",
+	          currentNarrationPriorityBlock ? `` : "",
+	          currentNarrationPriorityBlock
+	            ? sanitizePromptCached(currentNarrationPriorityBlock)
+	            : "",
+	          continuityPriorityBlock ? `` : "",
+	          continuityPriorityBlock,
+	          currentOocPriorityBlock ? `` : "",
+	          currentOocPriorityBlock
+	            ? sanitizePromptCached(currentOocPriorityBlock)
+	            : "",
 	        ].join("\n")
 	      : [
 	          systemMain,
@@ -2412,6 +2485,8 @@ const systemRaw = (cacheFriendlyLayout
 	          ``,
 	          sanitizePromptCached(noteBlock),
 	          ``,
+	          continuityPriorityBlock,
+	          continuityPriorityBlock ? `` : "",
 	          // 상태창만 출력하도록 강제
 	          `지금부터는 '2단계 메타/상태'만 작성한다.`,
 	          `출력은 반드시 하나의 fenced 코드블록으로만 구성한다.`,
