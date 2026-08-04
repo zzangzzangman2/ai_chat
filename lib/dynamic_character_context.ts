@@ -119,6 +119,7 @@ export function buildDynamicCharacterContext(params: {
   chatId: string;
   personaName: string;
   focusText: string;
+  recentFocusText?: string;
   graph: RelationshipGraphData;
 }): DynamicCharacterContext {
   const chatId = cleanText(params.chatId, 120);
@@ -170,6 +171,16 @@ export function buildDynamicCharacterContext(params: {
     aliases: row.aliases,
   }));
   const focusedIds = findFocusedCharacterIds(scopeRows, params.focusText);
+
+  // A character explicitly named in the current user input owns this turn's
+  // character context. Recent dialogue is only a pronoun/name-omission fallback;
+  // mixing both sources activated unrelated recent characters and caused their
+  // events and locations to be fused into the requested character's memory.
+  if (focusedIds.size === 0 && params.recentFocusText) {
+    for (const id of findFocusedCharacterIds(scopeRows, params.recentFocusText)) {
+      focusedIds.add(id);
+    }
+  }
 
   // If the current text omits names, retain only the character(s) most recently
   // involved in an individual-memory turn. This preserves pronoun continuity

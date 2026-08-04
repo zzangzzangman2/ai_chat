@@ -70,6 +70,10 @@ const SEMANTIC_SEARCH_GROUPS: Array<{ pattern: RegExp; tokens: string[] }> = [
     tokens: ["배신", "속였", "거짓말", "기만"],
   },
   {
+    pattern: /(사진|촬영|찍어|찍은|찍었|카메라|녹화|캡처)/u,
+    tokens: ["사진", "촬영", "찍어", "찍은", "찍었", "카메라", "녹화", "캡처"],
+  },
+  {
     pattern: /(싸움|다툼|갈등|화해|용서)/u,
     tokens: ["싸움", "다툼", "갈등", "화해", "용서"],
   },
@@ -142,6 +146,139 @@ function rangesOverlap(a: { start: number; end: number }, b: TurnRange) {
   return a.start <= b.endTurn && b.startTurn <= a.end;
 }
 
+export type MemoryRetrievalCandidate = {
+  startTurn: number;
+  endTurn: number;
+  text: string;
+  boost?: number;
+};
+
+export type RankedMemoryRetrievalCandidate<T extends MemoryRetrievalCandidate> = T & {
+  score: number;
+  primaryMatches: number;
+  primaryScore: number;
+  contextScore: number;
+  explicitMatch: boolean;
+};
+
+/**
+ * Ranks stored events without allowing a long recent-context tail to drown out
+ * the user's current request. A strong current-input match also reserves one
+ * slot for the earliest equally relevant event, so foundational events remain
+ * retrievable hundreds or thousands of turns later.
+ */
+export function rankMemoryRetrievalCandidates<T extends MemoryRetrievalCandidate>(params: {
+  candidates: T[];
+  primaryQueryText: string;
+  contextQueryText?: string;
+  maxItems: number;
+  maxChars: number;
+}): Array<RankedMemoryRetrievalCandidate<T>> {
+  const primaryTokens = memorySearchTokens(params.primaryQueryText);
+  const primaryTokenSet = new Set(primaryTokens);
+  const contextTokens = memorySearchTokens(params.contextQueryText || "").filter(
+    (token) => !primaryTokenSet.has(token)
+  );
+  const explicitRanges = explicitTurnRanges(
+    [params.primaryQueryText, params.contextQueryText || ""].filter(Boolean).join("\n")
+  );
+
+  const ranked = params.candidates
+    .map((candidate): RankedMemoryRetrievalCandidate<T> => {
+      const hay = String(candidate.text || "").toLowerCase();
+      let primaryMatches = 0;
+      let primaryScore = 0;
+      let contextScore = 0;
+
+      for (const token of primaryTokens) {
+        const first = hay.indexOf(token);
+        if (first < 0) continue;
+        primaryMatches += 1;
+        primaryScore += token.length >= 3 ? 12 : 8;
+        if (first < 120) primaryScore += 2;
+        const occurrences = hay.split(token).length - 1;
+        if (occurrences > 1) primaryScore += Math.min(4, occurrences - 1);
+      }
+      for (const token of contextTokens) {
+        const first = hay.indexOf(token);
+        if (first < 0) continue;
+        contextScore += token.length >= 3 ? 3 : 1;
+        if (first < 120) contextScore += 1;
+      }
+
+      const explicitMatch = explicitRanges.some((range) =>
+        rangesOverlap(range, candidate)
+      );
+      const score =
+        (explicitMatch ? 10_000 : 0) +
+        primaryScore +
+        contextScore +
+        Math.max(0, Number(candidate.boost || 0));
+      return {
+        ...candidate,
+        score,
+        primaryMatches,
+        primaryScore,
+        contextScore,
+        explicitMatch,
+      };
+    })
+    .filter((candidate) => candidate.score > 0)
+    .sort(
+      (a, b) =>
+        Number(b.explicitMatch) - Number(a.explicitMatch) ||
+        b.primaryMatches - a.primaryMatches ||
+        b.primaryScore - a.primaryScore ||
+        b.contextScore - a.contextScore ||
+        b.score - a.score ||
+        b.endTurn - a.endTurn
+    );
+
+  const maxItems = Math.max(0, Math.floor(Number(params.maxItems) || 0));
+  const maxChars = Math.max(0, Math.floor(Number(params.maxChars) || 0));
+  if (maxItems <= 0 || maxChars <= 0 || ranked.length === 0) return [];
+
+  const picked: Array<RankedMemoryRetrievalCandidate<T>> = [];
+  let usedChars = 0;
+  const add = (candidate: RankedMemoryRetrievalCandidate<T>) => {
+    if (picked.some((item) => item.startTurn === candidate.startTurn && item.endTurn === candidate.endTurn)) {
+      return;
+    }
+    const nextChars = String(candidate.text || "").length + 2;
+    if (picked.length >= maxItems) return;
+    if (usedChars > 0 && usedChars + nextChars > maxChars) return;
+    picked.push(candidate);
+    usedChars += nextChars;
+  };
+
+  const explicitAnchor = ranked.find((candidate) => candidate.explicitMatch);
+  if (explicitAnchor) add(explicitAnchor);
+
+  // Two or more current-input token matches indicate a concrete event lookup.
+  // Among equally strong matches, keep the earliest event as the origin anchor.
+  // An explicit "N턴" request remains absolute and takes this reserved slot.
+  const strongMatches = explicitAnchor
+    ? []
+    : ranked.filter((candidate) => candidate.primaryMatches >= 2);
+  if (strongMatches.length > 0) {
+    const bestMatchCount = Math.max(...strongMatches.map((candidate) => candidate.primaryMatches));
+    const originMatchFloor = Math.max(2, bestMatchCount - 1);
+    const originAnchor = strongMatches
+      .filter((candidate) => candidate.primaryMatches >= originMatchFloor)
+      .sort(
+        (a, b) =>
+          a.startTurn - b.startTurn ||
+          a.endTurn - b.endTurn ||
+          b.primaryMatches - a.primaryMatches ||
+          b.primaryScore - a.primaryScore
+      )[0];
+    if (originAnchor) add(originAnchor);
+  }
+
+  for (const candidate of ranked) add(candidate);
+  return picked.sort((a, b) => a.startTurn - b.startTurn || a.endTurn - b.endTurn);
+}
+
 function formatSection(section: StoredSummarySection) {
   return `### ${section.title} (${section.startTurn}-${section.endTurn}턴)\n${section.body}`.trim();
 }
@@ -161,6 +298,7 @@ function sectionChars(section: StoredSummarySection) {
 export function selectHybridMemory(params: {
   historySummary: string;
   queryText: string;
+  primaryQueryText?: string;
   currentArcTurns?: number;
   currentArcMaxChars?: number;
   maxRelatedSections?: number;
@@ -203,46 +341,28 @@ export function selectHybridMemory(params: {
   const currentKeys = new Set(current.map((section) => `${section.startTurn}:${section.endTurn}`));
   const older = sections.filter((section) => !currentKeys.has(`${section.startTurn}:${section.endTurn}`));
 
-  const tokens = memorySearchTokens(params.queryText);
-  const ranges = explicitTurnRanges(params.queryText);
-  const scored = older
-    .map((section) => {
-      const hay = `${section.title}\n${section.body}`.toLowerCase();
-      let score = 0;
-      for (const token of tokens) {
-        const first = hay.indexOf(token);
-        if (first < 0) continue;
-        score += token.length >= 3 ? 4 : 2;
-        if (first < 120) score += 1;
-        const occurrences = hay.split(token).length - 1;
-        if (occurrences > 1) score += Math.min(3, occurrences - 1);
-      }
-      // Persistent state changes must not lose a top slot to incidental name mentions.
-      // The continuity ledger independently enforces the latest state, while this boost
-      // also gives the model the surrounding event that caused the state change.
-      if (
-        score > 0 &&
-        /(?:사망|사살|숨졌|죽었|목숨을\s*잃|생존|부활|되살아|실종|행방불명|결혼|이혼|임신|출산)/u.test(hay)
-      ) {
-        score += 20;
-      }
-      for (const range of ranges) {
-        if (rangesOverlap(range, section)) score += 100;
-      }
-      return { section, score };
-    })
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score || b.section.endTurn - a.section.endTurn);
-
-  const picked: Array<{ section: StoredSummarySection; score: number; fallback: boolean }> = [];
-  let relatedChars = 0;
-  for (const item of scored) {
-    if (picked.length >= maxRelatedSections) break;
-    const chars = sectionChars(item.section) + 2;
-    if (relatedChars > 0 && relatedChars + chars > maxRelatedChars) continue;
-    picked.push({ ...item, fallback: false });
-    relatedChars += chars;
-  }
+  const ranked = rankMemoryRetrievalCandidates({
+    candidates: older.map((section) => {
+      const text = formatSection(section);
+      return {
+        section,
+        startTurn: section.startTurn,
+        endTurn: section.endTurn,
+        text,
+        boost: /(?:사망|사살|숨졌|죽었|목숨을\s*잃|생존|부활|되살아|실종|행방불명|결혼|이혼|임신|출산)/u.test(text)
+          ? 20
+          : 0,
+      };
+    }),
+    primaryQueryText: params.primaryQueryText ?? params.queryText,
+    contextQueryText: params.queryText,
+    maxItems: maxRelatedSections,
+    maxChars: maxRelatedChars,
+  });
+  const picked: Array<{ section: StoredSummarySection; score: number; fallback: boolean }> = ranked.map(
+    (item) => ({ section: item.section, score: item.score, fallback: false })
+  );
+  let relatedChars = ranked.reduce((sum, item) => sum + item.text.length + 2, 0);
 
   if (!picked.length && fallbackSections > 0 && maxRelatedSections > 0 && maxRelatedChars > 0) {
     // The current arc already contains the latest story. A no-hit fallback must

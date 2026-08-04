@@ -73,7 +73,11 @@ import {
 import { sanitizePromptCached } from "./_server/promptCache";
 import { buildFormatGuide } from "./_server/formatGuide";
 import { normalizeSummaryTail, sanitizeLongMemorySummary, upsertSummaryRangeBlock } from "./_server/memory";
-import { memorySearchTokens, selectHybridMemory } from "./_server/memorySelection";
+import {
+  memorySearchTokens,
+  rankMemoryRetrievalCandidates,
+  selectHybridMemory,
+} from "./_server/memorySelection";
 import { buildContinuityLedgerBlock } from "./_server/continuityState";
 import {
   _reEsc,
@@ -174,32 +178,16 @@ type RelatedMemoryBlock = {
   endTurn: number;
   summary: string;
   score: number;
+  primaryMatches: number;
+  primaryScore: number;
+  contextScore: number;
+  explicitMatch: boolean;
 };
-
-function explicitTurnRanges(text: string): Array<{ start: number; end: number }> {
-  const src = String(text || "");
-  const ranges: Array<{ start: number; end: number }> = [];
-  for (const m of src.matchAll(/(\d{1,6})\s*(?:[-~–—]|부터|에서)\s*(\d{1,6})\s*턴/g)) {
-    const a = Number(m[1]);
-    const b = Number(m[2]);
-    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
-    ranges.push({ start: Math.min(a, b), end: Math.max(a, b) });
-  }
-  for (const m of src.matchAll(/(\d{1,6})\s*턴/g)) {
-    const n = Number(m[1]);
-    if (!Number.isFinite(n)) continue;
-    ranges.push({ start: n, end: n });
-  }
-  return ranges;
-}
-
-function rangesOverlap(a: { start: number; end: number }, b: { start: number; end: number }) {
-  return a.start <= b.end && b.start <= a.end;
-}
 
 function buildRelatedMemoryBlocks(params: {
   chatId: string;
   queryText: string;
+  primaryQueryText?: string;
   historySummary: string;
   maxBlocks?: number;
   maxChars?: number;
@@ -212,9 +200,11 @@ function buildRelatedMemoryBlocks(params: {
   if (maxBlocks <= 0 || maxChars <= 0) return { blockText: "", blocks: [] };
 
   const queryText = stripUrlsAndMediaMarkdown(String(params.queryText || ""));
+  const primaryQueryText = stripUrlsAndMediaMarkdown(
+    String(params.primaryQueryText || params.queryText || "")
+  );
   const tokens = memorySearchTokens(queryText);
-  const explicitRanges = explicitTurnRanges(queryText);
-  if (!tokens.length && !explicitRanges.length) return { blockText: "", blocks: [] };
+  if (!tokens.length && !primaryQueryText.trim()) return { blockText: "", blocks: [] };
 
   const historySummary = String(params.historySummary || "");
   const allowDuplicate = String(process.env.AI_MEMORY_BLOCKS_INCLUDE_DUPLICATES || "").trim() === "1";
@@ -334,7 +324,12 @@ function buildRelatedMemoryBlocks(params: {
       ? baseRows.concat(ftsExtraRows).concat(likeExtraRows)
       : baseRows;
 
-  const scored: RelatedMemoryBlock[] = [];
+  const candidates: Array<{
+    startTurn: number;
+    endTurn: number;
+    summary: string;
+    text: string;
+  }> = [];
   for (const row of rows) {
     const startTurn = Math.max(1, Math.floor(Number(row?.startTurn) || 0));
     const endTurn = Math.max(startTurn, Math.floor(Number(row?.endTurn) || startTurn));
@@ -348,39 +343,23 @@ function buildRelatedMemoryBlocks(params: {
     // historySummary에 [startTurn..endTurn]을 포괄하는 구간 헤더가 이미 있으면 스킵.
     if (!allowDuplicate && isAlreadySummarized(startTurn, endTurn)) continue;
 
-    const hay = summary.toLowerCase();
-    let score = 0;
-    for (const token of tokens) {
-      const idx = hay.indexOf(token);
-      if (idx < 0) continue;
-      score += token.length >= 3 ? 3 : 1;
-      if (idx < 80) score += 1;
-    }
-    for (const range of explicitRanges) {
-      if (rangesOverlap(range, { start: startTurn, end: endTurn })) score += 100;
-    }
-    if (score > 0) scored.push({ startTurn, endTurn, summary, score });
+    candidates.push({ startTurn, endTurn, summary, text: summary });
   }
 
-  scored.sort((a, b) => b.score - a.score || b.endTurn - a.endTurn);
-
-  const picked: RelatedMemoryBlock[] = [];
-  let usedChars = 0;
-  for (const block of scored) {
-    const nextChars = strlen(block.summary) + 2;
-    if (picked.length >= maxBlocks) break;
-    if (usedChars > 0 && usedChars + nextChars > maxChars) continue;
-    picked.push(block);
-    usedChars += nextChars;
-  }
-
-  picked.sort((a, b) => a.startTurn - b.startTurn);
+  const picked: RelatedMemoryBlock[] = rankMemoryRetrievalCandidates({
+    candidates,
+    primaryQueryText,
+    contextQueryText: queryText,
+    maxItems: maxBlocks,
+    maxChars,
+  });
   if (!picked.length) return { blockText: "", blocks: [] };
 
   const blockText = [
     "# (2-B) 관련 장기기억 블록 원장",
     "- 기존 장기기억 요약을 대체하지 않고, 현재 입력과 관련된 사건 블록만 보강한다.",
     "- 기존 요약과 충돌하면 더 구체적인 블록 내용을 우선 참고한다.",
+    "- 조회된 과거 사건의 장소·대상·행동·순서를 다른 최근 사건이나 관계 정보와 섞거나 옮기지 않는다.",
     picked.map((b) => b.summary).join("\n\n"),
   ].join("\n");
 
@@ -1637,6 +1616,7 @@ ${body}`.trim();
     const hybridMemory = selectHybridMemory({
       historySummary,
       queryText: memoryQueryText,
+      primaryQueryText: userText,
       currentArcTurns: 15,
       currentArcMaxChars: 3200,
       maxRelatedSections: 6,
@@ -1648,6 +1628,7 @@ ${body}`.trim();
     const indexedRelatedMemory = buildRelatedMemoryBlocks({
       chatId: cid,
       queryText: memoryQueryText,
+      primaryQueryText: userText,
       historySummary: "",
       maxBlocks: 5,
       maxChars: 1800,
@@ -1655,10 +1636,11 @@ ${body}`.trim();
     const relatedArchiveText =
       String(indexedRelatedMemory.blockText || "").trim() ||
       hybridMemory.relatedArchiveText;
-    const characterFocusText = [
-      userText,
-      ...tail.slice(-4).map((m: any) => String(m?.content || "")),
-    ].join("\n");
+    const characterFocusText = userText;
+    const recentCharacterFocusText = tail
+      .slice(-4)
+      .map((m: any) => String(m?.content || ""))
+      .join("\n");
     const continuityIdentities = (db
       .prepare(
         `SELECT name, aliases, role, profile, relationshipNote,
@@ -1723,6 +1705,7 @@ ${body}`.trim();
         chatId: cid,
         personaName: personaNameFinal,
         focusText: characterFocusText,
+        recentFocusText: recentCharacterFocusText,
         graph: loadRelationshipGraph(cid),
       });
     } catch (error) {
@@ -1810,6 +1793,10 @@ ${body}`.trim();
             startTurn: block.startTurn,
             endTurn: block.endTurn,
             score: block.score,
+            primaryMatches: block.primaryMatches,
+            primaryScore: block.primaryScore,
+            contextScore: block.contextScore,
+            explicitMatch: block.explicitMatch,
             fallback: false,
             source: "fts-ledger",
           }))
