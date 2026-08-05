@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
+import { buildMemorySearchIndex, type MemorySearchIndex } from "./memory_search_index";
 
 const dataDir = path.join(process.cwd(), "data");
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -20,6 +21,26 @@ db.pragma("temp_store = MEMORY");
 db.pragma("mmap_size = 268435456");
 db.pragma("cache_size = -20000");
 db.pragma("busy_timeout = 5000");
+
+// SQLite triggers cannot run TypeScript directly, so expose the small,
+// deterministic memory-index extractor as scalar functions. The one-entry
+// cache matters during backfill: one row invokes each field function in turn.
+let cachedMemorySearchSource = "";
+let cachedMemorySearchIndex: MemorySearchIndex | null = null;
+function memorySearchField(field: keyof MemorySearchIndex) {
+  return (raw: unknown) => {
+    const source = String(raw || "");
+    if (!cachedMemorySearchIndex || cachedMemorySearchSource !== source) {
+      cachedMemorySearchSource = source;
+      cachedMemorySearchIndex = buildMemorySearchIndex(source);
+    }
+    return cachedMemorySearchIndex[field];
+  };
+}
+
+for (const field of ["title", "entities", "places", "events", "keywords", "summary"] as const) {
+  db.function(`memory_search_${field}`, { deterministic: true }, memorySearchField(field));
+}
 
 function hasColumn(table: string, column: string) {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as any[];
@@ -506,6 +527,96 @@ if (!hasColumn("chat_settings", "narrationColor")) {
     // FTS5는 빌드 옵션에 따라 사용 불가할 수 있다. 그 경우 인덱스 없이도 기존 경로가 동작하므로 무시.
   }
 
+  // 4-0-FTS-v2) 필드별 가중치 + 2글자 한국어 검색용 구조화 인덱스.
+  // - 제목/인물/장소/사건/핵심어를 분리해 BM25에서 중요한 일치를 더 높게 평가한다.
+  // - 기존 암호화 정책을 유지한다. 암호문은 평문 FTS에 절대 복사하지 않고 검색측의
+  //   제한된 호환 스캔으로만 처리한다.
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS chat_memory_blocks_search_fts_v2 USING fts5(
+        chatId UNINDEXED,
+        title,
+        entities,
+        places,
+        events,
+        keywords,
+        summary,
+        tokenize = 'trigram'
+      );
+    `);
+
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS chat_memory_blocks_search_v2_ai
+      AFTER INSERT ON chat_memory_blocks
+      WHEN substr(new.summary, 1, 7) != 'enc:v1:'
+      BEGIN
+        INSERT INTO chat_memory_blocks_search_fts_v2(
+          rowid, chatId, title, entities, places, events, keywords, summary
+        ) VALUES (
+          new.id,
+          new.chatId,
+          memory_search_title(new.summary),
+          memory_search_entities(new.summary),
+          memory_search_places(new.summary),
+          memory_search_events(new.summary),
+          memory_search_keywords(new.summary),
+          memory_search_summary(new.summary)
+        );
+      END;
+    `);
+
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS chat_memory_blocks_search_v2_ad
+      AFTER DELETE ON chat_memory_blocks
+      BEGIN
+        DELETE FROM chat_memory_blocks_search_fts_v2 WHERE rowid = old.id;
+      END;
+    `);
+
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS chat_memory_blocks_search_v2_au
+      AFTER UPDATE ON chat_memory_blocks
+      BEGIN
+        DELETE FROM chat_memory_blocks_search_fts_v2 WHERE rowid = old.id;
+        INSERT INTO chat_memory_blocks_search_fts_v2(
+          rowid, chatId, title, entities, places, events, keywords, summary
+        )
+        SELECT
+          new.id,
+          new.chatId,
+          memory_search_title(new.summary),
+          memory_search_entities(new.summary),
+          memory_search_places(new.summary),
+          memory_search_events(new.summary),
+          memory_search_keywords(new.summary),
+          memory_search_summary(new.summary)
+        WHERE substr(new.summary, 1, 7) != 'enc:v1:';
+      END;
+    `);
+
+    db.exec(`
+      INSERT INTO chat_memory_blocks_search_fts_v2(
+        rowid, chatId, title, entities, places, events, keywords, summary
+      )
+      SELECT
+        b.id,
+        b.chatId,
+        memory_search_title(b.summary),
+        memory_search_entities(b.summary),
+        memory_search_places(b.summary),
+        memory_search_events(b.summary),
+        memory_search_keywords(b.summary),
+        memory_search_summary(b.summary)
+      FROM chat_memory_blocks b
+      WHERE substr(b.summary, 1, 7) != 'enc:v1:'
+        AND NOT EXISTS (
+          SELECT 1 FROM chat_memory_blocks_search_fts_v2 f WHERE f.rowid = b.id
+        );
+    `);
+  } catch {
+    // FTS5/trigram 미지원 배포에서는 기존 인덱스 또는 호환 스캔을 계속 사용한다.
+  }
+
   // 4-1) message_usage (메시지별 토큰/지연 정보)
   db.exec(`
     CREATE TABLE IF NOT EXISTS chat_character_roster (
@@ -550,6 +661,33 @@ if (!hasColumn("chat_settings", "narrationColor")) {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_character_turn_memories_chat_roster ON chat_character_turn_memories(chatId, rosterId, turnNo)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_chat_character_turn_memories_roster ON chat_character_turn_memories(rosterId)`);
+
+  // 인물별 정본 사실의 근거 관측값. 최신 값만 덮어쓰지 않고 관측 이력을
+  // 보존해 과거 메시지 편집 시 해당 턴 이후만 안전하게 무효화할 수 있다.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_character_facts (
+      id TEXT PRIMARY KEY,
+      chatId TEXT NOT NULL,
+      subjectKey TEXT NOT NULL,
+      subjectName TEXT NOT NULL DEFAULT '',
+      category TEXT NOT NULL DEFAULT 'identity',
+      factKey TEXT NOT NULL,
+      factValue TEXT NOT NULL DEFAULT '',
+      factHash TEXT NOT NULL,
+      sourceRole TEXT NOT NULL DEFAULT 'assistant',
+      authority INTEGER NOT NULL DEFAULT 40,
+      confidence INTEGER NOT NULL DEFAULT 0,
+      evidence TEXT NOT NULL DEFAULT '',
+      turnNo INTEGER NOT NULL DEFAULT 0,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL,
+      UNIQUE(chatId, subjectKey, factKey, factHash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_character_facts_chat_subject
+      ON chat_character_facts(chatId, subjectKey, factKey, turnNo DESC);
+    CREATE INDEX IF NOT EXISTS idx_chat_character_facts_chat_turn
+      ON chat_character_facts(chatId, turnNo DESC);
+  `);
 
   // 4-1-1) 채팅별 구조화 관계도
   // 이름이 밝혀지지 않은 역할 인물도 subject/relation/slot 조합으로 먼저 보존하고,
@@ -909,6 +1047,9 @@ if (!hasColumn("chat_settings", "narrationColor")) {
         DELETE FROM chat_character_vitals
         WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_character_vitals.chatId);
 
+        DELETE FROM chat_character_facts
+        WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_character_facts.chatId);
+
         INSERT OR IGNORE INTO chat_settings (
           chatId,
           personaName, personaAge, personaGender, personaInfo,
@@ -974,6 +1115,7 @@ function deleteChatDataRows(targetChatId: string) {
   db.prepare(`DELETE FROM chat_character_relations WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_affinity WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_vitals WHERE chatId=?`).run(targetChatId);
+  db.prepare(`DELETE FROM chat_character_facts WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_roster WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=?`).run(targetChatId);
 }

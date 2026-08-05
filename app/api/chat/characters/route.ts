@@ -286,6 +286,13 @@ export async function PATCH(req: Request) {
     now,
     id
   );
+  try {
+    db.prepare(
+      `UPDATE chat_character_facts SET subjectName=?, updatedAt=? WHERE chatId=? AND subjectKey=?`
+    ).run(name, now, String(access.row.chatId || ""), id);
+  } catch {
+    // Pre-migration hot-reload compatibility; the next process start creates the table.
+  }
 
   const row = db.prepare(`SELECT * FROM chat_character_roster WHERE id=?`).get(id) as any;
   return NextResponse.json({ ok: true, character: rowForClient(row) });
@@ -300,6 +307,14 @@ export async function DELETE(req: Request) {
   if (!access.ok) return access.res;
 
   db.prepare(`DELETE FROM chat_character_turn_memories WHERE rosterId=?`).run(id);
+  try {
+    db.prepare(`DELETE FROM chat_character_facts WHERE chatId=? AND subjectKey=?`).run(
+      String(access.row.chatId || ""),
+      id
+    );
+  } catch {
+    // Pre-migration hot-reload compatibility.
+  }
   db.prepare(`DELETE FROM chat_character_affinity WHERE rosterId=?`).run(id);
   db.prepare(`DELETE FROM chat_character_vitals WHERE rosterId=?`).run(id);
   db.prepare(`DELETE FROM chat_character_roster WHERE id=?`).run(id);

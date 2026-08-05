@@ -7,6 +7,10 @@ import {
 } from "@/lib/structured_relationship_memory";
 import { db } from "@/lib/db";
 import { selectMessagesForAssistantTurnRange } from "@/app/api/chat/send/_server/turnRange";
+import {
+  buildAuthoritativePersonaFacts,
+  loadCanonicalCharacterFacts,
+} from "@/lib/canonical_character_facts";
 
 const RELATIONSHIP_REFRESH_EVERY_TURNS = 5;
 const RELATIONSHIP_BOOTSTRAP_WINDOW_TURNS = 12;
@@ -31,6 +35,7 @@ export type RelationshipGraphRefreshResult = {
   charactersAdded: string[];
   aliasesUpdated: string[];
   relationshipsUpserted: number;
+  factsUpserted: number;
 };
 
 const lastAttemptedTurnByChat = new Map<string, number>();
@@ -100,6 +105,7 @@ function result(
     charactersAdded: [],
     aliasesUpdated: [],
     relationshipsUpserted: 0,
+    factsUpserted: 0,
   };
 }
 
@@ -151,6 +157,20 @@ export async function refreshRelationshipGraphIfDue(params: {
     rawWindowText,
     personaName,
     existingCharacters: loadStructuredCharacterIdentities(chatId),
+    existingFacts: loadCanonicalCharacterFacts(chatId),
+    authoritativePersona: (() => {
+      const settings = db
+        .prepare(
+          `SELECT personaAge, personaGender, personaInfo FROM chat_settings WHERE chatId=?`
+        )
+        .get(chatId) as Record<string, unknown> | undefined;
+      return buildAuthoritativePersonaFacts({
+        name: personaName,
+        age: settings?.personaAge,
+        gender: settings?.personaGender,
+        info: settings?.personaInfo,
+      });
+    })(),
     llmOpts: {
       model:
         String(process.env.LONG_MEMORY_SUMMARY_MODEL || "").trim() ||
@@ -181,5 +201,6 @@ export async function refreshRelationshipGraphIfDue(params: {
     charactersAdded: applied.charactersAdded,
     aliasesUpdated: applied.aliasesUpdated,
     relationshipsUpserted: applied.relationshipsUpserted,
+    factsUpserted: applied.factsUpserted,
   };
 }

@@ -7,6 +7,15 @@ import {
   inferCharacterOccupation,
   isValidDescriptiveRelationship,
 } from "@/lib/relationship_context";
+import {
+  CANONICAL_FACT_KEYS,
+  canonicalFactConflictsWithPersona,
+  storeCanonicalFactObservations,
+  type AuthoritativePersonaFacts,
+  type CanonicalFactKey,
+  type CanonicalFactObservation,
+  type ResolvedCanonicalFact,
+} from "@/lib/canonical_character_facts";
 
 export const STRUCTURED_RELATION_TYPES = [
   "아버지",
@@ -197,10 +206,13 @@ export type StructuredRelationship = {
   evidence: string;
 };
 
+export type StructuredCharacterFact = CanonicalFactObservation;
+
 export type StructuredCharacterGraph = {
   ok: boolean;
   characters: StructuredCharacter[];
   relationships: StructuredRelationship[];
+  facts: StructuredCharacterFact[];
 };
 
 function cleanText(value: unknown, max = 400) {
@@ -294,7 +306,7 @@ export function loadStructuredCharacterIdentities(chatIdRaw: string) {
 
 const STRUCTURED_GRAPH_SCHEMA = {
   type: "object",
-  required: ["characters", "relationships"],
+  required: ["characters", "relationships", "facts"],
   properties: {
     characters: {
       type: "array",
@@ -334,12 +346,45 @@ const STRUCTURED_GRAPH_SCHEMA = {
         },
       },
     },
+    facts: {
+      type: "array",
+      items: {
+        type: "object",
+        required: [
+          "subject_id",
+          "category",
+          "fact_key",
+          "value",
+          "evidence",
+          "source_role",
+          "confidence",
+          "stable",
+        ],
+        properties: {
+          subject_id: { type: "string" },
+          category: { type: "string" },
+          fact_key: {
+            type: "string",
+            enum: CANONICAL_FACT_KEYS,
+          },
+          value: { type: "string" },
+          evidence: { type: "string" },
+          source_role: {
+            type: "string",
+            enum: ["user", "assistant"],
+          },
+          confidence: { type: "integer" },
+          stable: { type: "boolean" },
+        },
+      },
+    },
   },
 } as const;
 
 type StructuredGraphResponseShape = {
   characters?: unknown;
   relationships?: unknown;
+  facts?: unknown;
 };
 
 function extractJsonObject(raw: string): unknown {
@@ -361,6 +406,22 @@ function extractJsonObject(raw: string): unknown {
 function exactEvidence(raw: string, value: unknown) {
   const evidence = cleanText(value, 500);
   return evidence.length >= 2 && raw.includes(evidence) ? evidence : "";
+}
+
+function evidenceSourceRole(raw: string, evidence: string) {
+  const roles = new Set<"user" | "assistant">();
+  let from = 0;
+  while (from < raw.length) {
+    const index = raw.indexOf(evidence, from);
+    if (index < 0) break;
+    const prefix = raw.slice(0, index);
+    const userAt = prefix.lastIndexOf("[사용자]");
+    const assistantAt = prefix.lastIndexOf("[어시스턴트]");
+    roles.add(userAt > assistantAt ? "user" : "assistant");
+    from = index + Math.max(1, evidence.length);
+  }
+  if (roles.size !== 1) return "";
+  return [...roles][0];
 }
 
 function safeAliases(
@@ -392,6 +453,8 @@ export async function extractStructuredCharacterGraph(params: {
   rawWindowText: string;
   personaName: string;
   existingCharacters: ExistingStructuredCharacter[];
+  existingFacts?: ResolvedCanonicalFact[];
+  authoritativePersona?: AuthoritativePersonaFacts;
   llmOpts: {
     model: string;
     maxOutputTokens: number;
@@ -403,14 +466,29 @@ export async function extractStructuredCharacterGraph(params: {
 }): Promise<StructuredCharacterGraph> {
   const raw = String(params.rawWindowText || "").trim();
   if (!raw || raw.length < 40) {
-    return { ok: true, characters: [], relationships: [] };
+    return { ok: true, characters: [], relationships: [], facts: [] };
   }
 
   const personaName = cleanText(params.personaName, 80);
   const existing = params.existingCharacters.slice(0, 80);
+  const existingFacts = (params.existingFacts || []).slice(0, 240);
   const registry = [
     ...(personaName
-      ? [{ id: "persona", main_name: personaName, aliases: ["주인공", "페르소나"] }]
+      ? [{
+          id: "persona",
+          main_name: personaName,
+          aliases: ["주인공", "페르소나"],
+          profile: {
+            authoritative_setting: params.authoritativePersona || {},
+            canonical_facts: existingFacts
+              .filter(
+                (fact) =>
+                  fact.subjectKey === "persona" ||
+                  normalizedKey(fact.subjectName) === normalizedKey(personaName)
+              )
+              .map((fact) => ({ key: fact.factKey, value: fact.value, source: fact.sourceRole })),
+          },
+        }]
       : []),
     ...existing.map((item) => ({
       id: item.id,
@@ -422,6 +500,13 @@ export async function extractStructuredCharacterGraph(params: {
         background: item.profile,
         relationship_memory: item.relationshipNote,
         recent_individual_memory: item.recentMemory,
+        canonical_facts: existingFacts
+          .filter(
+            (fact) =>
+              fact.subjectKey === item.id ||
+              normalizedKey(fact.subjectName) === normalizedKey(item.mainName)
+          )
+          .map((fact) => ({ key: fact.factKey, value: fact.value, source: fact.sourceRole })),
       },
     })),
   ];
@@ -432,8 +517,9 @@ export async function extractStructuredCharacterGraph(params: {
     "2) 호칭 통합: 같은 인물의 이름, 성/이름 축약, 직함, 애칭, 가족 호칭을 한 main_name 아래 aliases로 묶는다.",
     "3) 직업·배경·기억 결합: 대화뿐 아니라 기존 레지스트리의 job, role, background, relationship_memory, recent_individual_memory를 함께 보고 관계를 추론한다.",
     "4) 관계 정의: 직접 대화가 없어도 제3자 언급, 직업, 배경 상황으로 확인되는 관계를 relationships에 기록한다.",
-    "5) 검증: 기존 인물 레지스트리와 같은 인물은 반드시 기존 id와 main_name을 그대로 재사용한다.",
-    "6) 출력: 지정된 JSON 스키마만 출력한다. 코드펜스, 설명, 분석문은 금지한다.",
+    "5) 정본 사실 추출: 인물마다 다음 대화에서도 유지되어야 할 나이·성별·키·체중·체형·외모·직업·배경·정체·말투만 facts에 구조화한다.",
+    "6) 검증: 기존 인물 레지스트리와 같은 인물은 반드시 기존 id와 main_name을 그대로 재사용한다.",
+    "7) 출력: 지정된 JSON 스키마만 출력한다. 코드펜스, 설명, 분석문은 금지한다.",
     "",
     "중요 규칙:",
     "- relationships는 이름이 아니라 characters의 id로 연결한다.",
@@ -450,6 +536,14 @@ export async function extractStructuredCharacterGraph(params: {
     "- 이름이 없는 역할 인물에게 새 이름을 지어내지 않는다. 이름 미상 노드도 만들지 않는다.",
     "- evidence는 반드시 원문에서 글자 그대로 복사한 짧은 구절이어야 한다.",
     "- 동일 인물을 여러 character로 쪼개지 말고, 서로 다른 인물을 같은 호칭만으로 합치지 않는다.",
+    "- facts에는 일회성 자세·표정·옷차림·현재 위치·순간 감정·비유를 넣지 않는다. 여러 턴 뒤에도 유지될 정체성·신체·직업·배경 사실만 넣는다.",
+    "- facts의 source_role은 근거 문장이 [사용자]면 user, [어시스턴트]면 assistant로 정확히 기록한다. 발화 내용이 아니라 원문 역할 태그를 따른다.",
+    "- [사용자]가 직접 확정·정정한 사실은 기존 사실과 달라도 최신 값으로 추출한다.",
+    "- 단, 등장인물의 대사 속 주장·욕설·질문·추측·거짓말은 사용자 태그에 있어도 정본 사실 근거가 아니다. OOC/설정/서술로 확정된 내용만 user 사실로 인정한다.",
+    "- [어시스턴트] 지문은 새 NPC의 아직 없는 사실을 처음 세우는 근거로만 쓸 수 있다. 기존 정본 사실을 덮어쓰거나 모순시키는 AI 형용사·추측은 facts에 넣지 않는다.",
+    "- 특히 키·체중 수치와 반대되는 체형 표현을 만들지 않는다. 기존 설정이 100kg 이상인 인물을 왜소한 몸집·마른 체구·가녀린 체격으로 추출하지 않는다.",
+    "- 사실 근거는 반드시 한 개의 짧은 exact evidence로 직접 확인되어야 하며, 추론한 수치나 외형은 저장하지 않는다.",
+    `페르소나 최우선 설정: ${JSON.stringify(params.authoritativePersona || {})}`,
     `기존 인물 레지스트리: ${JSON.stringify(registry)}`,
   ].join("\n");
   const user = [
@@ -485,7 +579,7 @@ export async function extractStructuredCharacterGraph(params: {
           rawTextSample: responseText.slice(0, 1200),
         }));
       }
-      return { ok: false, characters: [], relationships: [] };
+      return { ok: false, characters: [], relationships: [], facts: [] };
     }
   } catch (error: unknown) {
     if (process.env.CHAT_DEBUG === "1") {
@@ -495,10 +589,10 @@ export async function extractStructuredCharacterGraph(params: {
         error: String((error as { message?: unknown })?.message || error),
       }));
     }
-    return { ok: false, characters: [], relationships: [] };
+    return { ok: false, characters: [], relationships: [], facts: [] };
   }
   if (!parsed) {
-    return { ok: false, characters: [], relationships: [] };
+    return { ok: false, characters: [], relationships: [], facts: [] };
   }
 
   const existingById = new Map(existing.map((item) => [item.id, item]));
@@ -648,6 +742,80 @@ export async function extractStructuredCharacterGraph(params: {
     });
   }
 
+  const facts: StructuredCharacterFact[] = [];
+  const factSlots = new Map<string, number>();
+  let rejectedFactCount = 0;
+  const rawFacts = Array.isArray(parsed?.facts) ? parsed.facts : [];
+  for (const item of rawFacts) {
+    const subject = resolveKnownCharacter(item?.subject_id);
+    const factKey = cleanText(item?.fact_key, 40) as CanonicalFactKey;
+    const value = cleanText(item?.value, 800);
+    const evidence = exactEvidence(raw, item?.evidence);
+    const sourceRole = evidence ? evidenceSourceRole(raw, evidence) : "";
+    const declaredSourceRole = cleanText(item?.source_role, 20);
+    const confidence = Math.max(0, Math.min(100, Math.trunc(Number(item?.confidence) || 0)));
+    const stable = item?.stable === true;
+    if (
+      !subject ||
+      !CANONICAL_FACT_KEYS.includes(factKey) ||
+      !value ||
+      !evidence ||
+      !sourceRole ||
+      declaredSourceRole !== sourceRole ||
+      !stable ||
+      confidence < 60
+    ) {
+      rejectedFactCount += 1;
+      continue;
+    }
+
+    const fact: StructuredCharacterFact = {
+      subjectKey: subject.id === "persona" ? "persona" : subject.id,
+      subjectName: subject.mainName,
+      category: cleanText(item?.category, 40) || "identity",
+      factKey,
+      value,
+      evidence,
+      sourceRole,
+      confidence,
+      turnNo: params.windowEndTurn,
+    };
+    const existingSameKey = existingFacts.filter(
+      (known) =>
+        (known.subjectKey === fact.subjectKey ||
+          normalizedKey(known.subjectName) === normalizedKey(fact.subjectName)) &&
+        known.factKey === fact.factKey
+    );
+    if (
+      sourceRole === "assistant" &&
+      (canonicalFactConflictsWithPersona(
+        fact,
+        params.authoritativePersona || {
+          name: personaName,
+          age: 0,
+          gender: "",
+          info: "",
+          heightCm: null,
+          weightKg: null,
+        }
+      ) ||
+        existingSameKey.some(
+          (known) => normalizedKey(known.value) !== normalizedKey(fact.value)
+        ))
+    ) {
+      rejectedFactCount += 1;
+      continue;
+    }
+    const factSlot = [fact.subjectKey, fact.factKey].join("\u0000");
+    const previousIndex = factSlots.get(factSlot);
+    if (previousIndex !== undefined) {
+      if (sourceRole === "user") facts[previousIndex] = fact;
+      continue;
+    }
+    factSlots.set(factSlot, facts.length);
+    facts.push(fact);
+  }
+
   const characters = [...charactersByName.values()];
   const canonicalNames = new Set(characters.map((item) => normalizedKey(item.mainName)));
   const aliasOwners = new Map<string, Set<string>>();
@@ -677,6 +845,9 @@ export async function extractStructuredCharacterGraph(params: {
       rawRelationshipCount: rawRelationships.length,
       acceptedRelationshipCount: relationships.length,
       rejectedRelationshipCount,
+      rawFactCount: rawFacts.length,
+      acceptedFactCount: facts.length,
+      rejectedFactCount,
     }));
   }
 
@@ -684,6 +855,7 @@ export async function extractStructuredCharacterGraph(params: {
     ok: true,
     characters: characters.slice(0, 80),
     relationships: relationships.slice(0, 160),
+    facts: facts.slice(0, 240),
   };
 }
 
@@ -709,6 +881,7 @@ export function applyStructuredCharacterGraph(params: {
       charactersAdded: [] as string[],
       aliasesUpdated: [] as string[],
       relationshipsUpserted: 0,
+      factsUpserted: 0,
     };
   }
 
@@ -940,9 +1113,15 @@ export function applyStructuredCharacterGraph(params: {
   });
   applyRelationships();
 
+  const factsUpserted = storeCanonicalFactObservations({
+    chatId,
+    facts: params.graph.facts,
+  });
+
   return {
     charactersAdded: [...new Set(charactersAdded)],
     aliasesUpdated: [...new Set(aliasesUpdated)],
     relationshipsUpserted,
+    factsUpserted,
   };
 }

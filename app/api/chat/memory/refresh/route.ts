@@ -20,6 +20,12 @@ import {
   extractStructuredCharacterGraph,
   loadStructuredCharacterIdentities,
 } from "@/lib/structured_relationship_memory";
+import {
+  analyzeCanonicalFactDrift,
+  buildAuthoritativePersonaFacts,
+  formatCanonicalCharacterFactsBlock,
+  loadCanonicalCharacterFacts,
+} from "@/lib/canonical_character_facts";
 
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
@@ -570,11 +576,15 @@ type StructuredGraphRefreshOutcome = {
   autoCharactersAdded: string[];
   autoAliasesUpdated: string[];
   autoRelationshipsUpserted: number;
+  autoFactsUpserted: number;
 };
 
 async function refreshStructuredCharacterState(params: {
   chatId: string;
   personaName: string;
+  personaAge: number;
+  personaGender: string;
+  personaInfo: string;
   summaryModel: string;
   graphWindowText: string;
   graphWindowStartTurn: number;
@@ -591,6 +601,7 @@ async function refreshStructuredCharacterState(params: {
     autoCharactersAdded: [],
     autoAliasesUpdated: [],
     autoRelationshipsUpserted: 0,
+    autoFactsUpserted: 0,
   });
 
   try {
@@ -604,10 +615,18 @@ async function refreshStructuredCharacterState(params: {
     );
     const candidateNames: string[] = [];
     const wasRosterEmpty = existingNames.size === 0;
+    const authoritativePersona = buildAuthoritativePersonaFacts({
+      name: params.personaName,
+      age: params.personaAge,
+      gender: params.personaGender,
+      info: params.personaInfo,
+    });
     const structuredGraph = await extractStructuredCharacterGraph({
       rawWindowText: params.graphWindowText,
       personaName: params.personaName,
       existingCharacters: loadStructuredCharacterIdentities(params.chatId),
+      existingFacts: loadCanonicalCharacterFacts(params.chatId),
+      authoritativePersona,
       llmOpts: {
         model: params.summaryModel,
         maxOutputTokens: 4096,
@@ -635,6 +654,7 @@ async function refreshStructuredCharacterState(params: {
     let autoCharactersAdded: string[] = [];
     let autoAliasesUpdated: string[] = [];
     let autoRelationshipsUpserted = 0;
+    let autoFactsUpserted = 0;
     if (structuredGraph.ok) {
       const applied = applyStructuredCharacterGraph({
         chatId: params.chatId,
@@ -645,6 +665,7 @@ async function refreshStructuredCharacterState(params: {
       autoCharactersAdded = applied.charactersAdded;
       autoAliasesUpdated = applied.aliasesUpdated;
       autoRelationshipsUpserted = applied.relationshipsUpserted;
+      autoFactsUpserted = applied.factsUpserted;
     }
 
     let detected: AutoDetectedCharacter[] = [];
@@ -705,7 +726,9 @@ async function refreshStructuredCharacterState(params: {
 
     const structuredGraphRefreshed =
       structuredGraph.ok &&
-      (acceptedNames.size > 0 || structuredGraph.relationships.length > 0);
+      (acceptedNames.size > 0 ||
+        structuredGraph.relationships.length > 0 ||
+        structuredGraph.facts.length > 0);
     if (process.env.CHAT_DEBUG === "1") {
       console.log(JSON.stringify({
         tag: "structuredGraph.refresh",
@@ -719,6 +742,7 @@ async function refreshStructuredCharacterState(params: {
         autoCharactersAdded,
         autoAliasesUpdated,
         autoRelationshipsUpserted,
+        autoFactsUpserted,
       }));
     }
     return {
@@ -731,6 +755,7 @@ async function refreshStructuredCharacterState(params: {
       autoCharactersAdded,
       autoAliasesUpdated,
       autoRelationshipsUpserted,
+      autoFactsUpserted,
     };
   } catch (error: unknown) {
     if (process.env.CHAT_DEBUG === "1") {
@@ -914,7 +939,8 @@ export async function POST(req: Request) {
     // settings (model + token budgets)
     const st = db
       .prepare(
-        `SELECT model, maxOutputTokens, maxReasoningTokens, thinkingBudget, personaName, longMemoryPerTurnChars
+        `SELECT model, maxOutputTokens, maxReasoningTokens, thinkingBudget,
+                personaName, personaAge, personaGender, personaInfo, longMemoryPerTurnChars
          FROM chat_settings WHERE chatId=?`
       )
       .get(chatId) as any;
@@ -953,6 +979,15 @@ export async function POST(req: Request) {
       ? ""
       : inferPersonaNameFromMessages(all);
     const personaName = configuredPersonaName || inferredPersonaName;
+    const personaAge = Math.max(0, Math.trunc(Number(st?.personaAge) || 0));
+    const personaGender = String(st?.personaGender || "").trim();
+    const personaInfo = String(st?.personaInfo || "").trim();
+    const authoritativePersona = buildAuthoritativePersonaFacts({
+      name: personaName,
+      age: personaAge,
+      gender: personaGender,
+      info: personaInfo,
+    });
 
     if (!configuredPersonaName && inferredPersonaName) {
       db.prepare(
@@ -1037,8 +1072,11 @@ export async function POST(req: Request) {
             .get(chatId) as { count?: unknown }
         )?.count || 0
       );
+      const canonicalFactCount = loadCanonicalCharacterFacts(chatId).length;
       const shouldRepairGraph =
-        rosterCount === 0 || (rosterCount > 1 && relationshipCount === 0);
+        rosterCount === 0 ||
+        canonicalFactCount === 0 ||
+        (rosterCount > 1 && relationshipCount === 0);
       if (shouldRepairGraph) {
         const wasRosterEmpty = rosterCount === 0;
         const graphWindowStartTurn = Math.max(
@@ -1056,6 +1094,9 @@ export async function POST(req: Request) {
         const graphOutcome = await refreshStructuredCharacterState({
           chatId,
           personaName,
+          personaAge,
+          personaGender,
+          personaInfo,
           summaryModel,
           graphWindowText,
           graphWindowStartTurn,
@@ -1071,7 +1112,8 @@ export async function POST(req: Request) {
         const graphChanged =
           graphOutcome.autoCharactersAdded.length > 0 ||
           graphOutcome.autoAliasesUpdated.length > 0 ||
-          graphOutcome.autoRelationshipsUpserted > 0;
+          graphOutcome.autoRelationshipsUpserted > 0 ||
+          graphOutcome.autoFactsUpserted > 0;
         return NextResponse.json({
           ok: true,
           refreshed: graphChanged,
@@ -1228,6 +1270,11 @@ export async function POST(req: Request) {
       characterSources: identityCharacters,
     });
     const relationshipGraphBlock = formatRelationshipGraphBlock(loadRelationshipGraph(chatId));
+    const canonicalFacts = loadCanonicalCharacterFacts(chatId);
+    const canonicalFactsBlock = formatCanonicalCharacterFactsBlock({
+      persona: authoritativePersona,
+      facts: canonicalFacts,
+    });
 
     const sourceNameSet = collectLikelyKoreanNames(cleanedText);
     for (const fact of identityCanon.canon.nameFacts) {
@@ -1245,6 +1292,7 @@ export async function POST(req: Request) {
       LONG_MEMORY_SUMMARY_RULES,
       relationshipCorrectionGuidance,
       identityCanon.block,
+      canonicalFactsBlock,
       relationshipGraphBlock,
       nameLockGuidance,
       "- 저장된 관계도는 인물별 가족관계·서사 관계 성격·현재 나이·호감도를 지키기 위한 연속성 기준이다.",
@@ -1303,9 +1351,15 @@ export async function POST(req: Request) {
       summary: norm.body,
       canon: identityCanon.canon,
     });
+    let canonicalFactDrift = analyzeCanonicalFactDrift({
+      sourceText: cleanedText,
+      summary: norm.body,
+      persona: authoritativePersona,
+      facts: canonicalFacts,
+    });
 
     // 2) retry with stricter prompt and without model downshift (more reliable, higher cost, rare)
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -1332,10 +1386,16 @@ export async function POST(req: Request) {
         summary: norm.body,
         canon: identityCanon.canon,
       });
+      canonicalFactDrift = analyzeCanonicalFactDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        persona: authoritativePersona,
+        facts: canonicalFacts,
+      });
     }
 
     // 3) last-resort: fallback summarizer (body-only) then wrap into a section.
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -1361,11 +1421,17 @@ export async function POST(req: Request) {
         summary: norm.body,
         canon: identityCanon.canon,
       });
+      canonicalFactDrift = analyzeCanonicalFactDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        persona: authoritativePersona,
+        facts: canonicalFacts,
+      });
     }
 
     // 4) optional rescue pass: only when LONG_MEMORY_SUMMARY_FALLBACK_MODEL is explicitly set.
     // Default policy is flash-only (no automatic model bounce).
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       const fallbackModel = pickLongMemorySummaryFallbackModel();
       if (fallbackModel) {
         const rescueOpts = {
@@ -1397,6 +1463,12 @@ export async function POST(req: Request) {
             summary: norm.body,
             canon: identityCanon.canon,
           });
+          canonicalFactDrift = analyzeCanonicalFactDrift({
+            sourceText: cleanedText,
+            summary: norm.body,
+            persona: authoritativePersona,
+            facts: canonicalFacts,
+          });
         }
       }
     }
@@ -1405,12 +1477,13 @@ export async function POST(req: Request) {
     // 막히지 않도록, 실제 저장된 assistant 원문에서 결정론적 보존 요약을 만든다.
     let deterministicFallbackUsed = false;
     let deterministicFallbackReason = "";
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok) {
+    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       deterministicFallbackReason = [
         !q.ok ? `quality:${q.reason}` : "",
         !ndrift.ok ? `name:${ndrift.reason}` : "",
         !relationshipDrift.ok ? `relationship:${relationshipDrift.reason}` : "",
         !identityDrift.ok ? `identity:${identityDrift.reason}` : "",
+        !canonicalFactDrift.ok ? `canonical_fact:${canonicalFactDrift.reason}` : "",
         ...generationErrors,
       ]
         .filter(Boolean)
@@ -1430,6 +1503,12 @@ export async function POST(req: Request) {
         summary: norm.body,
         canon: identityCanon.canon,
       });
+      canonicalFactDrift = analyzeCanonicalFactDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        persona: authoritativePersona,
+        facts: canonicalFacts,
+      });
       deterministicFallbackUsed = true;
     }
 
@@ -1438,18 +1517,21 @@ export async function POST(req: Request) {
 
     // Relationship/identity conflicts are semantic corruption, not formatting defects.
     // Never save it even when the debug-only bad-output override is enabled.
-    if (!relationshipDrift.ok || !identityDrift.ok) {
+    if (!relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       return NextResponse.json({
         ok: true,
         skipped: true,
-        reason: !identityDrift.ok
-          ? "identity_canon_conflict"
-          : "relationship_correction_conflict",
+        reason: !canonicalFactDrift.ok
+          ? "canonical_fact_conflict"
+          : !identityDrift.ok
+            ? "identity_canon_conflict"
+            : "relationship_correction_conflict",
         windowStartTurn,
         windowEndTurn,
         boundaryEndTurn,
         relationshipDrift,
         identityDrift,
+        canonicalFactDrift,
       });
     }
 
@@ -1654,6 +1736,7 @@ export async function POST(req: Request) {
     let autoCharactersAdded: string[] = [];
     let autoAliasesUpdated: string[] = [];
     let autoRelationshipsUpserted = 0;
+    let autoFactsUpserted = 0;
     let structuredGraphParsed = false;
     let structuredGraphRefreshed = false;
     let structuredGraphFallbackUsed = false;
@@ -1678,6 +1761,9 @@ export async function POST(req: Request) {
       const graphOutcome = await refreshStructuredCharacterState({
         chatId,
         personaName,
+        personaAge,
+        personaGender,
+        personaInfo,
         summaryModel,
         graphWindowText,
         graphWindowStartTurn,
@@ -1687,6 +1773,7 @@ export async function POST(req: Request) {
       autoCharactersAdded = graphOutcome.autoCharactersAdded;
       autoAliasesUpdated = graphOutcome.autoAliasesUpdated;
       autoRelationshipsUpserted = graphOutcome.autoRelationshipsUpserted;
+      autoFactsUpserted = graphOutcome.autoFactsUpserted;
       structuredGraphParsed = graphOutcome.structuredGraphParsed;
       structuredGraphRefreshed = graphOutcome.structuredGraphRefreshed;
       structuredGraphFallbackUsed = graphOutcome.fallbackUsed;
@@ -1718,11 +1805,13 @@ export async function POST(req: Request) {
       nameDrift: ndrift,
       relationshipDrift,
       identityDrift,
+      canonicalFactDrift,
       memoryBlocksBackfilled,
       autoCharactersAdded,
       autoCharactersBackfilled,
       autoAliasesUpdated,
       autoRelationshipsUpserted,
+      autoFactsUpserted,
       structuredGraphParsed,
       structuredGraphRefreshed,
       structuredGraphFallbackUsed,

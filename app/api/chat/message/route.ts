@@ -215,6 +215,7 @@ export async function PATCH(req: Request) {
           `DELETE FROM chat_memory_blocks WHERE chatId=? AND endTurn>?`
         ).run(cid, truncateEndTurn);
         db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
+        db.prepare(`DELETE FROM chat_character_facts WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
       }
     } catch {
       // best-effort
@@ -303,6 +304,7 @@ export async function DELETE(req: Request) {
             `DELETE FROM chat_memory_blocks WHERE chatId=? AND endTurn>?`
           ).run(cid, truncateEndTurn);
           db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
+          db.prepare(`DELETE FROM chat_character_facts WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
         }
       } catch {
         // ignore

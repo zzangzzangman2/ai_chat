@@ -27,6 +27,15 @@ import {
 } from "@/lib/relationship_graph";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
 import { selectConservativeMemoryRows } from "@/lib/character_memory_quality";
+import {
+  buildMemorySearchFtsQuery,
+  buildMemorySearchIndex,
+} from "@/lib/memory_search_index";
+import {
+  buildAuthoritativePersonaFacts,
+  formatCanonicalCharacterFactsBlock,
+  loadCanonicalCharacterFacts,
+} from "@/lib/canonical_character_facts";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -185,6 +194,15 @@ type RelatedMemoryBlock = {
   explicitMatch: boolean;
 };
 
+const relatedMemoryStatementCache = new Map<string, ReturnType<typeof db.prepare>>();
+function relatedMemoryStatement(sql: string) {
+  const cached = relatedMemoryStatementCache.get(sql);
+  if (cached) return cached;
+  const statement = db.prepare(sql);
+  relatedMemoryStatementCache.set(sql, statement);
+  return statement;
+}
+
 function buildRelatedMemoryBlocks(params: {
   chatId: string;
   queryText: string;
@@ -236,100 +254,214 @@ function buildRelatedMemoryBlocks(params: {
     if (!summarizedRanges.length) return false;
     return summarizedRanges.some((r) => r.start <= st && r.end >= ed);
   };
-  // 1) 기본 후보군: 가장 오래된 1200건 (기존 동작 유지)
-  const baseRows = db
-    .prepare(
+  type SearchRow = {
+    id: number;
+    startTurn: number;
+    endTurn: number;
+    summary: string;
+    _searchBoost?: number;
+  };
+
+  const candidateRows = new Map<number, SearchRow>();
+  const addCandidateRows = (rows: any[], boost = 0) => {
+    for (const raw of rows) {
+      const id = Number(raw?.id || 0);
+      if (id <= 0) continue;
+      const previous = candidateRows.get(id);
+      const nextBoost = Math.max(Number(previous?._searchBoost || 0), boost);
+      candidateRows.set(id, {
+        id,
+        startTurn: Number(raw?.startTurn || 0),
+        endTurn: Number(raw?.endTurn || 0),
+        summary: String(raw?.summary || ""),
+        _searchBoost: nextBoost,
+      });
+    }
+  };
+
+  // Always retain a small origin/recent safety window. This preserves early
+  // foundational events and immediate continuity without scanning 1,200 rows.
+  const earliestRows = relatedMemoryStatement(
       `SELECT id, startTurn, endTurn, summary
        FROM chat_memory_blocks
        WHERE chatId=?
        ORDER BY startTurn ASC
-       LIMIT 1200`
+       LIMIT 40`
     )
     .all(chatId) as any[];
+  const latestRows = relatedMemoryStatement(
+      `SELECT id, startTurn, endTurn, summary
+       FROM chat_memory_blocks
+       WHERE chatId=?
+       ORDER BY endTurn DESC
+       LIMIT 48`
+    )
+    .all(chatId) as any[];
+  addCandidateRows(earliestRows);
+  addCandidateRows(latestRows);
 
-  // 2) (최적화) FTS5 인덱스로 토큰 매칭되는 블록을 추가로 끌어온다.
-  //    - 1200건 cap 밖에 있던(=오래된 채팅 후반부) 관련 블록도 회수 가능
-  //    - FTS 사용 불가/실패 시 자동으로 빈 결과 → baseRows 단독 경로로 fallback
-  //    - 주의: FTS5 trigram 토크나이저는 3자 이상에서만 매칭 가능.
-  //      "두부"·"가시"·"병원" 같은 2자 한국어 명사는 FTS로 못 잡아서 아래 LIKE 보강이 필요하다.
-  const baseIdSet = new Set<number>(baseRows.map((r: any) => Number(r?.id || 0)).filter((n) => n > 0));
-  let ftsExtraRows: any[] = [];
+  // Explicit turn requests bypass lexical search entirely.
+  const requestedRanges: Array<{ start: number; end: number }> = [];
+  const turnLookupText = `${primaryQueryText}\n${queryText}`;
+  for (const match of turnLookupText.matchAll(/(\d{1,6})\s*(?:[-~–—]|부터|에서)\s*(\d{1,6})\s*턴/gu)) {
+    const a = Number(match[1]);
+    const b = Number(match[2]);
+    if (Number.isFinite(a) && Number.isFinite(b)) {
+      requestedRanges.push({ start: Math.min(a, b), end: Math.max(a, b) });
+    }
+  }
+  for (const match of turnLookupText.matchAll(/(\d{1,6})\s*턴/gu)) {
+    const n = Number(match[1]);
+    if (Number.isFinite(n)) requestedRanges.push({ start: n, end: n });
+  }
+  const directRangeStatement = relatedMemoryStatement(
+    `SELECT id, startTurn, endTurn, summary
+     FROM chat_memory_blocks
+     WHERE chatId=? AND startTurn <= ? AND endTurn >= ?
+     ORDER BY startTurn ASC
+     LIMIT 12`
+  );
+  for (const range of requestedRanges.slice(0, 8)) {
+    addCandidateRows(directRangeStatement.all(chatId, range.end, range.start) as any[], 20);
+  }
+
+  const primaryTokens = memorySearchTokens(primaryQueryText);
+  const ftsQuery = buildMemorySearchFtsQuery(
+    primaryTokens.slice(0, 18).concat(tokens.slice(0, 14)),
+    28
+  );
+  let v2Available = false;
+  let v2Hits: any[] = [];
   try {
-    const ftsTokens = tokens.filter((t) => t.length >= 3).slice(0, 20);
-    if (ftsTokens.length > 0) {
-      const ftsQuery = ftsTokens
-        .map((t) => `"${t.replace(/"/g, '""')}"`)
-        .join(" OR ");
-      const ftsHits = db
-        .prepare(
-          `SELECT rowid AS id FROM chat_memory_blocks_fts
-           WHERE chatId = ? AND summary MATCH ?
-           ORDER BY bm25(chat_memory_blocks_fts) ASC
-           LIMIT 200`
+    // This also distinguishes "no matches" from "index unavailable" so a
+    // vague request does not accidentally trigger the legacy full scan.
+    const indexedChatRow = relatedMemoryStatement(
+      `SELECT rowid FROM chat_memory_blocks_search_fts_v2 WHERE chatId=? LIMIT 1`
+    )
+      .get(chatId) as any;
+    const plaintextMemoryRow = relatedMemoryStatement(
+        `SELECT id
+         FROM chat_memory_blocks
+         WHERE chatId=? AND substr(summary, 1, 7)!='enc:v1:'
+         LIMIT 1`
+      )
+      .get(chatId) as any;
+    v2Available = Boolean(indexedChatRow?.rowid) || !plaintextMemoryRow?.id;
+    if (v2Available && ftsQuery) {
+      v2Hits = relatedMemoryStatement(
+          `SELECT b.id, b.startTurn, b.endTurn, b.summary,
+                  f.entities, f.places, f.events,
+                  bm25(chat_memory_blocks_search_fts_v2, 0.0, 9.0, 12.0, 7.0, 8.0, 4.0, 1.0) AS searchRank
+           FROM chat_memory_blocks_search_fts_v2 f
+           JOIN chat_memory_blocks b ON b.id=f.rowid
+           WHERE f.chatId = ? AND chat_memory_blocks_search_fts_v2 MATCH ?
+           ORDER BY searchRank ASC
+           LIMIT 240`
         )
         .all(chatId, ftsQuery) as any[];
-      const extraIds = ftsHits
-        .map((r: any) => Number(r?.id || 0))
-        .filter((n: number) => n > 0 && !baseIdSet.has(n));
-      if (extraIds.length > 0) {
-        const placeholders = extraIds.map(() => "?").join(",");
-        ftsExtraRows = db
-          .prepare(
-            `SELECT id, startTurn, endTurn, summary
-             FROM chat_memory_blocks
-             WHERE chatId = ? AND id IN (${placeholders})`
-          )
-          .all(chatId, ...extraIds) as any[];
+    }
+  } catch {
+    v2Available = false;
+    v2Hits = [];
+  }
+
+  if (v2Hits.length > 0) {
+    const indexedRows = v2Hits;
+    for (let rank = 0; rank < indexedRows.length; rank += 1) {
+      const row = indexedRows[rank];
+      addCandidateRows([row], Math.max(1, 6 - Math.floor(rank / 40)));
+    }
+
+    // Pull the immediately adjacent block only when it shares a structured
+    // entity/place/event. This recovers causes and consequences without adding
+    // a large chronological window to every prompt.
+    const indexedRowsById = new Map(
+      indexedRows.map((row) => [Number(row?.id || 0), row] as const)
+    );
+    const previousStatement = relatedMemoryStatement(
+      `SELECT id, startTurn, endTurn, summary
+       FROM chat_memory_blocks
+       WHERE chatId=? AND endTurn < ?
+       ORDER BY endTurn DESC
+       LIMIT 1`
+    );
+    const nextStatement = relatedMemoryStatement(
+      `SELECT id, startTurn, endTurn, summary
+       FROM chat_memory_blocks
+       WHERE chatId=? AND startTurn > ?
+       ORDER BY startTurn ASC
+       LIMIT 1`
+    );
+    const structuredTerms = (value: unknown) =>
+      new Set(String(value || "").split(/\s+/u).filter((term) => term.length >= 2));
+    const overlaps = (a: Set<string>, b: Set<string>) => {
+      for (const term of a) if (b.has(term)) return true;
+      return false;
+    };
+
+    for (const hit of v2Hits.slice(0, 10)) {
+      const hitRow = indexedRowsById.get(Number(hit?.id || 0));
+      if (!hitRow) continue;
+      const hitTerms = structuredTerms(`${hit?.entities || ""} ${hit?.places || ""} ${hit?.events || ""}`);
+      if (hitTerms.size === 0) continue;
+      const adjacent = [
+        previousStatement.get(chatId, Number(hitRow.startTurn || 0)) as any,
+        nextStatement.get(chatId, Number(hitRow.endTurn || 0)) as any,
+      ].filter(Boolean);
+      for (const neighbor of adjacent) {
+        const gap = Number(neighbor.startTurn) > Number(hitRow.endTurn)
+          ? Number(neighbor.startTurn) - Number(hitRow.endTurn)
+          : Number(hitRow.startTurn) - Number(neighbor.endTurn);
+        if (gap > 2) continue;
+        const plain = decryptIfPossible(String(neighbor.summary || ""));
+        const index = buildMemorySearchIndex(plain);
+        const neighborTerms = structuredTerms(`${index.entities} ${index.places} ${index.events}`);
+        if (overlaps(hitTerms, neighborTerms)) addCandidateRows([neighbor], 3);
       }
     }
-  } catch {
-    // FTS 미지원 / 쿼리 파싱 실패 / 트리거 미적용 등 → 기존 경로로만 동작
-    ftsExtraRows = [];
   }
 
-  // 3) (보강) 2자 토큰은 trigram FTS로 못 잡으니 SQL LIKE %t% 로 보강한다.
-  //    - "두부"/"가시"/"병원" 같은 2자 한국어 명사가 cap 밖 블록에 있어도 회수 가능
-  //    - chatId 필터 + base/FTS 후보 제외해서 추가분만 끌어옴
-  //    - 암호화 저장된 행은 LIKE 매칭이 무의미하므로 평문(prefix가 'enc:v1:'이 아닌)만 대상
-  let likeExtraRows: any[] = [];
-  try {
-    const shortTokens = tokens.filter((t) => t.length === 2).slice(0, 15);
-    if (shortTokens.length > 0) {
-      const ftsExtraIdSet = new Set<number>(
-        ftsExtraRows.map((r: any) => Number(r?.id || 0)).filter((n) => n > 0)
-      );
-      const likeClauses = shortTokens.map(() => "summary LIKE ?").join(" OR ");
-      const likeParams = shortTokens.map((t) => `%${t.replace(/[%_]/g, "\\$&")}%`);
-      const likeHits = db
-        .prepare(
+  // Old or encrypted deployments remain readable. This is deliberately an
+  // exceptional path; normal plaintext chats use the bounded v2 shortlist.
+  if (!v2Available) {
+    const legacyRows = relatedMemoryStatement(
+        `SELECT id, startTurn, endTurn, summary
+         FROM chat_memory_blocks
+         WHERE chatId=?
+         ORDER BY startTurn ASC
+         LIMIT 1200`
+      )
+      .all(chatId) as any[];
+    addCandidateRows(legacyRows);
+  } else {
+    const hasEncryptedRow = relatedMemoryStatement(
+        `SELECT 1 AS found
+         FROM chat_memory_blocks
+         WHERE chatId=? AND substr(summary, 1, 7)='enc:v1:'
+         LIMIT 1`
+      )
+      .get(chatId) as any;
+    if (hasEncryptedRow?.found) {
+      const encryptedRows = relatedMemoryStatement(
           `SELECT id, startTurn, endTurn, summary
            FROM chat_memory_blocks
-           WHERE chatId = ?
-             AND substr(summary, 1, 7) != 'enc:v1:'
-             AND (${likeClauses})
-           ORDER BY endTurn DESC
-           LIMIT 100`
+           WHERE chatId=? AND substr(summary, 1, 7)='enc:v1:'
+           ORDER BY startTurn ASC
+           LIMIT 1200`
         )
-        .all(chatId, ...likeParams) as any[];
-      likeExtraRows = likeHits.filter((r: any) => {
-        const id = Number(r?.id || 0);
-        return id > 0 && !baseIdSet.has(id) && !ftsExtraIdSet.has(id);
-      });
+        .all(chatId) as any[];
+      addCandidateRows(encryptedRows);
     }
-  } catch {
-    likeExtraRows = [];
   }
 
-  const rows =
-    ftsExtraRows.length + likeExtraRows.length > 0
-      ? baseRows.concat(ftsExtraRows).concat(likeExtraRows)
-      : baseRows;
+  const rows = [...candidateRows.values()];
 
   const candidates: Array<{
     startTurn: number;
     endTurn: number;
     summary: string;
     text: string;
+    boost?: number;
   }> = [];
   for (const row of rows) {
     const startTurn = Math.max(1, Math.floor(Number(row?.startTurn) || 0));
@@ -344,7 +476,13 @@ function buildRelatedMemoryBlocks(params: {
     // historySummary에 [startTurn..endTurn]을 포괄하는 구간 헤더가 이미 있으면 스킵.
     if (!allowDuplicate && isAlreadySummarized(startTurn, endTurn)) continue;
 
-    candidates.push({ startTurn, endTurn, summary, text: summary });
+    candidates.push({
+      startTurn,
+      endTurn,
+      summary,
+      text: summary,
+      boost: Math.max(0, Number(row?._searchBoost || 0)),
+    });
   }
 
   const picked: RelatedMemoryBlock[] = rankMemoryRetrievalCandidates({
@@ -1474,6 +1612,12 @@ ${body}`.trim();
     const personaAgeFinal = persona.age || 0;
     const personaGenderFinal = persona.gender;
     const personaInfoFinal = persona.info;
+    const authoritativePersonaFacts = buildAuthoritativePersonaFacts({
+      name: personaNameFinal,
+      age: personaAgeFinal,
+      gender: personaGenderFinal,
+      info: personaInfoFinal,
+    });
 
     const personaBlock = [
       // (G9) 페르소나 헤더에 "사용자 소유" 영역임을 명시 — NPC가 대신 말하거나 감정/행동을 단정할 수 없는 영역.
@@ -1807,6 +1951,26 @@ ${body}`.trim();
       ),
     };
     const identityCanonBlock = formatIdentityCanonBlock(identityCanonForPrompt);
+    let canonicalCharacterFactsBlock = "";
+    try {
+      canonicalCharacterFactsBlock = formatCanonicalCharacterFactsBlock({
+        persona: authoritativePersonaFacts,
+        facts: loadCanonicalCharacterFacts(cid),
+        focusNames: [
+          personaNameFinal,
+          preset.characterName,
+          ...continuityLedger.promptStates.map((state) => state.name),
+          ...dynamicCharacterContext.focusedNames,
+          ...dynamicCharacterContext.includedNames,
+        ],
+      });
+    } catch (error) {
+      console.error("[chat/send] canonical character facts failed", {
+        chatId: cid,
+        reqId,
+        error: String((error as { message?: unknown })?.message || error),
+      });
+    }
     // 새 동적 조회가 비어 있거나 DB 조회에 실패한 경우에만 기존 등록 캐릭터
     // 블록을 복구 경로로 사용한다. 정상 경로에서는 두 기억 블록을 중복 주입하지 않는다.
     let manualCharacterRosterFallback = "";
@@ -1869,6 +2033,7 @@ ${body}`.trim();
       dynamicEventCount: dynamicCharacterContext.eventCount,
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
       identityCanonChars: strlen(identityCanonBlock),
+      canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
       identityNameFacts: identityCanon.canon.nameFacts.length,
       identityRoleAnchors: identityCanon.canon.roleAnchors.length,
       inferredPersonaName: inferredPersonaName || "",
@@ -2386,9 +2551,15 @@ const systemRaw = (cacheFriendlyLayout
       ]).join("\n");
     const npcName = preset.characterName || (preset as any).name || "상대";
     const systemBase = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });
-    const systemWithIdentityCanon = identityCanonBlock
-      ? `${systemBase}\n\n${sanitizePromptCached(identityCanonBlock)}`
-      : systemBase;
+    const systemWithIdentityCanon = [
+      systemBase,
+      identityCanonBlock ? sanitizePromptCached(identityCanonBlock) : "",
+      canonicalCharacterFactsBlock
+        ? sanitizePromptCached(canonicalCharacterFactsBlock)
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
     const currentNarrationPriorityBlock = hasCurrentUserNarration
       ? [
           `# [CURRENT USER NARRATION — COMPLETED SCENE FACT]`,
@@ -2452,6 +2623,10 @@ const systemRaw = (cacheFriendlyLayout
 	          recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
 	          identityCanonBlock ? `` : "",
 	          identityCanonBlock ? sanitizePromptCached(identityCanonBlock) : "",
+	          canonicalCharacterFactsBlock ? `` : "",
+	          canonicalCharacterFactsBlock
+	            ? sanitizePromptCached(canonicalCharacterFactsBlock)
+	            : "",
 	          ``,
 	          "※ (중요) 이 이어쓰기 호출에서는 fenced 코드블록(```...```) 출력 금지. STATUS/INFO/메타 블록도 출력하지 마라.",
 	          currentNarrationPriorityBlock ? `` : "",
