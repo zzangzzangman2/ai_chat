@@ -14,6 +14,7 @@ export const CANONICAL_FACT_KEYS = [
   "background",
   "identity",
   "speech_style",
+  "residence",
 ] as const;
 
 export type CanonicalFactKey = (typeof CANONICAL_FACT_KEYS)[number];
@@ -307,6 +308,7 @@ const FACT_LABELS: Record<CanonicalFactKey, string> = {
   background: "배경",
   identity: "정체",
   speech_style: "말투",
+  residence: "거주지",
 };
 
 export function formatCanonicalCharacterFactsBlock(params: {
@@ -333,8 +335,8 @@ export function formatCanonicalCharacterFactsBlock(params: {
   const rows = [
     "# [인물별 정본 사실 — AI 지문·사건 요약보다 우선]",
     "- 페르소나/프리셋 설정과 사용자가 직접 확정·정정한 사실이 최우선이다. AI가 이전 답변에서 임의로 붙인 형용사·추측·비유는 정본을 변경하지 못한다.",
-    "- 아래 수치·직업·외형·정체를 뜻이 바뀌는 동의어로 바꾸지 말고, 모순되는 묘사를 새로 만들지 않는다.",
-    "- 관계·나이·직업·신체가 실제로 변한 경우에만 최신 사용자의 명시적 서술/OOC로 갱신한다.",
+    "- 아래 수치·직업·외형·정체·거주지를 뜻이 바뀌는 동의어로 바꾸지 말고, 모순되는 묘사를 새로 만들지 않는다.",
+    "- 관계·나이·직업·신체·거주지가 실제로 변한 경우에만 최신 사용자의 명시적 서술/OOC로 갱신한다.",
   ];
   if (persona.name) {
     const personaParts: string[] = [];

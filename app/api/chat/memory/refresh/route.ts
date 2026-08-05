@@ -26,6 +26,7 @@ import {
   formatCanonicalCharacterFactsBlock,
   loadCanonicalCharacterFacts,
 } from "@/lib/canonical_character_facts";
+import { buildSpatialCanon } from "@/lib/spatial_canon";
 
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 
@@ -1246,7 +1247,7 @@ export async function POST(req: Request) {
     const targetChars = Math.min(100000, Math.max(80, perTurnCharsVal * summaryEveryVal));
     const identityCharacters = (db
       .prepare(
-        `SELECT name, role, profile, relationshipNote, emotionNote, status
+        `SELECT name, aliases, role, profile, relationshipNote, emotionNote, status
          FROM chat_character_roster
          WHERE chatId=? AND enabled != 0
          ORDER BY updatedAt DESC, name ASC
@@ -1254,6 +1255,7 @@ export async function POST(req: Request) {
       )
       .all(chatId) as any[]).map((row) => ({
       name: String(row?.name || "").trim(),
+      aliases: decryptIfPossible(String(row?.aliases || "")),
       role: decryptIfPossible(String(row?.role || "")),
       profile: decryptIfPossible(String(row?.profile || "")),
       relationshipNote: decryptIfPossible(String(row?.relationshipNote || "")),
@@ -1275,6 +1277,22 @@ export async function POST(req: Request) {
       persona: authoritativePersona,
       facts: canonicalFacts,
     });
+    const spatialCanon = buildSpatialCanon({
+      messages: all,
+      knownNames: identityKnownNames,
+      identities: [
+        ...identityCharacters.map((identity) => ({
+          canonicalName: identity.name,
+          aliases: identity.aliases,
+        })),
+        ...identityCanon.canon.nameFacts.map((fact) => ({
+          canonicalName: fact.canonicalName,
+          aliases: fact.aliases,
+        })),
+      ],
+      personaName,
+      focusText: cleanedText,
+    });
 
     const sourceNameSet = collectLikelyKoreanNames(cleanedText);
     for (const fact of identityCanon.canon.nameFacts) {
@@ -1293,6 +1311,7 @@ export async function POST(req: Request) {
       relationshipCorrectionGuidance,
       identityCanon.block,
       canonicalFactsBlock,
+      spatialCanon.block,
       relationshipGraphBlock,
       nameLockGuidance,
       "- 저장된 관계도는 인물별 가족관계·서사 관계 성격·현재 나이·호감도를 지키기 위한 연속성 기준이다.",

@@ -36,6 +36,7 @@ import {
   formatCanonicalCharacterFactsBlock,
   loadCanonicalCharacterFacts,
 } from "@/lib/canonical_character_facts";
+import { buildSpatialCanon } from "@/lib/spatial_canon";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -1971,6 +1972,27 @@ ${body}`.trim();
         error: String((error as { message?: unknown })?.message || error),
       });
     }
+    const spatialCanon = buildSpatialCanon({
+      messages: all,
+      knownNames: continuityIdentities.map((identity) => identity.name),
+      identities: [
+        ...continuityLedgerIdentities.map((identity) => ({
+          canonicalName: identity.name,
+          aliases: identity.aliases,
+        })),
+        ...identityCanon.canon.nameFacts.map((fact) => ({
+          canonicalName: fact.canonicalName,
+          aliases: fact.aliases,
+        })),
+      ],
+      personaName: personaNameFinal,
+      focusText: [
+        characterFocusText,
+        recentCharacterFocusText,
+        hybridMemory.currentArcText,
+        relatedArchiveText,
+      ].join("\n"),
+    });
     // 새 동적 조회가 비어 있거나 DB 조회에 실패한 경우에만 기존 등록 캐릭터
     // 블록을 복구 경로로 사용한다. 정상 경로에서는 두 기억 블록을 중복 주입하지 않는다.
     let manualCharacterRosterFallback = "";
@@ -2034,6 +2056,9 @@ ${body}`.trim();
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
       identityCanonChars: strlen(identityCanonBlock),
       canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
+      spatialCanonChars: strlen(spatialCanon.block),
+      spatialResidenceCount: spatialCanon.residences.length,
+      spatialRelativeAnchorCount: spatialCanon.relativeAnchors.length,
       identityNameFacts: identityCanon.canon.nameFacts.length,
       identityRoleAnchors: identityCanon.canon.roleAnchors.length,
       inferredPersonaName: inferredPersonaName || "",
@@ -2045,6 +2070,7 @@ ${body}`.trim();
       `- 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
       `- 인물 연속성 장부가 있으면 과거 캐릭터 기록과 최신 일반 장면 지시보다 우선한다.`,
       `- 별도의 인물 정체성·가족관계 정사 블록이 있으면 이 통합 장기기억보다 우선한다.`,
+      `- 별도의 공간 정본 블록이 있으면 집·거주지·아랫집·윗집 판단은 그 블록을 우선한다.`,
       historySummaryForPrompt || "(없음)",
     ].join("\n");
     tEnd(tLongMemoryBlock);
@@ -2587,6 +2613,7 @@ const systemRaw = (cacheFriendlyLayout
       : "";
     const system = [
       systemWithIdentityCanon,
+      sanitizePromptCached(spatialCanon.block),
       currentNarrationPriorityBlock,
       continuityPriorityBlock,
       currentOocPriorityBlock,
@@ -2627,6 +2654,8 @@ const systemRaw = (cacheFriendlyLayout
 	          canonicalCharacterFactsBlock
 	            ? sanitizePromptCached(canonicalCharacterFactsBlock)
 	            : "",
+	          spatialCanon.block ? `` : "",
+	          spatialCanon.block ? sanitizePromptCached(spatialCanon.block) : "",
 	          ``,
 	          "※ (중요) 이 이어쓰기 호출에서는 fenced 코드블록(```...```) 출력 금지. STATUS/INFO/메타 블록도 출력하지 마라.",
 	          currentNarrationPriorityBlock ? `` : "",
