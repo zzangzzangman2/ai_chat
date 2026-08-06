@@ -20,6 +20,7 @@ import {
   omitWorldOnlyRelationshipsFromPrompt,
   sanitizeSharedEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
+import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
 import {
   applyStructuredCharacterGraph,
   extractStructuredCharacterGraph,
@@ -979,7 +980,7 @@ export async function POST(req: Request) {
     }));
     const preRefreshGraph = loadRelationshipGraph(chatId);
     const epistemicFirewall = buildEpistemicPromptFirewall(preRefreshGraph);
-    const all = decryptedAll.map((message) => {
+    let all = decryptedAll.map((message) => {
       if (message.role !== "assistant" && message.role !== "model") return message;
       return {
         ...message,
@@ -997,6 +998,30 @@ export async function POST(req: Request) {
       ? ""
       : inferPersonaNameFromMessages(all);
     const personaName = configuredPersonaName || inferredPersonaName;
+    const legalStatusIdentities = [
+      ...(personaName
+        ? [{ name: personaName, aliases: [], isPersona: true }]
+        : []),
+      ...preRefreshGraph.nodes.map((node) => ({
+        name: node.name,
+        aliases: [],
+        isPersona: Boolean(node.isPersona),
+      })),
+    ];
+    const trustedLegalStatusUserTexts = decryptedAll
+      .filter((message) => message.role === "user")
+      .map((message) => String(message.content || ""));
+    all = all.map((message) => {
+      if (message.role !== "assistant" && message.role !== "model") return message;
+      return {
+        ...message,
+        content: removeUnsupportedLegalStatusClaims({
+          text: message.content,
+          trustedUserTexts: trustedLegalStatusUserTexts,
+          identities: legalStatusIdentities,
+        }).text,
+      };
+    });
     const personaAge = Math.max(0, Math.trunc(Number(st?.personaAge) || 0));
     const personaGender = String(st?.personaGender || "").trim();
     const personaInfo = String(st?.personaInfo || "").trim();

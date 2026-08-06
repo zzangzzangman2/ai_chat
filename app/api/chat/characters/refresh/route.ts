@@ -23,6 +23,7 @@ import {
   omitWorldOnlyRelationshipsFromPrompt,
   sanitizeSharedEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
+import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
 import {
   inferCriticalCoreMemoryType,
   isCoreMemoryCandidate,
@@ -326,7 +327,7 @@ export async function POST(req: Request) {
       })) as MsgRow[];
     const preRefreshGraph = loadRelationshipGraph(chatId);
     const epistemicFirewall = buildEpistemicPromptFirewall(preRefreshGraph);
-    const all = decryptedAll.map((message) => {
+    let all = decryptedAll.map((message) => {
       if (!isAssistantRole(message.role)) return message;
       return {
         ...message,
@@ -341,7 +342,7 @@ export async function POST(req: Request) {
     const assistantId = requestedAssistantId || latestAssistantId(all);
     if (!assistantId) return NextResponse.json({ ok: true, skipped: true, reason: "no_assistant" });
 
-    const assistant = all.find((m) => String(m.id) === assistantId && isAssistantRole(m.role));
+    let assistant = all.find((m) => String(m.id) === assistantId && isAssistantRole(m.role));
     if (!assistant) return NextResponse.json({ ok: true, skipped: true, reason: "assistant_not_found" });
 
     const turnNo = assistantTurnNo(all, assistantId);
@@ -353,6 +354,38 @@ export async function POST(req: Request) {
       ? ""
       : inferPersonaNameFromMessages(all);
     const personaName = configuredPersonaName || inferredPersonaName || "나";
+    const legalStatusIdentities = [
+      { name: personaName, aliases: [], isPersona: true },
+      ...preRefreshGraph.nodes.map((node) => ({
+        name: node.name,
+        aliases: [],
+        isPersona: Boolean(node.isPersona),
+      })),
+    ];
+    const trustedLegalStatusUserTexts = decryptedAll
+      .filter((message) => message.role === "user")
+      .map((message) => String(message.content || ""));
+    all = all.map((message) => {
+      if (!isAssistantRole(message.role)) return message;
+      return {
+        ...message,
+        content: removeUnsupportedLegalStatusClaims({
+          text: message.content,
+          trustedUserTexts: trustedLegalStatusUserTexts,
+          identities: legalStatusIdentities,
+        }).text,
+      };
+    });
+    assistant = all.find(
+      (message) => String(message.id) === assistantId && isAssistantRole(message.role)
+    );
+    if (!assistant) {
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: "assistant_removed_by_fact_guard",
+      });
+    }
 
     const relationshipGraphRefresh = await refreshRelationshipGraphIfDue({
       chatId,

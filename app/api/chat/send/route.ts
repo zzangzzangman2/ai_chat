@@ -29,8 +29,13 @@ import {
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
 import {
   buildEpistemicPromptFirewall,
+  sanitizeGeneratedEpistemicText,
   sanitizeSharedEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
+import {
+  removeUnsupportedLegalStatusClaims,
+  type LegalStatusIdentity,
+} from "@/lib/legal_status_consistency_guard";
 import {
   findRecognitionContradiction,
   removeRecognitionContradictionPassages,
@@ -2037,6 +2042,46 @@ ${body}`.trim();
       }
     }
     const epistemicFirewall = buildEpistemicPromptFirewall(relationshipGraph);
+    const legalIdentityByName = new Map<string, LegalStatusIdentity>();
+    const addLegalIdentity = (identity: LegalStatusIdentity) => {
+      const name = String(identity.name || "").replace(/\s+/g, " ").trim();
+      if (!name) return;
+      const key = name.toLocaleLowerCase("ko-KR");
+      const previous = legalIdentityByName.get(key);
+      legalIdentityByName.set(key, {
+        name,
+        aliases: [
+          ...new Set([
+            ...(previous?.aliases || []),
+            ...(identity.aliases || []),
+          ].map((alias) => String(alias || "").trim()).filter(Boolean)),
+        ],
+        isPersona: Boolean(previous?.isPersona || identity.isPersona),
+      });
+    };
+    addLegalIdentity({
+      name: personaNameFinal,
+      aliases: dynamicCharacterContext.personaAliases,
+      isPersona: true,
+    });
+    for (const identity of continuityIdentities) {
+      let aliases: string[] = [];
+      const rawAliases = String(identity.aliases || "").trim();
+      try {
+        const parsed = JSON.parse(rawAliases);
+        aliases = Array.isArray(parsed) ? parsed.map(String) : [];
+      } catch {
+        aliases = rawAliases.split(/[\n,;\/|]+/u);
+      }
+      addLegalIdentity({ name: identity.name, aliases });
+    }
+    for (const node of relationshipGraph.nodes) {
+      addLegalIdentity({ name: node.name, isPersona: node.isPersona });
+    }
+    const legalStatusIdentities = [...legalIdentityByName.values()];
+    const trustedLegalStatusUserTexts = all
+      .filter((message) => String(message?.role || "") === "user")
+      .map((message) => String(message?.content || ""));
     const historySummaryForPromptRaw = [
       hybridMemory.currentArcText,
       relatedArchiveText,
@@ -2048,7 +2093,12 @@ ${body}`.trim();
       historySummaryForPromptRaw,
       epistemicFirewall
     );
-    const historySummaryForPrompt = historyEpistemicView.text;
+    const historyLegalStatusView = removeUnsupportedLegalStatusClaims({
+      text: historyEpistemicView.text,
+      trustedUserTexts: trustedLegalStatusUserTexts,
+      identities: legalStatusIdentities,
+    });
+    const historySummaryForPrompt = historyLegalStatusView.text;
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -2101,6 +2151,7 @@ ${body}`.trim();
       epistemicProtectedFactCount: epistemicFirewall.facts.length,
       epistemicWorldOnlyFactCount: epistemicFirewall.worldOnlyRelationIds.size,
       epistemicSummaryRedactions: historyEpistemicView.redactedSegments,
+      legalStatusSummaryRedactions: historyLegalStatusView.removed,
     });
     const memoryBlock = [
       `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
@@ -2680,6 +2731,13 @@ const systemRaw = (cacheFriendlyLayout
           `- 응답을 내기 전에 각 NPC의 대사·생각·시점 지문에 쓰인 결론마다 직접 목격, 전달, 조사로 얻은 근거가 있는지 검사한다. 근거가 없으면 확정 표현을 관찰 가능한 사실 또는 불확실한 추측으로 낮춘다.`,
         ].join("\n")
       : "";
+    const legalStatusPriorityBlock = [
+      `# [LEGAL/PROCEDURAL STATUS HARD GUARD — RESPONSE VALIDATION]`,
+      `- 사건 관계자, 조사 대상, 감시 대상, 수상한 인물, 현장 방문자는 그 이유만으로 피의자·피고인·수배자·구속자·유죄 확정자가 아니다.`,
+      `- 입건, 피의자 전환, 체포, 구속, 기소, 수배, 유죄 확정 같은 법적·절차적 상태는 최신 사용자 지문이나 저장된 명시적 절차 사건에 실제로 발생했다고 기록된 경우에만 사용한다.`,
+      `- 경찰·수사관이 경계하거나 출입을 막는 장면에서도 근거 없는 법적 신분을 새로 만들지 않는다. 필요하면 '사건 관계자', '방문자', '신원 확인 대상'처럼 관찰 가능한 중립 표현을 쓴다.`,
+      `- 이번 응답에서 법적 지위를 한 단계라도 올리기 전, 누가 언제 어떤 절차를 집행했는지 근거 문장을 확인한다. 근거가 없으면 승격하지 않는다.`,
+    ].join("\n");
     const system = [
       systemWithIdentityCanon,
       sanitizePromptCached(spatialCanon.block),
@@ -2687,6 +2745,7 @@ const systemRaw = (cacheFriendlyLayout
       continuityPriorityBlock,
       recognitionPriorityBlock,
       epistemicPriorityBlock,
+      legalStatusPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -2792,6 +2851,7 @@ const systemRaw = (cacheFriendlyLayout
   };
 
     let epistemicTailRedactions = 0;
+    let legalStatusTailRedactions = 0;
     const epistemicTail = tail.map((message) => {
       const role = String(message?.role || "");
       if (role !== "assistant" && role !== "model") return message;
@@ -2800,7 +2860,13 @@ const systemRaw = (cacheFriendlyLayout
         epistemicFirewall
       );
       epistemicTailRedactions += sanitized.redactedSegments;
-      return { ...message, content: sanitized.text };
+      const legalStatus = removeUnsupportedLegalStatusClaims({
+        text: sanitized.text,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        identities: legalStatusIdentities,
+      });
+      legalStatusTailRedactions += legalStatus.removed;
+      return { ...message, content: legalStatus.text };
     });
     const contextRaw = formatStoryTurnsForMode(
       epistemicTail,
@@ -2809,7 +2875,12 @@ const systemRaw = (cacheFriendlyLayout
       renderMode
     );
     const context = stripUrlsAndMediaMarkdown(stripStatusErrorFences(contextRaw));
-    if (historyEpistemicView.redactedSegments || epistemicTailRedactions) {
+    if (
+      historyEpistemicView.redactedSegments ||
+      epistemicTailRedactions ||
+      historyLegalStatusView.removed ||
+      legalStatusTailRedactions
+    ) {
       dbg({
         tag: "send.epistemic-firewall",
         chatId: cid,
@@ -2818,6 +2889,8 @@ const systemRaw = (cacheFriendlyLayout
         worldOnlyFacts: epistemicFirewall.worldOnlyRelationIds.size,
         summaryRedactions: historyEpistemicView.redactedSegments,
         recentAssistantRedactions: epistemicTailRedactions,
+        legalStatusSummaryRedactions: historyLegalStatusView.removed,
+        recentLegalStatusRedactions: legalStatusTailRedactions,
       });
     }
     // 사용자 입력을 모드에 맞춰 전달한다.
@@ -4738,6 +4811,32 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
 
     if (continueMode && continueBaseText) {
       assistantText = mergeContinuationBase(continueBaseText, assistantText);
+    }
+
+    const epistemicOutputChecked = sanitizeGeneratedEpistemicText(
+      assistantText,
+      epistemicFirewall
+    );
+    assistantText = epistemicOutputChecked.text;
+    const legalStatusOutputChecked = removeUnsupportedLegalStatusClaims({
+      text: assistantText,
+      trustedUserTexts: trustedLegalStatusUserTexts,
+      identities: legalStatusIdentities,
+    });
+    assistantText = legalStatusOutputChecked.text;
+    if (epistemicOutputChecked.redactedSegments || legalStatusOutputChecked.removed) {
+      dbg({
+        tag: "send.output-fact-guard",
+        chatId: cid,
+        reqId,
+        epistemicRedactions: epistemicOutputChecked.redactedSegments,
+        legalStatusRedactions: legalStatusOutputChecked.removed,
+        legalStatuses: legalStatusOutputChecked.statuses,
+        legalCharacters: legalStatusOutputChecked.characterNames,
+      });
+    }
+    if (!assistantText.trim()) {
+      assistantText = "*현장 관계자들은 확인되지 않은 사실을 단정하지 않고 방문 목적과 출입 가능 여부부터 확인했다.*";
     }
 
 	    let assistantMsg: any = {

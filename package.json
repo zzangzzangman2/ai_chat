@@ -9,7 +9,7 @@
     "lint": "eslint",
     "test:knowledge": "node --test lib/character_knowledge.test.js",
     "test:recognition": "node --test lib/recognition_consistency_guard.test.js",
-    "test:memory": "node --test lib/character_knowledge.test.js lib/epistemic_prompt_firewall.test.js lib/recognition_consistency_guard.test.js"
+    "test:memory": "node --test lib/character_knowledge.test.js lib/epistemic_prompt_firewall.test.js lib/legal_status_consistency_guard.test.js lib/recognition_consistency_guard.test.js"
   },
   "dependencies": {
     "@google/genai": "^1.34.0",

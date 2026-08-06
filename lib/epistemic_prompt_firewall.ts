@@ -26,6 +26,23 @@ export type EpistemicSanitizeResult = {
   redactedSegments: number;
 };
 
+function splitLineSentences(line: string) {
+  const marked = String(line || "").replace(
+    /([.!?。！？](?:["”']|\*+)?)(\s+)/gu,
+    "$1\u0000"
+  );
+  return marked.split("\u0000").map((part) => part.trim()).filter(Boolean);
+}
+
+function restoreOuterNarrationMarkers(original: string, value: string) {
+  let output = String(value || "").trim();
+  if (!output) return "";
+  const source = String(original || "").trim();
+  if (source.startsWith("*") && !output.startsWith("*")) output = `*${output}`;
+  if (source.endsWith("*") && !output.endsWith("*")) output = `${output}*`;
+  return output;
+}
+
 function cleanText(value: unknown, max = 2000) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
@@ -233,4 +250,44 @@ export function sanitizeCharacterEpistemicText(
     (fact) => !fact.knownByNames.some((name) => nameKey(name) === character)
   );
   return sanitizeEpistemicText(value, restrictedFacts);
+}
+
+/**
+ * Final-response backstop. Unlike shared-memory sanitization, this removes only
+ * the individual generated sentences that assert a world-only confidential
+ * fact so the rest of the scene and its observable details remain intact.
+ */
+export function sanitizeGeneratedEpistemicText(
+  value: unknown,
+  firewall: EpistemicPromptFirewall
+): EpistemicSanitizeResult {
+  const source = String(value || "");
+  const facts = firewall.facts.filter((fact) => fact.knownByNames.length === 0);
+  if (!source.trim() || facts.length === 0) {
+    return { text: source.trim(), redactedSegments: 0 };
+  }
+
+  let redactedSegments = 0;
+  let inFence = false;
+  const lines = source.split(/\r?\n/u).map((line) => {
+    if (/^\s*```/u.test(line)) {
+      inFence = !inFence;
+      return line;
+    }
+    if (inFence || !line.trim()) return line;
+
+    const kept = splitLineSentences(line).filter((sentence) => {
+      const unsupported = facts.some((fact) =>
+        segmentAssertsProtectedFact(sentence, fact)
+      );
+      if (unsupported) redactedSegments += 1;
+      return !unsupported;
+    });
+    return restoreOuterNarrationMarkers(line, kept.join(" "));
+  });
+
+  return {
+    text: normalizeAfterRedaction(lines.filter((line) => line.trim()).join("\n")),
+    redactedSegments,
+  };
 }
