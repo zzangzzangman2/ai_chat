@@ -14,6 +14,10 @@ import {
   isInvalidRelationshipLabel,
   inferPersonaOccupationFromScenario,
 } from "@/lib/relationship_context";
+import {
+  inferRelationshipKnownByNames,
+  parseRelationshipKnownBy,
+} from "@/lib/character_knowledge";
 
 export type RelationshipGraphRelation = {
   id: string;
@@ -26,6 +30,8 @@ export type RelationshipGraphRelation = {
   objectName: string;
   objectRosterId: string;
   objectRole: string;
+  knownByNames: string[];
+  knowledgeEvidence: string;
   firstSeenTurn: number;
   lastSeenTurn: number;
   updatedAt: number;
@@ -660,7 +666,8 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     db
       .prepare(
         `SELECT r.id, r.subjectKey, r.subjectName, r.relation, r.slotKey,
-                r.objectKey, r.objectName, r.objectRole, r.firstSeenTurn,
+                r.objectKey, r.objectName, r.objectRole, r.knownBy,
+                r.knowledgeEvidence, r.firstSeenTurn,
                 r.lastSeenTurn, r.updatedAt,
                 COALESCE(sr.id, '') AS subjectRosterId,
                 COALESCE(orr.id, '') AS objectRosterId
@@ -682,6 +689,8 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     objectName: String(row?.objectName || ""),
     objectRosterId: String(row?.objectRosterId || ""),
     objectRole: String(row?.objectRole || ""),
+    knownByNames: parseRelationshipKnownBy(row?.knownBy),
+    knowledgeEvidence: String(row?.knowledgeEvidence || ""),
     firstSeenTurn: Number(row?.firstSeenTurn || 0),
     lastSeenTurn: Number(row?.lastSeenTurn || 0),
     updatedAt: Number(row?.updatedAt || 0),
@@ -867,6 +876,8 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         objectName: node.name,
         objectRosterId: node.rosterId,
         objectRole: detailParts.join("; "),
+        knownByNames: [],
+        knowledgeEvidence: "",
         firstSeenTurn: 0,
         lastSeenTurn: Math.max(0, Number(affinity?.lastTurnNo || 0)),
         updatedAt: Math.max(Number(node.updatedAt || 0), Number(affinity?.updatedAt || 0)),
@@ -891,6 +902,8 @@ export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
   const lines: string[] = [
     "# [저장된 관계도·현재 나이 — 최신 정사, 기본 프로필보다 우선]",
     "- 아래 나이는 명시된 나이와 이후 시간 경과를 합산한 현재값이다. 초기 페르소나/인물 프로필의 나이와 다르면 아래 현재 나이를 따른다.",
+    "- 관계도는 세계관 정사이며 그 자체로 모든 인물의 개인 지식이 아니다. 각 관계의 '알고 있는 인물'만 그 구체적 사실을 안다.",
+    "- '알고 있는 인물: 없음(세계관 전용)'인 비밀·범인·배후·정체는 직접 목격하거나 전달받은 별도 근거가 생기기 전까지 NPC 기억으로 옮기지 않는다.",
   ];
   for (const node of graph.nodes.filter((item) => item.age > 0).slice(0, 60)) {
     lines.push(`- ${node.name} 현재 나이: ${node.age}세`);
@@ -904,11 +917,21 @@ export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
     const generatedRole = `${relation.subjectName}의 ${relation.relation}`;
     const detailSuffix =
       details && details !== generatedRole ? `; 세부: ${details}` : "";
+    const knownByNames = inferRelationshipKnownByNames({
+      subjectName: relation.subjectName,
+      objectName: relation.objectName,
+      relation: relation.relation,
+      details,
+      storedKnownByNames: relation.knownByNames,
+    });
+    const knowledgeSuffix = knownByNames.length
+      ? `; 알고 있는 인물: ${knownByNames.join(", ")}`
+      : "; 알고 있는 인물: 없음(세계관 전용)";
 
     lines.push(
       SYMMETRIC_RELATIONS.has(relation.relation) || isContextualSymmetricRelationship(relation.relation)
-        ? `- ${relation.subjectName} ↔ ${relation.objectName}: ${relation.relation}${detailSuffix}`
-        : `- ${relation.subjectName} → ${relation.relation} → ${relation.objectName}${detailSuffix}`
+        ? `- ${relation.subjectName} ↔ ${relation.objectName}: ${relation.relation}${detailSuffix}${knowledgeSuffix}`
+        : `- ${relation.subjectName} → ${relation.relation} → ${relation.objectName}${detailSuffix}${knowledgeSuffix}`
     );
   }
   for (const affinity of graph.affinities.slice(0, 40)) {

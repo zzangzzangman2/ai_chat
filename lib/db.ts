@@ -703,6 +703,8 @@ if (!hasColumn("chat_settings", "narrationColor")) {
       objectKey TEXT NOT NULL,
       objectName TEXT NOT NULL DEFAULT '',
       objectRole TEXT NOT NULL DEFAULT '',
+      knownBy TEXT NOT NULL DEFAULT '[]',
+      knowledgeEvidence TEXT NOT NULL DEFAULT '',
       sourceOrder INTEGER NOT NULL DEFAULT 0,
       firstSeenTurn INTEGER NOT NULL DEFAULT 0,
       lastSeenTurn INTEGER NOT NULL DEFAULT 0,
@@ -713,6 +715,14 @@ if (!hasColumn("chat_settings", "narrationColor")) {
     CREATE INDEX IF NOT EXISTS idx_chat_character_relations_chat
       ON chat_character_relations(chatId, subjectName, relation, updatedAt DESC);
   `);
+  if (!hasColumn("chat_character_relations", "knownBy")) {
+    db.exec(`ALTER TABLE chat_character_relations ADD COLUMN knownBy TEXT NOT NULL DEFAULT '[]'`);
+  }
+  if (!hasColumn("chat_character_relations", "knowledgeEvidence")) {
+    db.exec(
+      `ALTER TABLE chat_character_relations ADD COLUMN knowledgeEvidence TEXT NOT NULL DEFAULT ''`
+    );
+  }
 
   // 4-1-2) 등록 인물이 주인공에게 느끼는 지속 호감도
   // 같은 턴 재생성 시 lastDelta를 되돌린 뒤 새 delta를 반영해 중복 누적을 막는다.

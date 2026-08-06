@@ -458,6 +458,8 @@ export async function POST(req: Request) {
       identityCanon.block,
       formatRelationshipGraphBlock(loadRelationshipGraph(chatId)),
       "The saved relationship graph is a continuity constraint. Use it to keep family roles, narrative relationship type, age, and affinity attached to the correct character.",
+      "World-canon relationship facts are not automatically known by either endpoint. A character may remember a secret, culprit, hidden identity, or off-screen event only when that character is listed as knowing it or this exact turn directly shows that character witnessing or being told it.",
+      "Never save omniscient narration as a character memory for somebody who was absent, asleep, unable to identify the actor, or otherwise lacked access to the information.",
       "Do not claim an older graph fact happened in this exact turn unless the exact-turn scene text supports it.",
       "For each saved direct conversation, estimate only THIS TURN's change in the character's affinity toward the persona.",
       "affinityDelta must be an integer from -3 to 3. Use 0 when the exchange does not clearly change affinity.",
