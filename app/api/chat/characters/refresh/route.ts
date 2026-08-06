@@ -19,6 +19,11 @@ import {
 } from "@/lib/relationship_graph";
 import { refreshRelationshipGraphIfDue } from "@/lib/relationship_graph_refresh";
 import {
+  buildEpistemicPromptFirewall,
+  omitWorldOnlyRelationshipsFromPrompt,
+  sanitizeSharedEpistemicText,
+} from "@/lib/epistemic_prompt_firewall";
+import {
   inferCriticalCoreMemoryType,
   isCoreMemoryCandidate,
   isNearDuplicateMemory,
@@ -310,7 +315,7 @@ export async function POST(req: Request) {
     const access = await requireChatAccess(chatId);
     if (!access.ok) return access.res;
 
-    const all = db
+    const decryptedAll = db
       .prepare(`SELECT id, role, content, createdAt FROM messages WHERE chatId=? ORDER BY createdAt ASC, id ASC`)
       .all(chatId)
       .map((row: any) => ({
@@ -319,6 +324,18 @@ export async function POST(req: Request) {
         content: decryptIfPossible(String(row?.content || "")),
         createdAt: Number(row?.createdAt || 0),
       })) as MsgRow[];
+    const preRefreshGraph = loadRelationshipGraph(chatId);
+    const epistemicFirewall = buildEpistemicPromptFirewall(preRefreshGraph);
+    const all = decryptedAll.map((message) => {
+      if (!isAssistantRole(message.role)) return message;
+      return {
+        ...message,
+        content: sanitizeSharedEpistemicText(
+          message.content,
+          epistemicFirewall
+        ).text,
+      };
+    });
 
     const requestedAssistantId = String(body?.assistantMessageId || "").trim();
     const assistantId = requestedAssistantId || latestAssistantId(all);
@@ -456,7 +473,15 @@ export async function POST(req: Request) {
       "A title used by one character never becomes a title that another character may use.",
       "If the persona corrects or denies a relationship/title, that correction overrides the assistant response and must remain negated.",
       identityCanon.block,
-      formatRelationshipGraphBlock(loadRelationshipGraph(chatId)),
+      (() => {
+        const currentGraph = loadRelationshipGraph(chatId);
+        return formatRelationshipGraphBlock(
+          omitWorldOnlyRelationshipsFromPrompt(
+            currentGraph,
+            buildEpistemicPromptFirewall(currentGraph)
+          )
+        );
+      })(),
       "The saved relationship graph is a continuity constraint. Use it to keep family roles, narrative relationship type, age, and affinity attached to the correct character.",
       "World-canon relationship facts are not automatically known by either endpoint. A character may remember a secret, culprit, hidden identity, or off-screen event only when that character is listed as knowing it or this exact turn directly shows that character witnessing or being told it.",
       "Never save omniscient narration as a character memory for somebody who was absent, asleep, unable to identify the actor, or otherwise lacked access to the information.",

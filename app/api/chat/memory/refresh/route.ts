@@ -16,6 +16,11 @@ import {
 } from "@/lib/identity_memory";
 import { formatRelationshipGraphBlock, loadRelationshipGraph } from "@/lib/relationship_graph";
 import {
+  buildEpistemicPromptFirewall,
+  omitWorldOnlyRelationshipsFromPrompt,
+  sanitizeSharedEpistemicText,
+} from "@/lib/epistemic_prompt_firewall";
+import {
   applyStructuredCharacterGraph,
   extractStructuredCharacterGraph,
   loadStructuredCharacterIdentities,
@@ -967,11 +972,23 @@ export async function POST(req: Request) {
       )
       .all(chatId) as any[];
 
-    const all = rawAll.map((m) => ({
+    const decryptedAll = rawAll.map((m) => ({
       ...m,
       content: decryptIfPossible(m.content),
       imagesJson: decryptIfPossible(m.imagesJson),
     }));
+    const preRefreshGraph = loadRelationshipGraph(chatId);
+    const epistemicFirewall = buildEpistemicPromptFirewall(preRefreshGraph);
+    const all = decryptedAll.map((message) => {
+      if (message.role !== "assistant" && message.role !== "model") return message;
+      return {
+        ...message,
+        content: sanitizeSharedEpistemicText(
+          message.content,
+          epistemicFirewall
+        ).text,
+      };
+    });
 
     const completedTurnCount = countAssistantTurns(all);
     const summaryModel = pickLongMemorySummaryModel();
@@ -1271,7 +1288,13 @@ export async function POST(req: Request) {
       personaName,
       characterSources: identityCharacters,
     });
-    const relationshipGraphBlock = formatRelationshipGraphBlock(loadRelationshipGraph(chatId));
+    const currentRelationshipGraph = loadRelationshipGraph(chatId);
+    const relationshipGraphBlock = formatRelationshipGraphBlock(
+      omitWorldOnlyRelationshipsFromPrompt(
+        currentRelationshipGraph,
+        buildEpistemicPromptFirewall(currentRelationshipGraph)
+      )
+    );
     const canonicalFacts = loadCanonicalCharacterFacts(chatId);
     const canonicalFactsBlock = formatCanonicalCharacterFactsBlock({
       persona: authoritativePersona,

@@ -24,8 +24,13 @@ import { syncCharacterVitals } from "@/lib/character_vitals";
 import {
   loadRelationshipGraph,
   syncIdentityCanonRelations,
+  type RelationshipGraphData,
 } from "@/lib/relationship_graph";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
+import {
+  buildEpistemicPromptFirewall,
+  sanitizeSharedEpistemicText,
+} from "@/lib/epistemic_prompt_firewall";
 import {
   findRecognitionContradiction,
   removeRecognitionContradictionPassages,
@@ -1892,6 +1897,12 @@ ${body}`.trim();
       relationshipCount: 0,
       eventCount: 0,
     };
+    let relationshipGraph: RelationshipGraphData = {
+      personaName: personaNameFinal,
+      nodes: [],
+      relations: [],
+      affinities: [],
+    };
     try {
       syncIdentityCanonRelations({
         chatId: cid,
@@ -1905,13 +1916,14 @@ ${body}`.trim();
         personaName: personaNameFinal,
         personaAge: personaAgeFinal,
       });
+      relationshipGraph = loadRelationshipGraph(cid);
       dynamicCharacterContext = buildDynamicCharacterContext({
         chatId: cid,
         personaName: personaNameFinal,
         focusText: characterFocusText,
         recentFocusText: recentCharacterFocusText,
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
-        graph: loadRelationshipGraph(cid),
+        graph: relationshipGraph,
       });
     } catch (error) {
       console.error("[chat/send] dynamic character context failed", {
@@ -2024,13 +2036,19 @@ ${body}`.trim();
         });
       }
     }
-    const historySummaryForPrompt = [
+    const epistemicFirewall = buildEpistemicPromptFirewall(relationshipGraph);
+    const historySummaryForPromptRaw = [
       hybridMemory.currentArcText,
       relatedArchiveText,
       manualCharacterRosterFallback,
     ]
       .filter((x) => String(x || "").trim())
       .join("\n\n");
+    const historyEpistemicView = sanitizeSharedEpistemicText(
+      historySummaryForPromptRaw,
+      epistemicFirewall
+    );
+    const historySummaryForPrompt = historyEpistemicView.text;
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -2080,6 +2098,9 @@ ${body}`.trim();
       identityNameFacts: identityCanon.canon.nameFacts.length,
       identityRoleAnchors: identityCanon.canon.roleAnchors.length,
       inferredPersonaName: inferredPersonaName || "",
+      epistemicProtectedFactCount: epistemicFirewall.facts.length,
+      epistemicWorldOnlyFactCount: epistemicFirewall.worldOnlyRelationIds.size,
+      epistemicSummaryRedactions: historyEpistemicView.redactedSegments,
     });
     const memoryBlock = [
       `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
@@ -2650,12 +2671,22 @@ const systemRaw = (cacheFriendlyLayout
           `- 페르소나의 범행·비밀·의도를 모르는 상태는 유지할 수 있지만, 그 사실을 모른다는 이유로 이미 만난 페르소나 자체를 초면으로 처리하지 않는다.`,
         ].join("\n")
       : "";
+    const epistemicPriorityBlock = epistemicFirewall.facts.length
+      ? [
+          `# [CHARACTER KNOWLEDGE FIREWALL — RESPONSE VALIDATION]`,
+          `- 세계관의 민감한 사실과 등장인물이 실제로 아는 사실을 분리한다. 이번 프롬프트에서 비공개 사실 ${epistemicFirewall.facts.length}건을 지식 허용목록으로 관리하며, 그중 ${epistemicFirewall.worldOnlyRelationIds.size}건은 아는 NPC가 없어 원문 자체를 숨겼다.`,
+          `- 숨겨진 사실을 이상 행동, 현장 방문, 표정, 말투, 수사 대상이라는 이유만으로 재구성하거나 확정하지 않는다. 관찰자는 직접 본 행동만 말할 수 있고, 그 의미는 의심·가설·미상으로 남긴다.`,
+          `- 과거 어시스턴트 지문이나 통합 요약이 정보 획득 장면 없이 범인·원흉·배후·정체·누명 같은 결론을 단정했다면 그 문장은 정사가 아니라 지식 경계 오류다. 이번 응답에서 반복·인용·전제하지 않는다.`,
+          `- 응답을 내기 전에 각 NPC의 대사·생각·시점 지문에 쓰인 결론마다 직접 목격, 전달, 조사로 얻은 근거가 있는지 검사한다. 근거가 없으면 확정 표현을 관찰 가능한 사실 또는 불확실한 추측으로 낮춘다.`,
+        ].join("\n")
+      : "";
     const system = [
       systemWithIdentityCanon,
       sanitizePromptCached(spatialCanon.block),
       currentNarrationPriorityBlock,
       continuityPriorityBlock,
       recognitionPriorityBlock,
+      epistemicPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -2760,8 +2791,35 @@ const systemRaw = (cacheFriendlyLayout
       .trim();
   };
 
-    const contextRaw = formatStoryTurnsForMode(tail, personaName, npcName, renderMode);
+    let epistemicTailRedactions = 0;
+    const epistemicTail = tail.map((message) => {
+      const role = String(message?.role || "");
+      if (role !== "assistant" && role !== "model") return message;
+      const sanitized = sanitizeSharedEpistemicText(
+        String(message?.content || ""),
+        epistemicFirewall
+      );
+      epistemicTailRedactions += sanitized.redactedSegments;
+      return { ...message, content: sanitized.text };
+    });
+    const contextRaw = formatStoryTurnsForMode(
+      epistemicTail,
+      personaName,
+      npcName,
+      renderMode
+    );
     const context = stripUrlsAndMediaMarkdown(stripStatusErrorFences(contextRaw));
+    if (historyEpistemicView.redactedSegments || epistemicTailRedactions) {
+      dbg({
+        tag: "send.epistemic-firewall",
+        chatId: cid,
+        reqId,
+        protectedFacts: epistemicFirewall.facts.length,
+        worldOnlyFacts: epistemicFirewall.worldOnlyRelationIds.size,
+        summaryRedactions: historyEpistemicView.redactedSegments,
+        recentAssistantRedactions: epistemicTailRedactions,
+      });
+    }
     // 사용자 입력을 모드에 맞춰 전달한다.
     const userLine = continueMode ? "[이어쓰기]" : buildUserLineForMode(userText, personaName, renderMode);
 

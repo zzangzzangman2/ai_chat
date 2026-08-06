@@ -5,8 +5,13 @@ import type { RelationshipGraphData } from "@/lib/relationship_graph";
 import { selectConservativeMemoryRows } from "@/lib/character_memory_quality";
 import {
   inferRelationshipKnownByNames,
+  isConfidentialRelationshipKnowledge,
   relationshipKnowledgeScope,
 } from "@/lib/character_knowledge";
+import {
+  buildEpistemicPromptFirewall,
+  sanitizeCharacterEpistemicText,
+} from "@/lib/epistemic_prompt_firewall";
 
 type RosterRow = {
   id: string;
@@ -204,6 +209,7 @@ export function buildDynamicCharacterContext(params: {
   if (!chatId) return emptyContext();
 
   const personaName = cleanText(params.personaName || params.graph.personaName, 80);
+  const epistemicFirewall = buildEpistemicPromptFirewall(params.graph);
   const priorityNameKeys = new Set(
     (params.priorityNames || [])
       .map((value) => normalizedKey(value))
@@ -635,6 +641,12 @@ export function buildDynamicCharacterContext(params: {
             .filter((id) => characterIds.has(id))
         ),
       ];
+      if (
+        knownByNames.length === 0 &&
+        isConfidentialRelationshipKnowledge(`${relation.relation} ${relation.objectRole}`)
+      ) {
+        return null;
+      }
       return {
         source_id: idForName(relation.subjectName),
         target_id: idForName(relation.objectName),
@@ -646,7 +658,8 @@ export function buildDynamicCharacterContext(params: {
         known_by_character_ids: knownByCharacterIds,
         last_seen_turn: Math.max(0, Number(relation.lastSeenTurn || 0)),
       };
-    });
+    })
+    .filter(Boolean) as Array<Record<string, unknown>>;
 
   const focusedRosterIds = focusedRows.map((row) => row.id);
   const memoryFocusedRosterIds = rosterRows
@@ -683,11 +696,17 @@ export function buildDynamicCharacterContext(params: {
   const eventSeen = new Set<string>();
   const majorEvents = memories
     .map((memory) => {
-      const event = cleanText(
+      const eventRaw = cleanText(
         decryptIfPossible(String(memory?.summary || "")),
         360
       );
       const rosterId = cleanText(memory?.rosterId, 120);
+      const characterName = rosterById.get(rosterId)?.name || "";
+      const event = sanitizeCharacterEpistemicText(
+        eventRaw,
+        characterName,
+        epistemicFirewall
+      ).text;
       const key = `${rosterId}\u0000${event}`;
       if (!event || eventSeen.has(key)) return null;
       eventSeen.add(key);
