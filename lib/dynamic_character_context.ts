@@ -52,9 +52,11 @@ export type DynamicCharacterContext = {
   focusedRosterIds: string[];
   focusedNames: string[];
   includedNames: string[];
+  personaAliases: string[];
   recognition: Array<{
     characterId: string;
     characterName: string;
+    characterAliases: string[];
     firstInteractionTurn: number;
     lastInteractionTurn: number;
     evidence: string;
@@ -107,6 +109,7 @@ function emptyContext(): DynamicCharacterContext {
     focusedRosterIds: [],
     focusedNames: [],
     includedNames: [],
+    personaAliases: [],
     recognition: [],
     relationshipCount: 0,
     eventCount: 0,
@@ -712,6 +715,7 @@ export function buildDynamicCharacterContext(params: {
       return {
         character_id: row.id,
         character_name: row.name,
+        character_aliases: splitAliases(row.aliases).slice(0, 8),
         persona_id: "persona",
         status: "already_acquainted",
         first_interaction_turn: first.turnNo,
@@ -762,9 +766,19 @@ export function buildDynamicCharacterContext(params: {
     focusedRosterIds,
     focusedNames,
     includedNames,
+    personaAliases: [...personaAliasNames]
+      .map((alias) => cleanText(alias, 80))
+      .filter(Boolean)
+      .slice(0, 10),
     recognition: recognition.map((item) => ({
       characterId: cleanText(item.character_id, 120),
       characterName: cleanText(item.character_name, 80),
+      characterAliases: Array.isArray(item.character_aliases)
+        ? item.character_aliases
+            .map((alias) => cleanText(alias, 80))
+            .filter(Boolean)
+            .slice(0, 8)
+        : [],
       firstInteractionTurn: Math.max(
         0,
         Number(item.first_interaction_turn || 0)

@@ -1880,9 +1880,11 @@ ${body}`.trim();
       focusedRosterIds: [] as string[],
       focusedNames: [] as string[],
       includedNames: [] as string[],
+      personaAliases: [] as string[],
       recognition: [] as Array<{
         characterId: string;
         characterName: string;
+        characterAliases: string[];
         firstInteractionTurn: number;
         lastInteractionTurn: number;
         evidence: string;
@@ -2644,6 +2646,8 @@ const systemRaw = (cacheFriendlyLayout
             return `- ${item.characterName} ↔ ${personaNameFinal || "주인공"}: 기존 대면 이력 ${range}. ${item.evidence}`;
           }),
           `- 응답에서 위 인물이 페르소나에게 '누구냐', '처음 본다', '낯선 사람'처럼 반응하려 하면 그 문장을 출력하지 말고, 저장된 관계·감정·과거 사건을 알아보는 반응으로 다시 쓴다.`,
+          `- 두 사람의 실명이 같은 문장에 없어도 동일 규칙을 적용한다. '노인', '학생', 직업·관계 호칭, 별칭, 대명사로 표현된 인물을 앞뒤 지문과 연결해 같은 인물로 인식한다.`,
+          `- 페르소나의 범행·비밀·의도를 모르는 상태는 유지할 수 있지만, 그 사실을 모른다는 이유로 이미 만난 페르소나 자체를 초면으로 처리하지 않는다.`,
         ].join("\n")
       : "";
     const system = [
@@ -2873,6 +2877,9 @@ const systemRaw = (cacheFriendlyLayout
       const contradiction = findRecognitionContradiction({
         text: args.text,
         personaName: personaNameFinal,
+        personaAliases: dynamicCharacterContext.personaAliases,
+        currentUserText: userText,
+        sceneCharacterNames: dynamicCharacterContext.includedNames,
         recognition: dynamicCharacterContext.recognition,
       });
       if (!contradiction) return args;
@@ -2924,12 +2931,18 @@ const systemRaw = (cacheFriendlyLayout
       const remaining = findRecognitionContradiction({
         text,
         personaName: personaNameFinal,
+        personaAliases: dynamicCharacterContext.personaAliases,
+        currentUserText: userText,
+        sceneCharacterNames: dynamicCharacterContext.includedNames,
         recognition: dynamicCharacterContext.recognition,
       });
       if (remaining) {
         const filtered = removeRecognitionContradictionPassages({
           text,
           personaName: personaNameFinal,
+          personaAliases: dynamicCharacterContext.personaAliases,
+          currentUserText: userText,
+          sceneCharacterNames: dynamicCharacterContext.includedNames,
           recognition: dynamicCharacterContext.recognition,
         });
         if (filtered.text) text = filtered.text;
