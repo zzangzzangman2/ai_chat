@@ -1876,6 +1876,13 @@ ${body}`.trim();
       focusedRosterIds: [] as string[],
       focusedNames: [] as string[],
       includedNames: [] as string[],
+      recognition: [] as Array<{
+        characterId: string;
+        characterName: string;
+        firstInteractionTurn: number;
+        lastInteractionTurn: number;
+        evidence: string;
+      }>,
       relationshipCount: 0,
       eventCount: 0,
     };
@@ -2053,6 +2060,11 @@ ${body}`.trim();
       dynamicCharacterFocus: dynamicCharacterContext.focusedNames,
       dynamicRelationshipCount: dynamicCharacterContext.relationshipCount,
       dynamicEventCount: dynamicCharacterContext.eventCount,
+      dynamicRecognition: dynamicCharacterContext.recognition.map((item) => ({
+        name: item.characterName,
+        firstTurn: item.firstInteractionTurn,
+        lastTurn: item.lastInteractionTurn,
+      })),
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
       identityCanonChars: strlen(identityCanonBlock),
       canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
@@ -2611,11 +2623,31 @@ const systemRaw = (cacheFriendlyLayout
     const continuityPriorityBlock = continuityLedger.block
       ? sanitizePromptCached(continuityLedger.block)
       : "";
+    // Recognition facts need a short, human-readable guard near the end of the
+    // system prompt. The full dynamic JSON intentionally sits at the cacheable
+    // prefix, but long prompts can cause the model to overlook a rule buried at
+    // the beginning and make established characters react as if meeting the
+    // persona for the first time.
+    const recognitionPriorityBlock = dynamicCharacterContext.recognition.length
+      ? [
+          `# [CHARACTER RECOGNITION HARD GUARD — RESPONSE VALIDATION]`,
+          `- 아래 인물들은 페르소나 ${personaNameFinal || "주인공"}와 이미 직접 만났고 서로를 알고 있다. 최신 입력에 기억상실·변장·인식 불가가 명시되지 않는 한 초면으로 되돌리지 않는다.`,
+          ...dynamicCharacterContext.recognition.map((item) => {
+            const range =
+              item.firstInteractionTurn === item.lastInteractionTurn
+                ? `${item.lastInteractionTurn}턴`
+                : `${item.firstInteractionTurn}-${item.lastInteractionTurn}턴`;
+            return `- ${item.characterName} ↔ ${personaNameFinal || "주인공"}: 기존 대면 이력 ${range}. ${item.evidence}`;
+          }),
+          `- 응답에서 위 인물이 페르소나에게 '누구냐', '처음 본다', '낯선 사람'처럼 반응하려 하면 그 문장을 출력하지 말고, 저장된 관계·감정·과거 사건을 알아보는 반응으로 다시 쓴다.`,
+        ].join("\n")
+      : "";
     const system = [
       systemWithIdentityCanon,
       sanitizePromptCached(spatialCanon.block),
       currentNarrationPriorityBlock,
       continuityPriorityBlock,
+      recognitionPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)

@@ -47,6 +47,13 @@ export type DynamicCharacterContext = {
   focusedRosterIds: string[];
   focusedNames: string[];
   includedNames: string[];
+  recognition: Array<{
+    characterId: string;
+    characterName: string;
+    firstInteractionTurn: number;
+    lastInteractionTurn: number;
+    evidence: string;
+  }>;
   relationshipCount: number;
   eventCount: number;
 };
@@ -95,6 +102,7 @@ function emptyContext(): DynamicCharacterContext {
     focusedRosterIds: [],
     focusedNames: [],
     includedNames: [],
+    recognition: [],
     relationshipCount: 0,
     eventCount: 0,
   };
@@ -680,6 +688,7 @@ export function buildDynamicCharacterContext(params: {
       const latest = directMemories[directMemories.length - 1];
       return {
         character_id: row.id,
+        character_name: row.name,
         persona_id: "persona",
         status: "already_acquainted",
         first_interaction_turn: first.turnNo,
@@ -720,6 +729,19 @@ export function buildDynamicCharacterContext(params: {
     focusedRosterIds,
     focusedNames,
     includedNames,
+    recognition: recognition.map((item) => ({
+      characterId: cleanText(item.character_id, 120),
+      characterName: cleanText(item.character_name, 80),
+      firstInteractionTurn: Math.max(
+        0,
+        Number(item.first_interaction_turn || 0)
+      ),
+      lastInteractionTurn: Math.max(
+        0,
+        Number(item.last_interaction_turn || 0)
+      ),
+      evidence: cleanText(item.evidence, 300),
+    })),
     relationshipCount: fitted.relationships.length,
     eventCount: fitted.major_events.length,
   };
