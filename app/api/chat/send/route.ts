@@ -26,6 +26,10 @@ import {
   syncIdentityCanonRelations,
 } from "@/lib/relationship_graph";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
+import {
+  findRecognitionContradiction,
+  removeRecognitionContradictionPassages,
+} from "@/lib/recognition_consistency_guard";
 import { selectConservativeMemoryRows } from "@/lib/character_memory_quality";
 import {
   buildMemorySearchFtsQuery,
@@ -2852,6 +2856,101 @@ const systemRaw = (cacheFriendlyLayout
           .filter(Boolean)
           .join("\n");
 
+    const recognitionOverrideRequested =
+      /기억\s*상실|기억을\s*잃|인식\s*(?:불가|실패)|못\s*알아보|알아보지\s*못|(?:변장|복면|가면).{0,24}(?:정체를?\s*숨|인식\s*(?:불가|실패)|못\s*알아보|알아보지\s*못)/.test(
+        userText
+      );
+    const recognitionValidationActive = Boolean(
+      !recognitionOverrideRequested &&
+        personaNameFinal &&
+        dynamicCharacterContext.recognition.length
+    );
+    const enforceRecognitionConsistency = async (args: {
+      text: string;
+      usage: any;
+    }) => {
+      if (!recognitionValidationActive) return args;
+      const contradiction = findRecognitionContradiction({
+        text: args.text,
+        personaName: personaNameFinal,
+        recognition: dynamicCharacterContext.recognition,
+      });
+      if (!contradiction) return args;
+
+      dbg({
+        tag: "send.recognition_guard.detected",
+        chatId: cid,
+        reqId,
+        characterName: contradiction.characterName,
+        matchedText: contradiction.matchedText,
+      });
+
+      let text = args.text;
+      let usage = args.usage;
+      try {
+        const repairUser = [
+          user,
+          "",
+          "# [서버 검수 실패 — 전체 답변 재작성]",
+          `- 초안에서 이미 여러 차례 직접 만난 ${contradiction.characterName}이(가) ${personaNameFinal}을(를) 초면처럼 대하는 관계 모순이 발견됐다.`,
+          `- ${contradiction.characterName}은(는) ${personaNameFinal}을(를) 즉시 알아본다. 저장된 관계·감정·과거 사건에 맞는 반응으로 답변 전체를 다시 작성한다.`,
+          `- '누구냐', '누군데', '처음 본다', '초면', '낯선 사람', '모르는 사람'이라는 취지의 표현을 두 사람 사이에 사용하지 않는다.`,
+          "- 최신 사용자 입력은 반복하지 않고 직후 반응부터 시작하며, 원래 요구된 분량과 상태창 형식은 유지한다.",
+          "",
+          "[폐기할 초안 — 관계 모순을 고쳐 새로 쓸 것]",
+          text,
+        ].join("\n");
+        const repaired = await generateText({
+          system: [systemMain, recognitionPriorityBlock].filter(Boolean).join("\n\n"),
+          user: repairUser,
+          opts: {
+            ...opts,
+            maxOutputTokens: maxOutputTokensForCall,
+            maxOutputTokensRequested: opts.maxOutputTokens,
+          },
+        });
+        if (String(repaired?.text || "").trim()) {
+          text = String(repaired.text).trim();
+          usage = mergeStreamUsage(usage, repaired.usage);
+        }
+      } catch (error) {
+        console.error("[chat/send] recognition repair failed", {
+          chatId: cid,
+          reqId,
+          error: String((error as { message?: unknown })?.message || error),
+        });
+      }
+
+      const remaining = findRecognitionContradiction({
+        text,
+        personaName: personaNameFinal,
+        recognition: dynamicCharacterContext.recognition,
+      });
+      if (remaining) {
+        const filtered = removeRecognitionContradictionPassages({
+          text,
+          personaName: personaNameFinal,
+          recognition: dynamicCharacterContext.recognition,
+        });
+        if (filtered.text) text = filtered.text;
+        dbg({
+          tag: "send.recognition_guard.filtered",
+          chatId: cid,
+          reqId,
+          characterName: remaining.characterName,
+          removedPassages: filtered.removed,
+        });
+      } else {
+        dbg({
+          tag: "send.recognition_guard.repaired",
+          chatId: cid,
+          reqId,
+          characterName: contradiction.characterName,
+        });
+      }
+      return { text, usage };
+    };
+
     const persistCharacterEventsForMessage = (_args: { messageId: string; assistantContent: string; createdAt: number }) => {
       // character card/relationship logging disabled
     };
@@ -3166,6 +3265,13 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           });
           raw = shortContinue.raw;
           combinedUsage = shortContinue.combinedUsage;
+
+          const recognitionChecked = await enforceRecognitionConsistency({
+            text: raw,
+            usage: combinedUsage,
+          });
+          raw = recognitionChecked.text;
+          combinedUsage = recognitionChecked.usage;
 
           combinedRaw = raw;
           const latestUsage: any = combinedUsage;
@@ -4486,6 +4592,13 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         // ignore
       }
     }
+
+    const recognitionChecked = await enforceRecognitionConsistency({
+      text: assistantText,
+      usage: latestUsage,
+    });
+    assistantText = recognitionChecked.text;
+    latestUsage = recognitionChecked.usage;
 
     tEnd(tGemini);
     tStart(tPost);
