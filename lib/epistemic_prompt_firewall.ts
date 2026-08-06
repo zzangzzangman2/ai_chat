@@ -264,7 +264,7 @@ export function sanitizeGeneratedEpistemicText(
   const source = String(value || "");
   const facts = firewall.facts.filter((fact) => fact.knownByNames.length === 0);
   if (!source.trim() || facts.length === 0) {
-    return { text: source.trim(), redactedSegments: 0 };
+    return { text: source, redactedSegments: 0 };
   }
 
   let redactedSegments = 0;
@@ -286,8 +286,12 @@ export function sanitizeGeneratedEpistemicText(
     return restoreOuterNarrationMarkers(line, kept.join(" "));
   });
 
+  if (redactedSegments === 0) {
+    return { text: source, redactedSegments: 0 };
+  }
+
   return {
-    text: normalizeAfterRedaction(lines.filter((line) => line.trim()).join("\n")),
+    text: normalizeAfterRedaction(lines.join("\n")),
     redactedSegments,
   };
 }

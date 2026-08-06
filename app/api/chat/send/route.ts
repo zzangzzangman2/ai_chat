@@ -36,6 +36,7 @@ import {
   removeUnsupportedLegalStatusClaims,
   type LegalStatusIdentity,
 } from "@/lib/legal_status_consistency_guard";
+import { createGuardedTextStream } from "@/lib/guarded_text_stream";
 import {
   findRecognitionContradiction,
   removeRecognitionContradictionPassages,
@@ -3132,7 +3133,7 @@ let cancelStreamWork: (() => void) | null = null;
         let lastDeltaAt = 0;
         let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
-        const safeEnqueue = (obj: any) => {
+        const enqueueWire = (obj: any) => {
           if (streamClosed) return false;
           try {
             const now = Date.now();
@@ -3159,6 +3160,27 @@ let cancelStreamWork: (() => void) | null = null;
             if (STREAM_DEBUG) console.warn(`${streamTag} enqueue ignored (closed)`, e?.message || e);
             return false;
           }
+        };
+        let streamEpistemicRedactions = 0;
+        let streamLegalStatusRedactions = 0;
+        const guardedTextStream = createGuardedTextStream((text) => {
+          const epistemic = sanitizeGeneratedEpistemicText(text, epistemicFirewall);
+          const legalStatus = removeUnsupportedLegalStatusClaims({
+            text: epistemic.text,
+            trustedUserTexts: trustedLegalStatusUserTexts,
+            identities: legalStatusIdentities,
+          });
+          streamEpistemicRedactions += epistemic.redactedSegments;
+          streamLegalStatusRedactions += legalStatus.removed;
+          return legalStatus.text;
+        });
+        const safeEnqueue = (obj: any) => {
+          if (obj?.type !== "delta" || typeof obj?.text !== "string") {
+            return enqueueWire(obj);
+          }
+          const safeText = guardedTextStream.push(obj.text);
+          if (!safeText) return !streamClosed;
+          return enqueueWire({ ...obj, text: safeText });
         };
 
         const safeClose = () => {
@@ -3608,6 +3630,24 @@ if (!TRANSPORT_STREAMING) {
             } catch {
               // ignore
             }
+          }
+
+          const guardedTail = guardedTextStream.finish();
+          if (guardedTail) enqueueWire({ type: "delta", text: guardedTail });
+          assistantText = guardedTextStream.output();
+          if (!assistantText.trim()) {
+            const safeFallback = "*현장 관계자들은 확인되지 않은 사실을 단정하지 않고 방문 목적과 출입 가능 여부부터 확인했다.*";
+            safeEnqueue({ type: "delta", text: safeFallback });
+            assistantText = guardedTextStream.output();
+          }
+          if (streamEpistemicRedactions || streamLegalStatusRedactions) {
+            dbg({
+              tag: "send.stream.output-fact-guard",
+              chatId: cid,
+              reqId,
+              epistemicRedactions: streamEpistemicRedactions,
+              legalStatusRedactions: streamLegalStatusRedactions,
+            });
           }
 
 // messages 저장

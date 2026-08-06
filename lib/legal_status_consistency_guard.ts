@@ -119,7 +119,7 @@ export function removeUnsupportedLegalStatusClaims(input: {
 }): LegalStatusGuardResult {
   const source = String(input.text || "");
   if (!source.trim()) {
-    return { text: "", removed: 0, statuses: [], characterNames: [] };
+    return { text: source, removed: 0, statuses: [], characterNames: [] };
   }
 
   const identities = input.identities.filter((identity) => clean(identity.name));
@@ -168,8 +168,12 @@ export function removeUnsupportedLegalStatusClaims(input: {
     return restoreOuterNarrationMarkers(line, kept.join(" "));
   });
 
+  if (removed === 0) {
+    return { text: source, removed: 0, statuses: [], characterNames: [] };
+  }
+
   return {
-    text: lines.filter((line) => line.trim()).join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    text: lines.join("\n").replace(/\n{3,}/g, "\n\n"),
     removed,
     statuses: [...removedStatuses],
     characterNames: [...removedCharacters],
