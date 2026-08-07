@@ -611,10 +611,15 @@ function parseLorebooksCached(raw: string): any[] {
   return arr;
 }
 
+// 상세 블록을 붙일 캐릭터 수 상한. 현재 입력에서 걸린 인물이 먼저 채우고, 남는
+// 자리에 최근 턴 등장 인물이 들어간다. 실측 장면 인물은 2~3명이라 넉넉하다.
+const MANUAL_ROSTER_DETAIL_LIMIT = 8;
+
 function buildManualCharacterRosterBlock(
   chatIdRaw: string,
   focusTextRaw = "",
-  personaNameOverride = ""
+  personaNameOverride = "",
+  recentFocusTextRaw = ""
 ) {
   const chatId = String(chatIdRaw || "").trim();
   if (!chatId) return "";
@@ -659,6 +664,22 @@ function buildManualCharacterRosterBlock(
     aliases: decryptIfPossible(String(row?.aliases || "")),
   }));
   const focusedIds = findFocusedCharacterIds(scopeRows, focusTextRaw);
+
+  // 최근 몇 턴에 등장한 캐릭터도 장면 인물로 본다.
+  //
+  // 이 블록은 이제 항상 주입되는데(AI_ALWAYS_INJECT_ROSTER), 포커스를 현재 입력
+  // 한 줄로만 잡으면 대부분의 턴에서 아무도 안 걸린다. 실측(로스터 13명) 최근 유저
+  // 턴 5개 중 4개가 현재 입력만으로는 0명이고 최근 4메시지로는 2~3명이었다. 그
+  // 차이만큼 관계·호칭·약속·조우 로그가 빠지고 이름만 남았다.
+  //
+  // 상세 블록은 캐릭터별 heading 안에만 들어가므로 대상을 넓혀도 관계가 다른
+  // 인물로 번지지는 않는다. 다만 대사가 큰 방에서 프롬프트가 붇지 않게 총량은
+  // 현재 입력에서 걸린 인물을 우선해 제한한다.
+  const recentFocusedIds = findFocusedCharacterIds(scopeRows, recentFocusTextRaw);
+  for (const id of recentFocusedIds) {
+    if (focusedIds.size >= MANUAL_ROSTER_DETAIL_LIMIT) break;
+    focusedIds.add(id);
+  }
 
   // 이름이 생략된 턴은 가장 최근에 실제 대화를 나눈 캐릭터를 장면 인물로 본다.
   // 모든 캐릭터의 상세 로그를 한꺼번에 넣으면 한 인물의 관계/호칭이 다른 인물로 번지기 쉽다.
@@ -2038,7 +2059,8 @@ ${body}`.trim();
         manualCharacterRosterFallback = buildManualCharacterRosterBlock(
           cid,
           characterFocusText,
-          personaNameFinal
+          personaNameFinal,
+          recentCharacterFocusText
         );
       } catch (error) {
         console.error("[chat/send] manual character context fallback failed", {
