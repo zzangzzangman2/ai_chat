@@ -67,8 +67,43 @@ export async function consumeMainStreamDeltas(
     hadDelta = true;
     params.safeEnqueue({ type: "delta", text });
   };
-  const flushWithHoldback = () => flushTo(raw.length - holdbackChars);
-  const flushAll = () => flushTo(raw.length);
+  // 선두 화자/작품명 접두(`강호말출 | ...`) 제거.
+  // non-streaming 경로는 textPolicy의 stripNamePrefixFromNarration/normalizeNovelPlain이
+  // 처리하지만, 그 블록은 TRANSPORT_STREAMING일 때 통째로 건너뛴다(전송된 delta는 회수 불가).
+  // 따라서 아직 아무것도 내보내지 않은 동안(flushedLen === 0) 여기서 잘라낸다.
+  // holdbackChars는 g3pro가 아니면 0이므로, 판정이 끝날 때까지 flush 자체를 막아야 한다.
+  const HEAD_SCAN_MAX = 96;
+  let headPrefixResolved = false;
+  const resolveHeadPrefix = (force = false) => {
+    if (headPrefixResolved) return;
+    if (flushedLen > 0) {
+      headPrefixResolved = true;
+      return;
+    }
+    // 모델이 선행 개행/공백을 먼저 뱉는 경우가 있어, 첫 '내용' 줄을 기준으로 본다.
+    const lead = (raw.match(/^\s*/) || [""])[0].length;
+    const rest = raw.slice(lead);
+    const nl = rest.indexOf("\n");
+    const head = nl >= 0 ? rest.slice(0, nl) : rest;
+    const m = head.match(/^[^|\n]{1,40}\|\s*/);
+    if (m) {
+      raw = raw.slice(0, lead) + rest.slice(m[0].length);
+      headPrefixResolved = true;
+      return;
+    }
+    // 접두가 없다는 판정은 확신이 설 때만(첫 줄이 끝났거나 충분히 길어졌을 때).
+    if (force || nl >= 0 || raw.length >= HEAD_SCAN_MAX) headPrefixResolved = true;
+  };
+
+  const flushWithHoldback = () => {
+    // 선두 판정 전에는 한 글자도 내보내지 않는다(최대 HEAD_SCAN_MAX만큼만 지연).
+    if (!headPrefixResolved) return;
+    flushTo(raw.length - holdbackChars);
+  };
+  const flushAll = () => {
+    resolveHeadPrefix(true);
+    flushTo(raw.length);
+  };
 
   let capReached = false;
   let metaStarted = false;
@@ -173,6 +208,7 @@ export async function consumeMainStreamDeltas(
     // Emit body/meta chunk (if any)
     if (out) {
       raw = raw + out;
+      resolveHeadPrefix();
       const now = Date.now();
       const gap = now - lastEmitAt;
       lastEmitAt = now;
