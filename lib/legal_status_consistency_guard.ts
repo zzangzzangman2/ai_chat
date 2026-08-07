@@ -82,10 +82,10 @@ function restoreOuterNarrationMarkers(original: string, value: string) {
 function hasTrustedEvidence(
   definition: LegalStatusDefinition,
   identity: LegalStatusIdentity,
-  trustedUserTexts: string[],
+  trustedTexts: string[],
   identities: LegalStatusIdentity[]
 ) {
-  return trustedUserTexts.some((source) => {
+  return trustedTexts.some((source) => {
     const text = String(source || "");
     const evidenceMatch = text.match(definition.evidence);
     if (!evidenceMatch) return false;
@@ -112,9 +112,33 @@ function hasTrustedEvidence(
   });
 }
 
+/// 법적 신분 주장의 근거로 인정할 텍스트를 모은다.
+///
+/// 사용자가 쓴 문장뿐 아니라 **이미 확정된 서술**도 근거다. 롤플레이에서 사건은
+/// 대부분 서술로 일어난다. 사용자가 "구속"이라고 타이핑한 적이 없어도, 앞선 턴에서
+/// 구속이 서술되어 저장됐다면 그건 이야기의 사실이다. 근거를 사용자 입력으로만
+/// 좁히면 서술로 성립한 사건이 요약 단계에서 통째로 지워지고, 장기기억에는 더 약한
+/// 표현(예: 조사)만 남는다. 실제로 그 사고가 났다.
+///
+/// 없는 신분을 새로 지어내는 것은 생성 시점 가드가 막는다. 그 시점의 in-flight
+/// 텍스트는 스스로의 근거가 될 수 없으므로 여기 넘기지 않는다.
+function collectTrustedTexts(input: {
+  trustedUserTexts?: string[];
+  trustedNarrationTexts?: string[];
+}) {
+  return [
+    ...(input.trustedUserTexts || []),
+    ...(input.trustedNarrationTexts || []),
+  ]
+    .map((value) => String(value || ""))
+    .filter((value) => value.trim());
+}
+
 export function removeUnsupportedLegalStatusClaims(input: {
   text: unknown;
   trustedUserTexts: string[];
+  /// 이미 저장된 서술(assistant 턴). 확정 사실로 취급한다.
+  trustedNarrationTexts?: string[];
   identities: LegalStatusIdentity[];
 }): LegalStatusGuardResult {
   const source = String(input.text || "");
@@ -122,6 +146,7 @@ export function removeUnsupportedLegalStatusClaims(input: {
     return { text: source, removed: 0, statuses: [], characterNames: [] };
   }
 
+  const trustedTexts = collectTrustedTexts(input);
   const identities = input.identities.filter((identity) => clean(identity.name));
   const removedStatuses = new Set<string>();
   const removedCharacters = new Set<string>();
@@ -150,12 +175,7 @@ export function removeUnsupportedLegalStatusClaims(input: {
       const unsupported = definitions.some((definition) =>
         targets.some(
           (identity) =>
-            !hasTrustedEvidence(
-              definition,
-              identity,
-              input.trustedUserTexts,
-              identities
-            )
+            !hasTrustedEvidence(definition, identity, trustedTexts, identities)
         )
       );
       if (!unsupported) return true;

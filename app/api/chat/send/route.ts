@@ -2024,10 +2024,16 @@ ${body}`.trim();
         relatedArchiveText,
       ].join("\n"),
     });
-    // 새 동적 조회가 비어 있거나 DB 조회에 실패한 경우에만 기존 등록 캐릭터
-    // 블록을 복구 경로로 사용한다. 정상 경로에서는 두 기억 블록을 중복 주입하지 않는다.
+    // (변경 2026-08) 등록 캐릭터/관계도는 "항상" 주입한다.
+    // - 기존에는 동적 조회(dynamicCharacterContext)가 비었을 때만 쓰는 복구 경로였는데,
+    //   동적 조회는 현재 입력에 이름이 언급된 캐릭터만 포커스하므로
+    //   "이름 없이 지칭한 인물"이나 "오래 안 나온 인물"의 관계가 통째로 빠졌다.
+    //   (실제 사고: 사용자가 새 인물을 이름 없이 도입하자 최근 캐릭터로 오인)
+    // - 관계도는 전체를 넣어도 1천자 내외라 비용이 미미하고, 관계 혼동을 크게 줄인다.
+    // - 롤백: AI_ALWAYS_INJECT_ROSTER=0 이면 기존처럼 fallback 전용으로 동작.
+    const alwaysInjectRoster = String(process.env.AI_ALWAYS_INJECT_ROSTER || "1").trim() !== "0";
     let manualCharacterRosterFallback = "";
-    if (!dynamicCharacterContext.block) {
+    if (alwaysInjectRoster || !dynamicCharacterContext.block) {
       try {
         manualCharacterRosterFallback = buildManualCharacterRosterBlock(
           cid,
@@ -2083,11 +2089,59 @@ ${body}`.trim();
     const trustedLegalStatusUserTexts = all
       .filter((message) => String(message?.role || "") === "user")
       .map((message) => String(message?.content || ""));
-    const historySummaryForPromptRaw = [
-      hybridMemory.currentArcText,
-      relatedArchiveText,
-      manualCharacterRosterFallback,
-    ]
+    // 저장된 서술도 근거다. 롤플레이 사건은 대부분 서술로 성립하므로, 사용자가
+    // 그 단어를 직접 친 적이 없다는 이유로 확정 사실을 지우면 안 된다. 지어내기는
+    // 생성 시점 가드가 막는다(아래 createGuardedTextStream).
+    const trustedLegalStatusNarrationTexts = all
+      .filter((message) => {
+        const role = String(message?.role || "");
+        return role === "assistant" || role === "model";
+      })
+      .map((message) => String(message?.content || ""));
+    // (변경 2026-08) 장기기억 "전체 주입" 모드.
+    // - 기존: 검색으로 최근 15턴(3200자) + 관련 과거 6섹션(2400자)만 주입 → 나머지 아카이브는 버려짐.
+    //   키워드 substring 매칭이라 다른 표현으로 물으면 회수 실패, 검색 실패 시 폴백도 '최신 2섹션'이라
+    //   초반 기억이 구조적으로 소환되지 않았다.
+    // - 변경: 정규화된 누적 요약(historySummary) 전문을 그대로 넣는다.
+    //   실측 200턴 = 약 9천 토큰(컨텍스트의 0.9%, 턴당 +15원)이라 비용/지연 영향이 미미하다.
+    // - 상한(AI_FULL_LONG_MEMORY_MAX_CHARS, 기본 64000자 ≈ 4만 토큰) 초과 시에만
+    //   섹션 단위로 오래된 구간부터 탈락시킨다. (문장 중간 절단 방지)
+    // - 롤백: AI_FULL_LONG_MEMORY=0 이면 기존 검색/선별 경로로 되돌아간다.
+    const fullLongMemoryEnabled = String(process.env.AI_FULL_LONG_MEMORY || "1").trim() !== "0";
+    const fullLongMemoryMaxChars = (() => {
+      const raw = Number(process.env.AI_FULL_LONG_MEMORY_MAX_CHARS ?? 64000);
+      if (!Number.isFinite(raw) || raw <= 0) return 64000;
+      return Math.max(4000, Math.floor(raw));
+    })();
+    const clampLongMemoryBySection = (text: string, maxChars: number) => {
+      const s = String(text || "");
+      if (s.length <= maxChars) return s;
+      const sections = extractSummarySections(s);
+      if (!sections.length) return s.slice(-maxChars);
+      const kept: string[] = [];
+      let used = 0;
+      // 최신 섹션부터 채우고, 예산을 넘기면 더 오래된 구간은 제외한다.
+      for (let i = sections.length - 1; i >= 0; i -= 1) {
+        const section = sections[i];
+        const range =
+          section.startTurn === section.endTurn
+            ? `${section.endTurn}턴`
+            : `${section.startTurn}-${section.endTurn}턴`;
+        const piece = `### ${section.title} (${range})\n${section.body}`.trim();
+        if (used > 0 && used + piece.length + 2 > maxChars) break;
+        kept.unshift(piece);
+        used += piece.length + 2;
+      }
+      return kept.join("\n\n");
+    };
+    const fullLongMemoryText = fullLongMemoryEnabled
+      ? clampLongMemoryBySection(String(historySummary || "").trim(), fullLongMemoryMaxChars)
+      : "";
+    const historySummaryForPromptRaw = (
+      fullLongMemoryText
+        ? [fullLongMemoryText, manualCharacterRosterFallback]
+        : [hybridMemory.currentArcText, relatedArchiveText, manualCharacterRosterFallback]
+    )
       .filter((x) => String(x || "").trim())
       .join("\n\n");
     const historyEpistemicView = sanitizeSharedEpistemicText(
@@ -2097,6 +2151,7 @@ ${body}`.trim();
     const historyLegalStatusView = removeUnsupportedLegalStatusClaims({
       text: historyEpistemicView.text,
       trustedUserTexts: trustedLegalStatusUserTexts,
+      trustedNarrationTexts: trustedLegalStatusNarrationTexts,
       identities: legalStatusIdentities,
     });
     const historySummaryForPrompt = historyLegalStatusView.text;
@@ -2141,6 +2196,13 @@ ${body}`.trim();
         lastTurn: item.lastInteractionTurn,
       })),
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
+      // (2026-08) 전체 주입 모드 진단
+      fullLongMemory: fullLongMemoryEnabled,
+      fullLongMemoryChars: strlen(fullLongMemoryText),
+      fullLongMemoryTruncated: fullLongMemoryEnabled
+        ? strlen(String(historySummary || "").trim()) > strlen(fullLongMemoryText)
+        : false,
+      alwaysInjectRoster,
       identityCanonChars: strlen(identityCanonBlock),
       canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
       spatialCanonChars: strlen(spatialCanon.block),
@@ -2155,9 +2217,15 @@ ${body}`.trim();
       legalStatusSummaryRedactions: historyLegalStatusView.removed,
     });
     const memoryBlock = [
-      `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
-      `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
-      `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
+      fullLongMemoryText
+        ? `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 전체 요약 아카이브)`
+        : `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
+      fullLongMemoryText
+        ? `- 아래 요약 아카이브는 이 대화의 처음부터 최근까지 전 구간이다. 오래된 구간도 사실 확인에 그대로 사용한다.`
+        : `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
+      fullLongMemoryText
+        ? `- 사용자가 과거 사건/인물/약속을 물으면 이 아카이브에서 근거를 찾아 답하고, 근거가 없으면 지어내지 말고 모른다고 처리한다.`
+        : `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
       `- 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
       `- 인물 연속성 장부가 있으면 과거 캐릭터 기록과 최신 일반 장면 지시보다 우선한다.`,
       `- 별도의 인물 정체성·가족관계 정사 블록이 있으면 이 통합 장기기억보다 우선한다.`,
@@ -2864,6 +2932,7 @@ const systemRaw = (cacheFriendlyLayout
       const legalStatus = removeUnsupportedLegalStatusClaims({
         text: sanitized.text,
         trustedUserTexts: trustedLegalStatusUserTexts,
+        trustedNarrationTexts: trustedLegalStatusNarrationTexts,
         identities: legalStatusIdentities,
       });
       legalStatusTailRedactions += legalStatus.removed;
@@ -3168,6 +3237,7 @@ let cancelStreamWork: (() => void) | null = null;
           const legalStatus = removeUnsupportedLegalStatusClaims({
             text: epistemic.text,
             trustedUserTexts: trustedLegalStatusUserTexts,
+            trustedNarrationTexts: trustedLegalStatusNarrationTexts,
             identities: legalStatusIdentities,
           });
           streamEpistemicRedactions += epistemic.redactedSegments;
@@ -4861,6 +4931,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     const legalStatusOutputChecked = removeUnsupportedLegalStatusClaims({
       text: assistantText,
       trustedUserTexts: trustedLegalStatusUserTexts,
+      trustedNarrationTexts: trustedLegalStatusNarrationTexts,
       identities: legalStatusIdentities,
     });
     assistantText = legalStatusOutputChecked.text;

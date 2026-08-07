@@ -1938,6 +1938,23 @@ function clearPreviousTerminalRows(rows) {
   return out;
 }
 
+// 입력 프롬프트가 차지한 영역을 통째로 지운다.
+//
+// terminalRowsForLine은 VT의 "보류 줄바꿈"을 가정한다. 오른쪽 끝 칸을 채워도
+// 커서는 그 칸에 머물고, 다음 글자를 쓸 때 비로소 줄이 넘어간다는 모델이다.
+// 그런데 conhost는 마지막 칸을 채우는 순간 바로 다음 줄로 내려간다. 그래서
+// 입력의 표시폭이 터미널 폭의 정확한 배수일 때만 두 모델이 한 줄 어긋나고,
+// 그 한 줄이 지워지지 않아 원문이 통째로 남는다.
+//
+// 폭을 더 정확히 세는 방법으로는 이 차이를 없앨 수 없다. 어느 쪽 터미널인지
+// 알아야 하는 문제라서다. 대신 프롬프트 앞에 우리가 넣은 빈 줄까지 한 줄 더
+// 거슬러 올라간 뒤 화면 끝까지 지운다. 두 모델 중 어느 쪽이든 원문은 남지
+// 않으며, 어긋나는 쪽에서는 빈 줄이 하나 더 생길 뿐이다.
+function clearEchoedPromptRegion(rows) {
+  const count = Math.max(1, Math.floor(Number(rows) || 1)) + 1;
+  return `\x1b[${count}A\r\x1b[0J`;
+}
+
 function fitDisplay(value, maxWidth) {
   const text = String(value || "");
   if (displayWidth(text) <= maxWidth) return text;
@@ -3113,9 +3130,11 @@ async function main() {
         try {
           const promptStr = prompt.replace(/^\n+/, ""); // 줄바꿈 제외한 prompt 본문
           const terminalColumns = Math.max(1, Number(process.stdout.columns || 80));
-          const echoedRows = terminalRowsForLine(`${promptStr}${line}`, terminalColumns);
-          process.stdout.write(clearPreviousTerminalRows(echoedRows));
-          process.stdout.write(`${promptStr}${colorNovelInline(line)}\n`);
+          // readline이 실제로 echo한 것은 트림 전 원문이다. 트림한 line으로 재면
+          // 앞뒤 공백만큼 줄 수가 모자랄 수 있다.
+          const echoedRows = terminalRowsForLine(`${promptStr}${lineRaw}`, terminalColumns);
+          process.stdout.write(clearEchoedPromptRegion(echoedRows));
+          process.stdout.write(`\n${promptStr}${colorNovelInline(line)}\n`);
         } catch {
           // 일부 TTY 환경에서 ANSI 이동이 실패하면 무시 (기능 영향 없음)
         }
@@ -3171,4 +3190,5 @@ module.exports = {
   settingsPanelRows,
   terminalRowsForLine,
   clearPreviousTerminalRows,
+  clearEchoedPromptRegion,
 };

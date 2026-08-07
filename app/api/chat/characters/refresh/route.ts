@@ -365,6 +365,11 @@ export async function POST(req: Request) {
     const trustedLegalStatusUserTexts = decryptedAll
       .filter((message) => message.role === "user")
       .map((message) => String(message.content || ""));
+    // 저장된 서술도 확정 사실이므로 근거에 포함한다. 빼면 서술로 성립한 신분이
+    // 캐릭터 카드 갱신 단계에서 사라진다.
+    const trustedLegalStatusNarrationTexts = decryptedAll
+      .filter((message) => isAssistantRole(message.role))
+      .map((message) => String(message.content || ""));
     all = all.map((message) => {
       if (!isAssistantRole(message.role)) return message;
       return {
@@ -372,6 +377,7 @@ export async function POST(req: Request) {
         content: removeUnsupportedLegalStatusClaims({
           text: message.content,
           trustedUserTexts: trustedLegalStatusUserTexts,
+          trustedNarrationTexts: trustedLegalStatusNarrationTexts,
           identities: legalStatusIdentities,
         }).text,
       };

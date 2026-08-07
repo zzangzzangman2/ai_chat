@@ -907,7 +907,13 @@ function firstBadSectionRange(summary: string, boundaryEndTurn: number) {
   const ordered = [...sections].sort((a, b) => a.startTurn - b.startTurn);
   for (const s of ordered) {
     if (s.endTurn > boundaryEndTurn) continue;
-    const q = analyzeLongMemoryBody(s.body);
+    // (변경 2026-08) 저장본 복구 판정에도 self-review 마커 검사를 적용한다.
+    // 모델의 사고/자기검증 텍스트("Wait, check...", "(71 chars) Total length...",
+    // "시스템 지침의 마크다운 금지는 오버라이드할 수 없다...")가 요약 본문으로 저장된
+    // 사례가 실제로 확인됐고, 기존 analyzeLongMemoryBody는 한국어 사고문을 걸러내지 못했다.
+    // 이 판정은 repairCorrupted=true 로 명시 요청했을 때만 사용되므로,
+    // "배포만으로 과거 채팅이 재작성되지 않는다"는 기존 원칙은 그대로 유지된다.
+    const q = analyzeGeneratedLongMemoryBody(s.body);
     if (!q.ok) return { startTurn: s.startTurn, endTurn: s.endTurn, title: s.title, quality: q };
   }
   return null;
@@ -1011,6 +1017,11 @@ export async function POST(req: Request) {
     const trustedLegalStatusUserTexts = decryptedAll
       .filter((message) => message.role === "user")
       .map((message) => String(message.content || ""));
+    // 이미 저장된 서술은 확정 사실이다. 요약을 만들기 전에 이걸 근거에서 빼면
+    // 서술로만 성립한 사건(예: 구속)이 사라진 채로 장기기억이 굳어버린다.
+    const trustedLegalStatusNarrationTexts = decryptedAll
+      .filter((message) => message.role === "assistant" || message.role === "model")
+      .map((message) => String(message.content || ""));
     all = all.map((message) => {
       if (message.role !== "assistant" && message.role !== "model") return message;
       return {
@@ -1018,6 +1029,7 @@ export async function POST(req: Request) {
         content: removeUnsupportedLegalStatusClaims({
           text: message.content,
           trustedUserTexts: trustedLegalStatusUserTexts,
+          trustedNarrationTexts: trustedLegalStatusNarrationTexts,
           identities: legalStatusIdentities,
         }).text,
       };
@@ -1731,6 +1743,36 @@ export async function POST(req: Request) {
       const forceSection = `### ${forceTitle} (${windowStartTurn}-${windowEndTurn}턴)\n자동검증 실패로 임시 저장됨. 상세 검토 필요.`;
       nextSummary = upsertSummaryRangeBlock(recentSummary, forceSection, windowStartTurn, windowEndTurn);
       nextSummary = normalizeStoredMemorySummary(normalizeSummaryTail(nextSummary), summaryEveryVal);
+    }
+
+    // (가드 2026-08) 아카이브 축소 방지.
+    // 실제 사고: repairCorrupted 경로로 1-3턴을 재생성했더니 저장 직후 캐시가
+    // 66섹션(1-198턴, 14,376자) → 1섹션(1-3턴, 1,085자)으로 잘리고 커서가 198→3으로 후퇴했다.
+    // (정규화 체인 어딘가에서 연속성이 깨지면 그 뒤 섹션이 통째로 폐기되는데,
+    //  그 결과가 무가드로 DB에 덮어써져 자력 복구가 불가능해진다.)
+    // 새 요약의 섹션 수가 기존보다 줄어들면 저장하지 않고 건너뛴다.
+    // (정상 경로는 섹션이 늘거나 같으므로 영향 없음)
+    const prevSectionCount = extractSummarySections(String(recentSummary || "")).length;
+    const nextSectionCount = extractSummarySections(String(nextSummary || "")).length;
+    if (prevSectionCount > 0 && nextSectionCount < prevSectionCount) {
+      console.error("[memory/refresh] archive shrink blocked", {
+        chatId,
+        windowStartTurn,
+        windowEndTurn,
+        prevSectionCount,
+        nextSectionCount,
+        prevChars: strlenSummary(recentSummary),
+        nextChars: strlenSummary(nextSummary),
+      });
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: "archive_shrink_blocked",
+        windowStartTurn,
+        windowEndTurn,
+        prevSectionCount,
+        nextSectionCount,
+      });
     }
 
     const nextEndTurn = Math.max(summarizedEndTurn, getSummarizedEndTurn(nextSummary));
