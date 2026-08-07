@@ -1623,7 +1623,14 @@ export function normalizeNovelOutput(text: string, personaName: string, npcName:
       .replace(/[\s\u200b\u200c\u200d]+/g, "")
       .replace(/["'“”‘’\.,!?！？。…]/g, "")
       .trim();
-  const latestNorm = latestUserLine ? norm(latestUserLine.replace(new RegExp(`^${personaName}\s*\|\s*`), "")) : "";
+  // 유저 최신 대사에서 화자 접두를 떼고 비교용으로 정규화한다.
+  // 이전 구현: new RegExp(`^${personaName}\s*\|\s*`)
+  //  - 템플릿 리터럴에서 \s -> "s", \| -> "|" 로 백슬래시가 사라져 소스가 `^NAMEs*|s*`가 된다.
+  //    끝의 빈 대안 때문에 접두가 통째로 지워지지 않고 "| " 가 남아, 아래 1676행 비교가
+  //    항상 불일치 -> 화자 교정 가드가 한 번도 동작하지 않았다.
+  //  - personaName을 이스케이프하지 않아, 이름에 정규식 메타문자가 있으면 예외로 터졌다.
+  // 이름에 의존하지 않는 선두 접두 규칙(streamLoop/create와 동일)으로 통일한다.
+  const latestNorm = latestUserLine ? norm(latestUserLine.replace(/^[^|\n]{1,40}\|\s*/, "")) : "";
 
   const out: string[] = [];
   for (const line0 of raw.split("\n")) {

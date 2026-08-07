@@ -169,15 +169,21 @@ export async function POST(req: Request) {
           : ""
     ).trim();
     if (first) {
-      const npc = String(preset?.characterName || "상대").trim() || "상대";
-      const hasPrefix = new RegExp(`^${npc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\s*\|`).test(first);
-      const contentOnly = hasPrefix ? first.replace(/^.+?\s*\|\s*/, "").trim() : first;
-
-      // workspace의 "첫 메시지"는 제작자가 입력한 원문을 그대로 저장한다.
-      // - 제작자가 쌍따옴표로 묶지 않은 문장은 지문으로 취급되어야 하므로,
-      //   과거처럼 자동으로 `NPC | "..."` wrapper를 덧씌우지 않는다.
-      // - 제작자가 원하면 직접 따옴표/화자 접두를 넣을 수 있다.
-      const finalText = convertTabTablesToHtml(hasPrefix ? first : contentOnly);
+      // 선두 화자/작품명 접두(`강호말출 | "..."`)를 제거한다.
+      // 스트리밍 응답(streamLoop의 resolveHeadPrefix)과 같은 규칙을 써서
+      // 프롤로그와 이후 답변의 첫인상이 어긋나지 않게 한다.
+      //
+      // 이전 구현은 두 군데가 동시에 깨져 있어 접두가 한 번도 제거되지 않았다:
+      //  (1) new RegExp(`^${npc}\s*\|`) — 템플릿 리터럴에서 \s -> "s", \| -> "|" 로
+      //      백슬래시가 사라져 소스가 `^NPCs*|` 가 된다. 끝의 빈 대안(alternation)이
+      //      모든 문자열에 매치되므로 hasPrefix는 항상 true였다.
+      //  (2) 그 뒤 삼항이 뒤집혀 있어(hasPrefix ? first : contentOnly) 접두가 있을 때
+      //      오히려 원문을 골랐고, contentOnly는 도달 불가능한 죽은 코드였다.
+      //
+      // 기존 방침(제작자 원문에 `NPC | "..."` wrapper를 덧씌우지 않는다)은 유지한다.
+      // 여기서는 덧씌우지 않고 '있는 접두를 떼기만' 한다.
+      const contentOnly = first.replace(/^[^|\n]{1,40}\|\s*/, "").trim();
+      const finalText = convertTabTablesToHtml(contentOnly || first);
 
 db.prepare(`INSERT INTO messages (id, chatId, role, content, createdAt, updatedAt, userEmail) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
         randomUUID(),
