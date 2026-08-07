@@ -6,6 +6,7 @@ const {
   clearEchoedPromptRegion,
   clearPreviousTerminalRows,
   displayWidth,
+  promptPersonaFields,
   terminalRowsForLine,
 } = require("./dos-chat.js");
 
@@ -56,4 +57,59 @@ test("an input that exactly fills the terminal still gets fully erased", () => {
   // 지우기는 그 위 빈 줄까지 올라가고 화면 끝까지 밀어버리므로,
   // conhost가 한 줄을 더 썼더라도 원문이 남지 않는다.
   assert.equal(clearEchoedPromptRegion(1), "\x1b[2A\r\x1b[0J");
+});
+
+function fakeReadline(answers) {
+  const asked = [];
+  let i = 0;
+  return {
+    asked,
+    question: async (label) => {
+      asked.push(label);
+      return answers[i++] ?? "";
+    },
+  };
+}
+
+test("persona setup asks for all four fields in order", async () => {
+  const rl = fakeReadline(["춘복", "16", "남", "고등학생"]);
+  const fields = await promptPersonaFields(rl, {});
+
+  assert.deepEqual(fields, {
+    personaName: "춘복",
+    personaAge: "16",
+    personaGender: "남",
+    personaInfo: "고등학생",
+  });
+  assert.equal(rl.asked.length, 4);
+  assert.match(rl.asked[0], /^이름 /u);
+  assert.match(rl.asked[1], /^나이/u);
+  assert.match(rl.asked[2], /^성별 /u);
+  assert.match(rl.asked[3], /^정보 /u);
+});
+
+test("Enter keeps the value the room already has", async () => {
+  const rl = fakeReadline(["", "", "", ""]);
+  const settings = {
+    personaName: "기존이름",
+    personaAge: 22,
+    personaGender: "여",
+    personaInfo: "기존정보",
+  };
+  const fields = await promptPersonaFields(rl, settings);
+
+  assert.equal(fields.personaName, "기존이름");
+  assert.equal(fields.personaAge, "22");
+  assert.equal(fields.personaGender, "여");
+  assert.equal(fields.personaInfo, "기존정보");
+  // 기존값을 프롬프트에 보여 줘야 Enter가 유지라는 걸 알 수 있다.
+  assert.match(rl.asked[0], /기존이름/u);
+});
+
+test("an empty room shows blank defaults rather than inventing a persona", async () => {
+  const rl = fakeReadline(["", "", "", ""]);
+  const fields = await promptPersonaFields(rl, {});
+
+  assert.equal(fields.personaName, "");
+  assert.match(rl.asked[0], /비어있음/u);
 });

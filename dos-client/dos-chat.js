@@ -130,6 +130,9 @@ const state = {
   // readline prompt 대기 중 Ctrl+C / Ctrl+Z를 명령으로 처리하기 위한 컨트롤러.
   promptController: null,
   shortcutAction: "",
+  // 페르소나 안내를 이미 띄운 채팅. 한 방에서 두 번 붙잡지 않기 위한 것으로,
+  // 프로세스가 살아 있는 동안만 유지한다.
+  personaPromptedChatIds: new Set(),
 };
 
 function restoreTerminal() {
@@ -2454,6 +2457,113 @@ async function updateSetting(field, value) {
 // - /persona gender 남     : 성별
 // - /persona info 키 178...: 상세 설명 (한 줄 입력. 줄바꿈은 \n 으로 입력)
 // - /persona edit          : 대화형 4단계 입력 (각 항목 Enter 시 기존값 유지)
+// 전역 프로필의 페르소나. 새 채팅은 이 값을 물려받으므로 비어 있으면 방 페르소나도
+// 비어서 시작한다. 입장 안내에서 기본값으로 보여 주면 Enter만으로 재사용할 수 있다.
+function readGlobalPersonaDefaults() {
+  try {
+    const row = dbGet(
+      `SELECT personaName, personaAge, personaGender, personaInfo
+         FROM user_profile WHERE id=1`,
+      []
+    );
+    if (!row) return null;
+    return {
+      personaName: String(row.personaName || ""),
+      personaAge: String(row.personaAge || ""),
+      personaGender: String(row.personaGender || ""),
+      personaInfo: String(row.personaInfo || ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// 페르소나 4항목을 대화형으로 받는다. Enter는 현재값(또는 전역 기본값) 유지.
+async function promptPersonaFields(rl, settings) {
+  const globals = readGlobalPersonaDefaults() || {};
+  const pick = (key) =>
+    String(settings?.[key] || "") || String(globals[key] || "");
+  const current = {
+    personaName: pick("personaName"),
+    personaAge: pick("personaAge"),
+    personaGender: pick("personaGender"),
+    personaInfo: pick("personaInfo"),
+  };
+  const ask = async (label, value) => {
+    const promptStr = `${label} [${value || "비어있음"}] (Enter면 유지): `;
+    const ans = await rl.question(promptStr);
+    return String(ans || "").trim() || value;
+  };
+  return {
+    personaName: await ask("이름", current.personaName),
+    personaAge: await ask("나이(숫자)", current.personaAge),
+    personaGender: await ask("성별", current.personaGender),
+    personaInfo: await ask("정보", current.personaInfo),
+  };
+}
+
+async function savePersonaFields(settings, fields) {
+  const ageNum = Number(fields.personaAge);
+  const next = {
+    ...settings,
+    chatId: state.chatId,
+    personaName: fields.personaName,
+    personaAge: Number.isFinite(ageNum) && ageNum > 0 ? Math.floor(ageNum) : 0,
+    personaGender: fields.personaGender,
+    personaInfo: fields.personaInfo,
+  };
+  const json = await apiJson("/api/chat/settings", {
+    method: "POST",
+    body: JSON.stringify(next),
+  });
+  applySettings(json && json.settings ? json.settings : null);
+  return json && json.settings ? json.settings : null;
+}
+
+// 방에 들어왔는데 페르소나가 비어 있으면 첫 입력을 받기 전에 먼저 정하게 한다.
+//
+// 새 채팅은 전역 프로필에서 페르소나를 복사하는데 그 프로필이 비어 있으면 방도
+// 비어서 시작한다. 그 상태로 대화를 시작하면 프롬프트에 페르소나가 없는 채로
+// 턴이 쌓이고, 나중에 채워도 앞선 턴은 그대로 남는다.
+//
+// 한 방에서는 한 번만 묻는다. 이름을 비운 채 넘겨도 다시 붙잡지 않고, 나중에
+// /persona edit 으로 정할 수 있다고만 알린다.
+async function ensurePersonaConfigured(rl) {
+  if (!state.chatId) return;
+  if (state.personaPromptedChatIds.has(state.chatId)) return;
+
+  const st = await loadSettings().catch(() => null);
+  if (!st) return;
+
+  state.personaPromptedChatIds.add(state.chatId);
+  if (cleanPromptName(st.personaName)) return;
+
+  hr("페르소나 설정");
+  console.log("이 방에는 아직 페르소나가 없습니다. 먼저 정하고 시작합니다.");
+  console.log(`${ANSI.gray}Enter만 누르면 그 항목은 비워 둡니다. 나중에 /persona edit 으로도 바꿉니다.${ANSI.reset}`);
+  console.log("");
+
+  try {
+    const fields = await promptPersonaFields(rl, st);
+    if (!cleanPromptName(fields.personaName)) {
+      console.log("");
+      console.log("페르소나를 비워 둔 채로 시작합니다. /persona edit 으로 언제든 정할 수 있어요.");
+      return;
+    }
+    await savePersonaFields(st, fields);
+    console.log("");
+    console.log(`페르소나를 ${cleanPromptName(fields.personaName)}(으)로 저장했습니다.`);
+  } catch (err) {
+    // Ctrl+C 등으로 중단하면 조용히 넘어간다. 다음 방 입장에서 다시 묻는다.
+    if (err && err.name === "AbortError") {
+      state.personaPromptedChatIds.delete(state.chatId);
+      console.log("");
+      return;
+    }
+    throw err;
+  }
+}
+
 async function personaCommand(rl, arg) {
   const st = await loadSettings();
   if (!st) {
@@ -2482,37 +2592,8 @@ async function personaCommand(rl, arg) {
   const rest = restArr.join(" ").trim();
 
   if (sub === "edit") {
-    const cur = {
-      personaName: String(st.personaName || ""),
-      personaAge: String(st.personaAge || ""),
-      personaGender: String(st.personaGender || ""),
-      personaInfo: String(st.personaInfo || ""),
-    };
-    const ask = async (label, current) => {
-      const promptStr = `${label} [${current || "비어있음"}] (Enter면 유지): `;
-      const ans = await rl.question(promptStr);
-      const s = String(ans || "").trim();
-      return s || current;
-    };
-    const name = await ask("이름", cur.personaName);
-    const ageStr = await ask("나이(숫자)", cur.personaAge);
-    const gender = await ask("성별", cur.personaGender);
-    const info = await ask("정보", cur.personaInfo);
-
-    const ageNum = Number(ageStr);
-    const next = {
-      ...st,
-      chatId: state.chatId,
-      personaName: name,
-      personaAge: Number.isFinite(ageNum) && ageNum > 0 ? Math.floor(ageNum) : 0,
-      personaGender: gender,
-      personaInfo: info,
-    };
-    const json = await apiJson("/api/chat/settings", {
-      method: "POST",
-      body: JSON.stringify(next),
-    });
-    applySettings(json && json.settings ? json.settings : null);
+    const fields = await promptPersonaFields(rl, st);
+    await savePersonaFields(st, fields);
     console.log("페르소나 저장 완료.");
     await showSettings();
     return;
@@ -3088,6 +3169,15 @@ async function main() {
 
   try {
     while (true) {
+      // 방에 들어온 직후 페르소나가 비어 있으면 첫 입력을 받기 전에 먼저 정한다.
+      // 생성(/new)·열기(/open)·시작 시 자동 복귀·뒤로가기까지 모든 입장 경로가
+      // 결국 이 지점을 지나므로 여기 한 곳만 두면 된다.
+      try {
+        await ensurePersonaConfigured(rl);
+      } catch {
+        // 설정 저장 실패가 대화 진입을 막지는 않게 한다.
+      }
+
       // 채팅 설정/전역 프로필에서 페르소나명을 즉시 반영한다.
       const promptName = getPromptDisplayName();
       const prompt = state.chatId
@@ -3191,4 +3281,5 @@ module.exports = {
   terminalRowsForLine,
   clearPreviousTerminalRows,
   clearEchoedPromptRegion,
+  promptPersonaFields,
 };
