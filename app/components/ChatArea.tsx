@@ -2022,12 +2022,29 @@ const loadOlder = useCallback(async () => {
     [CHAT_THEME, renderInline]
   );
 
+  // (성능) send는 매 렌더 새로 만들어지는 함수 선언이라 deps에 직접 넣으면
+  // renderMarkdownLite -> MessageContent memo가 통째로 무효화된다.
+  // 클릭 시점에만 필요하므로 latest-ref로 우회한다.
+  const sendRef = useRef<(t?: unknown) => void>(() => {});
+  useEffect(() => {
+    sendRef.current = (t?: unknown) => {
+      void send(t);
+    };
+  });
+
   // (Chat 모드) 최소 마크다운 렌더러
   // - 목적: 채팅 모드에서도 ```status 같은 코드블록/외부 이미지 마크다운이 UI에 그대로 보이게
   // - 주의: renderNovel(소설 모드) 로직/스타일은 절대 건드리지 않는다.
-  function renderMarkdownLite(text: string): React.ReactNode {
-    return renderMarkdownLiteNode(text, { theme: CHAT_THEME, renderInline, showImages, onQuickUserText: (t) => send(t) });
-  }
+  const renderMarkdownLite = useCallback(
+    (text: string): React.ReactNode =>
+      renderMarkdownLiteNode(text, {
+        theme: CHAT_THEME,
+        renderInline,
+        showImages,
+        onQuickUserText: (t) => sendRef.current(t),
+      }),
+    [CHAT_THEME, renderInline, showImages]
+  );
 
   // (템플릿) 프리셋 첫 메시지 등에 {{user}} placeholders가 남아있는 경우
   // 현재 선택된 페르소나로 최소 치환한다.
@@ -3911,7 +3928,9 @@ return (
         </div>
       );
     },
-	    [CHAT_THEME, galleryMap, renderInline, renderNovelInlineColored, renderNovel, renderMarkdownLite, buildInputPreviewNodes, (settings as any)?.renderMode, selectedProfile, selectedPreset?.name, showImages, firstAssistantId, messages, chatFontSizePx, paraSpacing, paraGapPx]
+	    // (성능) messages는 본문에서 쓰지 않는다. deps에 남겨두면 스트리밍 델타마다
+	    // MessageContent가 새로 만들어져 렌더된 메시지 전부가 재파싱된다.
+	    [CHAT_THEME, galleryMap, renderInline, renderNovelInlineColored, renderNovel, renderMarkdownLite, buildInputPreviewNodes, (settings as any)?.renderMode, selectedProfile, selectedPreset?.name, showImages, firstAssistantId, chatFontSizePx, paraSpacing, paraGapPx]
   );
 
   // (성능) 토큰 팝업 오픈 핸들러를 안정화해서, 입력창 타이핑마다 MessageList가 재렌더되는 것을 줄인다.
@@ -4266,6 +4285,18 @@ return (
   useEffect(() => {
     return () => cancelInFlightSend("chat-context-change");
   }, [chatId, presetId, cancelInFlightSend]);
+
+  // 생성 중 Esc = 중단. 입력창은 busy일 때 disabled라 keydown을 못 받으므로 window에 건다.
+  useEffect(() => {
+    if (!busy) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      cancelInFlightSend("user-stop-esc");
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [busy, cancelInFlightSend]);
 
 
   // 최신 추천 생성용(ref): 스트리밍 완료본을 state 레이스 없이 사용
@@ -7385,30 +7416,59 @@ boxSizing: "border-box",
 	              position: "relative",
 	            }}
 	          >
-	            {/* 전송 아이콘(메시지 박스 내부 우측 상단) */}
-	            <button
-	              type="button"
-	              onClick={send}
-	              disabled={busy || !!editingAssistantId || !chatId}
-	              title={messages.length === 0 ? "시작" : "전송"}
-	              style={{
-	                position: "absolute",
-	                top: 8,
-	                right: 8,
-	                width: 34,
-	                height: 34,
-	                borderRadius: 10,
-	                border: "none",
-	                background: busy || editingAssistantId ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.06)",
-	                color: busy || editingAssistantId ? "rgba(255,255,255,0.35)" : CHAT_THEME.text,
-	                cursor: busy || editingAssistantId ? "not-allowed" : "pointer",
-	                display: "flex",
-	                alignItems: "center",
-	                justifyContent: "center",
-	              }}
-	            >
-	              <Icon name="paperPlane" size={16} />
-	            </button>
+	            {/* 전송/중단 아이콘(메시지 박스 내부 우측 상단) */}
+	            {busy ? (
+	              // 생성 중에는 같은 자리를 '중단' 버튼으로 바꾼다.
+	              // (이전에는 취소 수단이 '채팅 전환'뿐이라 모델이 멈추면 빠져나갈 길이 없었다.)
+	              <button
+	                type="button"
+	                onClick={() => cancelInFlightSend("user-stop")}
+	                title="생성 중단 (Esc)"
+	                aria-label="생성 중단"
+	                style={{
+	                  position: "absolute",
+	                  top: 8,
+	                  right: 8,
+	                  width: 34,
+	                  height: 34,
+	                  borderRadius: 10,
+	                  border: "none",
+	                  background: "rgba(239,68,68,0.18)",
+	                  color: "#fca5a5",
+	                  cursor: "pointer",
+	                  display: "flex",
+	                  alignItems: "center",
+	                  justifyContent: "center",
+	                }}
+	              >
+	                <Icon name="stop" size={14} />
+	              </button>
+	            ) : (
+	              <button
+	                type="button"
+	                onClick={send}
+	                disabled={!!editingAssistantId || !chatId}
+	                title={messages.length === 0 ? "시작" : "전송"}
+	                aria-label={messages.length === 0 ? "시작" : "전송"}
+	                style={{
+	                  position: "absolute",
+	                  top: 8,
+	                  right: 8,
+	                  width: 34,
+	                  height: 34,
+	                  borderRadius: 10,
+	                  border: "none",
+	                  background: editingAssistantId ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.06)",
+	                  color: editingAssistantId ? "rgba(255,255,255,0.35)" : CHAT_THEME.text,
+	                  cursor: editingAssistantId ? "not-allowed" : "pointer",
+	                  display: "flex",
+	                  alignItems: "center",
+	                  justifyContent: "center",
+	                }}
+	              >
+	                <Icon name="paperPlane" size={16} />
+	              </button>
+	            )}
 
 	            {(suggestions.length > 0 || suggestLoading) && (
 	            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8, paddingRight: 44 }}>

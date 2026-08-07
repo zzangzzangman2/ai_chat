@@ -7,7 +7,7 @@ export function Icon({
   size = 16,
 }: {
   // 기존 코드에서 "refresh"라는 이름으로 호출되는 케이스가 있어 alias를 함께 허용한다.
-  name: "rotate" | "refresh" | "edit" | "trash" | "info" | "check" | "close" | "chevronLeft" | "paperPlane" | "chevronDown" | "asterisk" | "sparkles" | "narration" | "magic";
+  name: "rotate" | "refresh" | "edit" | "trash" | "info" | "check" | "close" | "chevronLeft" | "paperPlane" | "chevronDown" | "asterisk" | "sparkles" | "narration" | "magic" | "stop";
   size?: number;
 }) {
   const common = { width: size, height: size, viewBox: "0 0 24 24", fill: "none", xmlns: "http://www.w3.org/2000/svg" } as const;
@@ -69,6 +69,12 @@ export function Icon({
         <svg {...common}>
           <path d="M22 2 11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
           <path d="M22 2 15 22l-4-9-9-4 20-7Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "stop":
+      return (
+        <svg {...common}>
+          <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
         </svg>
       );
 
