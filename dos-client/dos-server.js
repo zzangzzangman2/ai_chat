@@ -58,10 +58,22 @@ function pidExists(pid) {
 
 function cleanEnv(extra = {}) {
   const env = {};
+  let inheritedPath = "";
   for (const [key, value] of Object.entries(process.env)) {
     if (!key || key.includes("=") || value === undefined) continue;
+    // Windows 환경변수 이름은 대소문자를 구분하지 않는다. Path/PATH를 둘 다
+    // 넘기면 cmd/npm이 시스템 Node를 먼저 고르는 경우가 있으므로 하나로 합친다.
+    if (key.toLowerCase() === "path") {
+      inheritedPath = String(value);
+      continue;
+    }
     env[key] = String(value);
   }
+  // dos-server를 실행한 Node와 자식 npm/next의 ABI를 항상 일치시킨다.
+  // better-sqlite3 같은 네이티브 모듈은 여기서 Node 버전이 바뀌면 즉시 깨진다.
+  const runtimeDir = path.dirname(process.execPath);
+  const pathKey = process.platform === "win32" ? "Path" : "PATH";
+  env[pathKey] = [runtimeDir, inheritedPath].filter(Boolean).join(path.delimiter);
   return { ...env, ...extra };
 }
 

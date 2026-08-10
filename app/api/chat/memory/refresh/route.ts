@@ -454,7 +454,13 @@ async function detectCharactersFromWindow(params: {
   rawWindowText: string;
   personaName: string;
   existingNames: Set<string>;
-  llmOpts: { model: string; maxOutputTokens: number; maxReasoningTokens: number; thinkingBudget: number };
+  llmOpts: {
+    model: string;
+    maxOutputTokens: number;
+    maxReasoningTokens: number;
+    thinkingBudget: number;
+    signal?: AbortSignal;
+  };
   windowStartTurn: number;
   windowEndTurn: number;
 }): Promise<AutoDetectedCharacter[]> {
@@ -505,6 +511,7 @@ async function detectCharactersFromWindow(params: {
         thinkingBudget: 128,
         temperature: 0.1,
         topP: 0.9,
+        signal: params.llmOpts.signal,
       },
     });
     outText = String((r as any)?.text || "").trim();
@@ -597,6 +604,7 @@ async function refreshStructuredCharacterState(params: {
   graphWindowStartTurn: number;
   graphWindowEndTurn: number;
   now: number;
+  signal?: AbortSignal;
 }): Promise<StructuredGraphRefreshOutcome> {
   const empty = (): StructuredGraphRefreshOutcome => ({
     attempted: true,
@@ -639,6 +647,7 @@ async function refreshStructuredCharacterState(params: {
         maxOutputTokens: 4096,
         maxReasoningTokens: 128,
         thinkingBudget: 128,
+        signal: params.signal,
       },
       windowStartTurn: params.graphWindowStartTurn,
       windowEndTurn: params.graphWindowEndTurn,
@@ -689,6 +698,7 @@ async function refreshStructuredCharacterState(params: {
           maxOutputTokens: 600,
           maxReasoningTokens: 0,
           thinkingBudget: 0,
+          signal: params.signal,
         },
         windowStartTurn: params.graphWindowStartTurn,
         windowEndTurn: params.graphWindowEndTurn,
@@ -1157,6 +1167,7 @@ export async function POST(req: Request) {
           graphWindowStartTurn,
           graphWindowEndTurn: boundaryEndTurn,
           now: Date.now(),
+          signal: req.signal,
         });
         const autoCharactersBackfilled = await backfillAutoCharacterMemories({
           req,
@@ -1295,6 +1306,7 @@ export async function POST(req: Request) {
       // Summaries should be stable/deterministic. Keep sampling conservative.
       temperature: 0.2,
       topP: 0.9,
+      signal: req.signal,
     };
 
     // Generate a single section: "### <title> (a-b턴)\n<body>"
@@ -1880,6 +1892,7 @@ export async function POST(req: Request) {
         graphWindowStartTurn,
         graphWindowEndTurn: windowEndTurn,
         now,
+        signal: req.signal,
       });
       autoCharactersAdded = graphOutcome.autoCharactersAdded;
       autoAliasesUpdated = graphOutcome.autoAliasesUpdated;

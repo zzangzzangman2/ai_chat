@@ -113,6 +113,7 @@ export async function refreshRelationshipGraphIfDue(params: {
   chatId: string;
   personaName: string;
   messages: RelationshipRefreshMessage[];
+  signal?: AbortSignal;
 }): Promise<RelationshipGraphRefreshResult> {
   const chatId = String(params.chatId || "").trim();
   const personaName = String(params.personaName || "").trim() || "나";
@@ -178,6 +179,7 @@ export async function refreshRelationshipGraphIfDue(params: {
       maxOutputTokens: 4096,
       maxReasoningTokens: 128,
       thinkingBudget: 128,
+      signal: params.signal,
     },
     windowStartTurn,
     windowEndTurn: turnNo,

@@ -5,10 +5,34 @@ const assert = require("node:assert/strict");
 const {
   clearEchoedPromptRegion,
   clearPreviousTerminalRows,
+  createInactivityWatchdog,
   displayWidth,
   promptPersonaFields,
   terminalRowsForLine,
 } = require("./dos-chat.js");
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("response watchdog resets on stream activity and aborts only after inactivity", async () => {
+  const watchdog = createInactivityWatchdog(undefined, 40);
+  await wait(25);
+  watchdog.touch();
+  await wait(25);
+  assert.equal(watchdog.signal.aborted, false);
+  await wait(25);
+  assert.equal(watchdog.signal.aborted, true);
+  assert.equal(watchdog.didTimeout(), true);
+  watchdog.stop();
+});
+
+test("response watchdog forwards a manual parent abort without reporting a timeout", () => {
+  const parent = new AbortController();
+  const watchdog = createInactivityWatchdog(parent.signal, 1_000);
+  parent.abort();
+  assert.equal(watchdog.signal.aborted, true);
+  assert.equal(watchdog.didTimeout(), false);
+  watchdog.stop();
+});
 
 test("terminalRowsForLine counts a short input as one terminal row", () => {
   assert.equal(terminalRowsForLine("이춘복> 짧은 입력", 80), 1);

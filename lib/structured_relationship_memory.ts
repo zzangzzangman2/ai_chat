@@ -470,6 +470,8 @@ export async function extractStructuredCharacterGraph(params: {
     maxOutputTokens: number;
     maxReasoningTokens: number;
     thinkingBudget: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
   };
   windowStartTurn: number;
   windowEndTurn: number;

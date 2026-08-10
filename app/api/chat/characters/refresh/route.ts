@@ -397,6 +397,7 @@ export async function POST(req: Request) {
       chatId,
       personaName,
       messages: all,
+      signal: req.signal,
     });
 
     const rosterAll = db
@@ -587,6 +588,7 @@ export async function POST(req: Request) {
           thinkingBudget: 0,
           temperature: 0.1,
           topP: 0.8,
+          signal: req.signal,
         },
       });
       parsed = extractJson(String(r?.text || ""));
