@@ -13,6 +13,30 @@ export type RecognitionContradiction = {
   index: number;
 };
 
+export type ScenePresenceMessage = {
+  role?: string;
+  content?: string;
+};
+
+export type ScenePresenceIdentity = {
+  name: string;
+  aliases?: string[];
+};
+
+export type ScenePresenceFact = {
+  characterName: string;
+  characterAliases: string[];
+  evidence: string;
+  messageIndex: number;
+};
+
+export type ScenePresenceContradiction = {
+  characterName: string;
+  matchedText: string;
+  index: number;
+  kind: "duplicate_entry" | "duplicate_introduction";
+};
+
 const FIRST_MEETING_PATTERNS = [
   /(?:당신|너|넌|네놈|자네|그쪽|저\s*(?:사람|남자|여자|노인|늙은이|사내|아이|인물)|이\s*(?:사람|남자|여자|노인|늙은이|사내|아이|인물))\s*(?:은|는|이|가|도)?\s*(?:대체\s*)?(?:누구(?:야|냐|세요|십니까|지)?|누군데|뭐(?:야|냐|죠|지|입니까)|뭡니까|정체가\s*뭐(?:야|냐|죠|지|입니까)|뭐\s*하는\s*사람(?:이야|이냐|입니까)?)/giu,
   /["“'‘]\s*(?:대체\s*)?누구(?:야|냐|세요|십니까|지)?(?:\s*[?!？！])?/giu,
@@ -38,6 +62,311 @@ function stripFencedBlocks(value: unknown) {
   return String(value || "")
     .replace(/```[^\n]*\n[\s\S]*?```/g, "")
     .replace(/```[\s\S]*$/g, "");
+}
+
+const SCENE_RESET_PATTERN =
+  /(?:\[?\s*장면\s*전환\s*\]?|다음\s*날|며칠\s*후|몇\s*(?:분|시간|주|달|년)\s*후|장소를\s*(?:옮기|이동)|새로운\s*장소로\s*(?:이동|향))/u;
+
+const ENTRY_CUE_PATTERN =
+  /(?:새로\s*|다시\s*|뒤이어\s*|다음으로\s*)?(?:들어왔|들어온|들어섰|입장했|입장한|도착했|도착한|합류했|합류한|나타났|나타난|등장했|등장한|끌려\s*(?:들어왔|들어온|들어가|내려왔|내려온|왔|온|와)|데려왔|데려온|불려왔|불려온|호송(?:되어|돼)?\s*(?:들어|왔|온)|모습을\s*드러냈|모습을\s*드러낸)/u;
+
+const EXIT_CUE_PATTERN =
+  /(?:나갔|나간|떠났|떠난|퇴장했|퇴장한|사라졌|사라진|돌아갔|돌아간|자리를\s*떴|자리를\s*뜬|끌려\s*(?:나갔|나간|나가|갔|간)|호송(?:되어|돼)?\s*나갔|밖으로\s*(?:나갔|나간|끌려갔|끌려간)|내보냈|내보낸|쫓아냈|쫓아낸)/u;
+
+const ACTIVE_CUE_PATTERN =
+  /(?:무릎을\s*꿇고\s*있|앉아\s*있|서\s*있|누워\s*있|기대어\s*있|머물고\s*있|남아\s*있|붙잡혀\s*있|포박(?:되어|돼)\s*있|묶여\s*있|갇혀\s*있|바라봤|바라보며|말했|물었|대답했|외쳤|고개를\s*(?:들|끄덕|저))/u;
+
+const ENTRY_MODIFIER_CUE_PATTERN =
+  /(?:들어온|입장한|도착한|합류한|나타난|등장한|끌려\s*(?:들어온|내려온|온)|데려온|불려온|호송(?:되어|돼)?\s*온|모습을\s*드러낸)/u;
+
+const EXIT_MODIFIER_CUE_PATTERN =
+  /(?:나간|떠난|퇴장한|사라진|돌아간|자리를\s*뜬|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+
+function compactEvidence(value: string) {
+  return value.replace(/\s+/g, " ").trim().slice(0, 220);
+}
+
+function splitStoryPassages(value: unknown) {
+  return stripFencedBlocks(value)
+    .split(/\n\s*\n|(?<=[.!?。！？])\s+/u)
+    .map((passage) => passage.trim())
+    .filter(Boolean);
+}
+
+function passageMentionsName(passage: string, names: string[]) {
+  const key = normalized(passage);
+  return names.some((name) => key.includes(name));
+}
+
+function nameBeforeCuePattern(name: string, cue: RegExp, distance = 100) {
+  return new RegExp(
+    `${escapeRegex(name)}(?:은|는|이|가|을|를|에게|한테|도|만|의|와|과)?[^.!?。！？\\n]{0,${distance}}(?:${cue.source})`,
+    "iu"
+  );
+}
+
+function cueBeforeNamePattern(name: string, cue: RegExp, distance = 100) {
+  return new RegExp(
+    `(?:${cue.source})[^.!?。！？\\n]{0,${distance}}${escapeRegex(name)}(?:은|는|이|가|을|를|에게|한테|도|만|의|와|과)?`,
+    "iu"
+  );
+}
+
+function passageHasNamedCue(args: {
+  passage: string;
+  names: string[];
+  cue: RegExp;
+  distance?: number;
+}) {
+  for (const name of args.names) {
+    if (
+      nameBeforeCuePattern(name, args.cue, args.distance).test(args.passage) ||
+      cueBeforeNamePattern(name, args.cue, args.distance).test(args.passage)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findNamedDirectionalCue(args: {
+  passage: string;
+  names: string[];
+  cue: RegExp;
+  modifierCue: RegExp;
+}) {
+  const matches: RegExpExecArray[] = [];
+  for (const name of args.names) {
+    const escapedName = escapeRegex(name);
+    const subject = new RegExp(
+      `${escapedName}(?:이|가)[^.!?。！？\\n]{0,70}(?:${args.cue.source})`,
+      "iu"
+    ).exec(args.passage);
+    if (subject) matches.push(subject);
+
+    const topicPattern = new RegExp(
+      `${escapedName}(?:은|는)([^.!?。！？\\n]{0,70})(?:${args.cue.source})`,
+      "iu"
+    );
+    const topic = topicPattern.exec(args.passage);
+    if (
+      topic &&
+      !/[\p{L}\p{N}_-]{2,30}(?:이|가)\s/iu.test(String(topic[1] || ""))
+    ) {
+      matches.push(topic);
+    }
+
+    // An object can only own the movement when a transport/escort verb binds it;
+    // "A를 보며 B가 들어왔다" must not be read as A entering.
+    const object = new RegExp(
+      `${escapedName}(?:을|를)([^.!?。！？\\n]{0,80})(?:${args.cue.source})`,
+      "iu"
+    ).exec(args.passage);
+    if (
+      object &&
+      /(?:끌|데리|데려|호송|부축|불러|내보내|쫓아내)/u.test(
+        String(object[0] || "")
+      )
+    ) {
+      matches.push(object);
+    }
+
+    const modifier = new RegExp(
+      `(?:${args.modifierCue.source})(?:\\s+[\\p{L}\\p{N}_-]+){0,4}\\s+${escapedName}(?:은|는|이|가|을|를)?`,
+      "iu"
+    ).exec(args.passage);
+    if (modifier) matches.push(modifier);
+
+    const reveal = new RegExp(
+      `(?:${args.cue.source})[^.!?。！？\\n]{0,35}(?:것|사람|여자|남자|인물|대상)(?:은|는|이|가)[^.!?。！？\\n]{0,80}${escapedName}(?:은|는|이|가|을|를)?`,
+      "iu"
+    ).exec(args.passage);
+    if (reveal) matches.push(reveal);
+  }
+  matches.sort((a, b) => a.index - b.index);
+  return matches[0] || null;
+}
+
+function findNamedEntryCue(passage: string, names: string[]) {
+  return findNamedDirectionalCue({
+    passage,
+    names,
+    cue: ENTRY_CUE_PATTERN,
+    modifierCue: ENTRY_MODIFIER_CUE_PATTERN,
+  });
+}
+
+function findNamedExitCue(passage: string, names: string[]) {
+  return findNamedDirectionalCue({
+    passage,
+    names,
+    cue: EXIT_CUE_PATTERN,
+    modifierCue: EXIT_MODIFIER_CUE_PATTERN,
+  });
+}
+
+function passageShowsActivePresence(passage: string, names: string[]) {
+  if (
+    passageHasNamedCue({
+      passage,
+      names,
+      cue: ACTIVE_CUE_PATTERN,
+      distance: 90,
+    })
+  ) {
+    return true;
+  }
+
+  // Korean scene prose often puts the continuing-state phrase before the
+  // subject: "무릎을 꿇고 있던 안유진은 ...".
+  for (const name of names) {
+    const stateBeforeSubject = new RegExp(
+      `(?:무릎을\\s*꿇고|앉아|서|누워|기대어|붙잡혀|포박(?:되어|돼)|묶여|갇혀)[^.!?。！？\\n]{0,45}(?:있던|있는)\\s*(?:[\\p{L}\\p{N}_-]+\\s+){0,4}${escapeRegex(name)}(?:은|는|이|가)?`,
+      "iu"
+    );
+    if (stateBeforeSubject.test(passage)) return true;
+  }
+  return false;
+}
+
+/**
+ * Reconstructs only high-confidence transient scene presence from recent raw
+ * turns. This deliberately does not use residence or long-memory locations:
+ * present/absent is a short-lived scene fact and must be cleared by an exit or
+ * an explicit time/location cut.
+ */
+export function deriveCurrentScenePresence(args: {
+  messages: ScenePresenceMessage[];
+  identities: ScenePresenceIdentity[];
+  maxMessages?: number;
+}): ScenePresenceFact[] {
+  const identities = args.identities
+    .map((identity) => ({
+      characterName: String(identity.name || "").trim(),
+      characterAliases: usableEntityNames(identity.aliases || []),
+    }))
+    .filter((identity) => normalized(identity.characterName).length >= 2);
+  if (!identities.length) return [];
+
+  const requestedMax = Number(args.maxMessages || 14);
+  const maxMessages = Number.isFinite(requestedMax)
+    ? Math.max(2, Math.floor(requestedMax))
+    : 14;
+  const recent = (args.messages || []).slice(-maxMessages);
+  const states = new Map<string, ScenePresenceFact>();
+
+  recent.forEach((message, messageIndex) => {
+    const story = stripFencedBlocks(message?.content || "");
+    if (!story.trim()) return;
+
+    for (const passage of splitStoryPassages(story)) {
+      if (SCENE_RESET_PATTERN.test(passage)) states.clear();
+      for (const identity of identities) {
+        const names = usableEntityNames([
+          identity.characterName,
+          ...identity.characterAliases,
+        ]);
+        if (!passageMentionsName(passage, names)) continue;
+
+        // Exit wins when a compact sentence contains both movement directions;
+        // a later passage in the same turn can still establish a true re-entry.
+        if (findNamedExitCue(passage, names)) {
+          states.delete(normalized(identity.characterName));
+          continue;
+        }
+
+        const entered = Boolean(findNamedEntryCue(passage, names));
+        if (!entered && !passageShowsActivePresence(passage, names)) continue;
+
+        states.set(normalized(identity.characterName), {
+          characterName: identity.characterName,
+          characterAliases: identity.characterAliases,
+          evidence: compactEvidence(passage),
+          messageIndex,
+        });
+      }
+    }
+  });
+
+  return [...states.values()];
+}
+
+function currentTurnOverridesScenePresence(value: unknown, names: string[]) {
+  const text = String(value || "");
+  if (!/(?:OOC|작가\s*지시|설정\s*(?:변경|수정|정정)|연속성\s*무시)/iu.test(text)) {
+    return false;
+  }
+  return (
+    passageMentionsName(text, names) &&
+    (ENTRY_CUE_PATTERN.test(text) || /(?:재입장|다시\s*등장|돌아오)/u.test(text))
+  );
+}
+
+function findNamedIntroduction(passage: string, names: string[]) {
+  for (const name of names) {
+    const pattern = new RegExp(
+      `(?:저는|전|제\\s*이름은|내\\s*이름은)?[^"”.!?。！？\\n]{0,45}${escapeRegex(name)}(?:\\s*(?:이라고|라고)\\s*(?:합니다|해요)|\\s*(?:입니다|예요|이에요))`,
+      "iu"
+    );
+    const match = pattern.exec(passage);
+    if (match) return match;
+  }
+  return null;
+}
+
+function findNamedDuplicateEntry(passage: string, names: string[]) {
+  return findNamedEntryCue(passage, names);
+}
+
+/** Finds a draft that stages an already-present person as a new arrival. */
+export function findScenePresenceContradiction(args: {
+  text: string;
+  currentUserText?: string;
+  presentCharacters: ScenePresenceFact[];
+}): ScenePresenceContradiction | null {
+  const story = stripFencedBlocks(args.text);
+  if (!story.trim() || !args.presentCharacters.length) return null;
+  let searchOffset = 0;
+
+  for (const passage of splitStoryPassages(story)) {
+    const passageIndex = story.indexOf(passage, searchOffset);
+    if (passageIndex >= 0) searchOffset = passageIndex + passage.length;
+
+    for (const fact of args.presentCharacters) {
+      const names = usableEntityNames([
+        fact.characterName,
+        ...(fact.characterAliases || []),
+      ]);
+      if (!passageMentionsName(passage, names)) continue;
+      if (currentTurnOverridesScenePresence(args.currentUserText, names)) continue;
+
+      const entry = findNamedDuplicateEntry(passage, names);
+      if (entry) {
+        return {
+          characterName: fact.characterName,
+          matchedText: entry[0],
+          index: Math.max(0, passageIndex) + entry.index,
+          kind: "duplicate_entry",
+        };
+      }
+
+      // A bare self-introduction is a second independent backstop. It catches
+      // the next streamed paragraph even when the duplicate-arrival paragraph
+      // immediately before it was already removed.
+      if (!/(?:소개|신원|이름|누구)/u.test(String(args.currentUserText || ""))) {
+        const introduction = findNamedIntroduction(passage, names);
+        if (introduction) {
+          return {
+            characterName: fact.characterName,
+            matchedText: introduction[0],
+            index: Math.max(0, passageIndex) + introduction.index,
+            kind: "duplicate_introduction",
+          };
+        }
+      }
+    }
+  }
+  return null;
 }
 
 function surroundingSpeakerPassage(text: string, index: number, matchLength: number) {
@@ -309,5 +638,44 @@ export function removeRecognitionContradictionPassages(args: {
   return {
     text: text.replace(/\n{3,}/g, "\n\n").trim(),
     removed,
+  };
+}
+
+/** Removes only the local contradictory prose after model repair also failed. */
+export function removeScenePresenceContradictionPassages(args: {
+  text: string;
+  currentUserText?: string;
+  presentCharacters: ScenePresenceFact[];
+}) {
+  const originalText = String(args.text || "");
+  let text = originalText;
+  let removed = 0;
+  const characters = new Set<string>();
+  const kinds = new Set<ScenePresenceContradiction["kind"]>();
+
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const contradiction = findScenePresenceContradiction({
+      text,
+      currentUserText: args.currentUserText,
+      presentCharacters: args.presentCharacters,
+    });
+    if (!contradiction) break;
+
+    const filtered = removeRecognitionContradictionAtIndex({
+      text,
+      index: contradiction.index,
+    });
+    if (!filtered.removed) break;
+    text = filtered.text;
+    removed += filtered.removed;
+    characters.add(contradiction.characterName);
+    kinds.add(contradiction.kind);
+  }
+
+  return {
+    text: removed ? text.replace(/\n{3,}/g, "\n\n").trim() : originalText,
+    removed,
+    characterNames: [...characters],
+    kinds: [...kinds],
   };
 }

@@ -38,8 +38,11 @@ import {
 } from "@/lib/legal_status_consistency_guard";
 import { createGuardedTextStream } from "@/lib/guarded_text_stream";
 import {
+  deriveCurrentScenePresence,
   findRecognitionContradiction,
+  findScenePresenceContradiction,
   removeRecognitionContradictionPassages,
+  removeScenePresenceContradictionPassages,
 } from "@/lib/recognition_consistency_guard";
 import { selectConservativeMemoryRows } from "@/lib/character_memory_quality";
 import {
@@ -2120,6 +2123,22 @@ ${body}`.trim();
         return role === "assistant" || role === "model";
       })
       .map((message) => String(message?.content || ""));
+    // Transient presence belongs to the recent raw scene, not long memory or
+    // residence canon. Strong entry/active-state evidence keeps a character in
+    // the current scene until a recent exit or explicit scene cut removes them.
+    const currentScenePresence = deriveCurrentScenePresence({
+      messages: tail.map((message: any) => ({
+        role: String(message?.role || ""),
+        content: String(message?.content || ""),
+      })),
+      identities: legalStatusIdentities
+        .filter((identity) => !identity.isPersona)
+        .map((identity) => ({
+          name: identity.name,
+          aliases: identity.aliases || [],
+        })),
+      maxMessages: 14,
+    });
     // (변경 2026-08) 장기기억 "전체 주입" 모드.
     // - 기존: 검색으로 최근 15턴(3200자) + 관련 과거 6섹션(2400자)만 주입 → 나머지 아카이브는 버려짐.
     //   키워드 substring 매칭이라 다른 표현으로 물으면 회수 실패, 검색 실패 시 폴백도 '최신 2섹션'이라
@@ -2216,6 +2235,10 @@ ${body}`.trim();
         name: item.characterName,
         firstTurn: item.firstInteractionTurn,
         lastTurn: item.lastInteractionTurn,
+      })),
+      currentScenePresence: currentScenePresence.map((item) => ({
+        name: item.characterName,
+        evidence: item.evidence,
       })),
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
       // (2026-08) 전체 주입 모드 진단
@@ -2813,6 +2836,19 @@ const systemRaw = (cacheFriendlyLayout
           `- 페르소나의 범행·비밀·의도를 모르는 상태는 유지할 수 있지만, 그 사실을 모른다는 이유로 이미 만난 페르소나 자체를 초면으로 처리하지 않는다.`,
         ].join("\n")
       : "";
+    const scenePresencePriorityBlock = currentScenePresence.length
+      ? [
+          `# [CURRENT SCENE PRESENCE HARD GUARD — RESPONSE VALIDATION]`,
+          `- 아래 인물은 최근 원문 장면에서 이미 입장했고, 명시적으로 퇴장하거나 장면이 전환되지 않아 지금도 같은 현장에 있다.`,
+          ...currentScenePresence.map(
+            (item) => `- 현재 현장에 있음: ${item.characterName}. 최근 근거(인용 데이터): ${JSON.stringify(item.evidence)}`
+          ),
+          `- 최신 입력이 '그다음 사람', '다음 여자/남자', '한 명 더', '다음 차례'를 요구하면 위 인물은 후보에서 반드시 제외한다. 아직 현장에 없는 다른 인물을 선택한다.`,
+          `- 위 인물을 새로 들어오거나, 끌려오거나, 나타나거나, 도착한 사람처럼 다시 연출하지 않는다. 이미 한 자기소개도 반복시키지 않는다.`,
+          `- 현장 안에서 자리 이동·표정·대사·반응을 이어가는 것은 허용한다. 재입장은 최근 원문에 실제 퇴장 후 귀환이 명시된 경우에만 허용한다.`,
+          `- 응답을 내기 직전에 새 입장 인물의 이름을 위 목록과 대조한다. 겹치면 해당 입장 장면을 폐기하고 현장 밖 인물로 다시 쓴다.`,
+        ].join("\n")
+      : "";
     const epistemicPriorityBlock = epistemicFirewall.facts.length
       ? [
           `# [CHARACTER KNOWLEDGE FIREWALL — RESPONSE VALIDATION]`,
@@ -2835,6 +2871,7 @@ const systemRaw = (cacheFriendlyLayout
       currentNarrationPriorityBlock,
       continuityPriorityBlock,
       recognitionPriorityBlock,
+      scenePresencePriorityBlock,
       epistemicPriorityBlock,
       legalStatusPriorityBlock,
       currentOocPriorityBlock,
@@ -3187,6 +3224,102 @@ const systemRaw = (cacheFriendlyLayout
       return { text, usage };
     };
 
+    const enforceScenePresenceConsistency = async (args: {
+      text: string;
+      usage: any;
+      allowRepair?: boolean;
+    }) => {
+      if (!currentScenePresence.length) return args;
+      const contradiction = findScenePresenceContradiction({
+        text: args.text,
+        currentUserText: userText,
+        presentCharacters: currentScenePresence,
+      });
+      if (!contradiction) return args;
+
+      dbg({
+        tag: "send.scene_presence_guard.detected",
+        chatId: cid,
+        reqId,
+        characterName: contradiction.characterName,
+        kind: contradiction.kind,
+        matchedText: contradiction.matchedText,
+        presentCharacters: currentScenePresence.map((item) => item.characterName),
+      });
+
+      let text = args.text;
+      let usage = args.usage;
+      if (args.allowRepair !== false) {
+        try {
+          const repairUser = [
+            user,
+            "",
+            "# [서버 검수 실패 — 전체 답변 재작성]",
+            `- 초안에서 이미 현재 현장에 있는 ${contradiction.characterName}을(를) 새로 등장시키거나 다시 소개하는 장면 연속성 모순이 발견됐다.`,
+            `- 현재 현장 인물: ${currentScenePresence.map((item) => item.characterName).join(", ")}. 이들은 명시적 퇴장 전까지 '그다음 사람/다음 차례' 후보가 아니다.`,
+            `- ${contradiction.characterName}의 현재 위치와 기존 등장을 유지한다. 최신 입력이 다음 인물을 요구하면 현재 현장 목록에 없는 인물을 선택한다.`,
+            "- 중복 입장, 중복 호송, 중복 등장, 반복 자기소개를 모두 없애고 답변 전체를 처음부터 다시 쓴다.",
+            "- 최신 사용자 입력은 반복하지 않고 직후 반응부터 시작하며, 원래 요구된 분량과 상태창 형식은 유지한다.",
+            "",
+            "[폐기할 초안 — 장면 체류 모순을 고쳐 새로 쓸 것]",
+            text,
+          ].join("\n");
+          const repaired = await generateText({
+            system: [systemMain, scenePresencePriorityBlock]
+              .filter(Boolean)
+              .join("\n\n"),
+            user: repairUser,
+            opts: {
+              ...opts,
+              maxOutputTokens: maxOutputTokensForCall,
+              maxOutputTokensRequested: opts.maxOutputTokens,
+            },
+          });
+          if (String(repaired?.text || "").trim()) {
+            text = String(repaired.text).trim();
+            usage = mergeStreamUsage(usage, repaired.usage);
+          }
+        } catch (error) {
+          console.error("[chat/send] scene presence repair failed", {
+            chatId: cid,
+            reqId,
+            error: String((error as { message?: unknown })?.message || error),
+          });
+        }
+      }
+
+      const remaining = findScenePresenceContradiction({
+        text,
+        currentUserText: userText,
+        presentCharacters: currentScenePresence,
+      });
+      if (remaining) {
+        const filtered = removeScenePresenceContradictionPassages({
+          text,
+          currentUserText: userText,
+          presentCharacters: currentScenePresence,
+        });
+        text = filtered.text;
+        dbg({
+          tag: "send.scene_presence_guard.filtered",
+          chatId: cid,
+          reqId,
+          characterName: remaining.characterName,
+          kind: remaining.kind,
+          removedPassages: filtered.removed,
+        });
+      } else {
+        dbg({
+          tag: "send.scene_presence_guard.repaired",
+          chatId: cid,
+          reqId,
+          characterName: contradiction.characterName,
+          kind: contradiction.kind,
+        });
+      }
+      return { text, usage };
+    };
+
     const persistCharacterEventsForMessage = (_args: { messageId: string; assistantContent: string; createdAt: number }) => {
       // character card/relationship logging disabled
     };
@@ -3254,6 +3387,7 @@ let cancelStreamWork: (() => void) | null = null;
         };
         let streamEpistemicRedactions = 0;
         let streamLegalStatusRedactions = 0;
+        let streamScenePresenceRedactions = 0;
         const guardedTextStream = createGuardedTextStream((text) => {
           const epistemic = sanitizeGeneratedEpistemicText(text, epistemicFirewall);
           const legalStatus = removeUnsupportedLegalStatusClaims({
@@ -3262,9 +3396,15 @@ let cancelStreamWork: (() => void) | null = null;
             trustedNarrationTexts: trustedLegalStatusNarrationTexts,
             identities: legalStatusIdentities,
           });
+          const scenePresence = removeScenePresenceContradictionPassages({
+            text: legalStatus.text,
+            currentUserText: userText,
+            presentCharacters: currentScenePresence,
+          });
           streamEpistemicRedactions += epistemic.redactedSegments;
           streamLegalStatusRedactions += legalStatus.removed;
-          return legalStatus.text;
+          streamScenePresenceRedactions += scenePresence.removed;
+          return scenePresence.text;
         });
         const safeEnqueue = (obj: any) => {
           if (obj?.type !== "delta" || typeof obj?.text !== "string") {
@@ -3530,6 +3670,15 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           });
           raw = recognitionChecked.text;
           combinedUsage = recognitionChecked.usage;
+          const scenePresenceChecked = await enforceScenePresenceConsistency({
+            text: raw,
+            usage: combinedUsage,
+            // Live deltas cannot be replaced after emission; their deterministic
+            // sentence gate below handles the backstop without a wasted LLM call.
+            allowRepair: usedBufferedTransport,
+          });
+          raw = scenePresenceChecked.text;
+          combinedUsage = scenePresenceChecked.usage;
 
           combinedRaw = raw;
           const latestUsage: any = combinedUsage;
@@ -3732,13 +3881,18 @@ if (!TRANSPORT_STREAMING) {
             safeEnqueue({ type: "delta", text: safeFallback });
             assistantText = guardedTextStream.output();
           }
-          if (streamEpistemicRedactions || streamLegalStatusRedactions) {
+          if (
+            streamEpistemicRedactions ||
+            streamLegalStatusRedactions ||
+            streamScenePresenceRedactions
+          ) {
             dbg({
               tag: "send.stream.output-fact-guard",
               chatId: cid,
               reqId,
               epistemicRedactions: streamEpistemicRedactions,
               legalStatusRedactions: streamLegalStatusRedactions,
+              scenePresenceRedactions: streamScenePresenceRedactions,
             });
           }
 
@@ -4875,6 +5029,12 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     });
     assistantText = recognitionChecked.text;
     latestUsage = recognitionChecked.usage;
+    const scenePresenceChecked = await enforceScenePresenceConsistency({
+      text: assistantText,
+      usage: latestUsage,
+    });
+    assistantText = scenePresenceChecked.text;
+    latestUsage = scenePresenceChecked.usage;
 
     tEnd(tGemini);
     tStart(tPost);
@@ -4956,8 +5116,17 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       trustedNarrationTexts: trustedLegalStatusNarrationTexts,
       identities: legalStatusIdentities,
     });
-    assistantText = legalStatusOutputChecked.text;
-    if (epistemicOutputChecked.redactedSegments || legalStatusOutputChecked.removed) {
+    const scenePresenceOutputChecked = removeScenePresenceContradictionPassages({
+      text: legalStatusOutputChecked.text,
+      currentUserText: userText,
+      presentCharacters: currentScenePresence,
+    });
+    assistantText = scenePresenceOutputChecked.text;
+    if (
+      epistemicOutputChecked.redactedSegments ||
+      legalStatusOutputChecked.removed ||
+      scenePresenceOutputChecked.removed
+    ) {
       dbg({
         tag: "send.output-fact-guard",
         chatId: cid,
@@ -4966,6 +5135,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         legalStatusRedactions: legalStatusOutputChecked.removed,
         legalStatuses: legalStatusOutputChecked.statuses,
         legalCharacters: legalStatusOutputChecked.characterNames,
+        scenePresenceRedactions: scenePresenceOutputChecked.removed,
+        scenePresenceCharacters: scenePresenceOutputChecked.characterNames,
       });
     }
     if (!assistantText.trim()) {
