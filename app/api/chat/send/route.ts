@@ -87,6 +87,13 @@ import {
 } from "./_server/textPolicy";
 import { sanitizePromptCached } from "./_server/promptCache";
 import { buildFormatGuide } from "./_server/formatGuide";
+import {
+  buildTemporalCanon,
+  extractPastDatedAnchors,
+  findTemporalContradiction,
+  formatTemporalCanonBlock,
+  hasTemporalOverrideRequest,
+} from "./_server/temporalCanon";
 import { normalizeSummaryTail, sanitizeLongMemorySummary, upsertSummaryRangeBlock } from "./_server/memory";
 import {
   memorySearchTokens,
@@ -1748,6 +1755,14 @@ ${body}`.trim();
     };
 
     const loreBlock = pickLorebooks();
+    const temporalCanon = buildTemporalCanon(all);
+    const pastDatedAnchors = temporalCanon?.confirmed
+      ? extractPastDatedAnchors([presetBlock, loreBlock].filter(Boolean).join("\n\n"), temporalCanon)
+      : [];
+    const temporalOverrideRequested = hasTemporalOverrideRequest(userText);
+    const temporalPriorityBlock = temporalOverrideRequested
+      ? ""
+      : formatTemporalCanonBlock(temporalCanon, pastDatedAnchors);
 
     const tUserNote = tStart("유저노트");
     const noteBlock = settings.userNote
@@ -2651,6 +2666,7 @@ const systemRaw = (cacheFriendlyLayout
       sanitizePromptCached(spatialCanon.block),
       currentNarrationPriorityBlock,
       continuityPriorityBlock,
+      temporalPriorityBlock,
       recognitionPriorityBlock,
       currentOocPriorityBlock,
     ]
@@ -2948,6 +2964,81 @@ const systemRaw = (cacheFriendlyLayout
           characterName: contradiction.characterName,
         });
       }
+      return { text, usage };
+    };
+
+    const temporalValidationActive = Boolean(
+      temporalCanon?.confirmed && !temporalOverrideRequested
+    );
+    const enforceTemporalConsistency = async (args: {
+      text: string;
+      usage: any;
+    }) => {
+      if (!temporalValidationActive) return args;
+      const contradiction = findTemporalContradiction({
+        text: args.text,
+        canon: temporalCanon,
+        anchors: pastDatedAnchors,
+      });
+      if (!contradiction) return args;
+
+      dbg({
+        tag: "send.temporal_guard.detected",
+        chatId: cid,
+        reqId,
+        kind: contradiction.kind,
+        reason: contradiction.reason,
+        matchedText: contradiction.matchedText,
+      });
+
+      let text = args.text;
+      let usage = args.usage;
+      try {
+        const repairUser = [
+          user,
+          "",
+          "# [서버 시간축 검수 실패 — 전체 답변 재작성]",
+          `- 현재 확정 시점은 ${temporalCanon!.label}이다. 초안의 시간축 모순(${contradiction.reason})을 제거하고 답변 전체를 다시 작성한다.`,
+          "- 작품 프롬프트나 로어북의 더 오래된 시작 날짜는 현재 날짜가 아니라 이미 지난 역사적 기준점이다.",
+          "- 현재보다 과거 날짜에 예정됐던 행사·발매·리허설·콜타임은 이미 끝난 일정이다. 새 일정처럼 다시 호출하지 않는다.",
+          "- 최신 사용자 입력은 반복하지 않고 직후 반응부터 시작하며, 원래 분량과 INFO/STATUS 형식을 유지한다.",
+          "",
+          "[폐기할 초안 — 시간축을 고쳐 새로 쓸 것]",
+          text,
+        ].join("\n");
+        const repaired = await generateText({
+          system: [systemMain, temporalPriorityBlock].filter(Boolean).join("\n\n"),
+          user: repairUser,
+          opts: {
+            ...opts,
+            maxOutputTokens: maxOutputTokensForCall,
+            maxOutputTokensRequested: opts.maxOutputTokens,
+          },
+        });
+        if (String(repaired?.text || "").trim()) {
+          text = String(repaired.text).trim();
+          usage = mergeStreamUsage(usage, repaired.usage);
+        }
+      } catch (error) {
+        console.error("[chat/send] temporal repair failed", {
+          chatId: cid,
+          reqId,
+          error: String((error as { message?: unknown })?.message || error),
+        });
+      }
+
+      const remaining = findTemporalContradiction({
+        text,
+        canon: temporalCanon,
+        anchors: pastDatedAnchors,
+      });
+      dbg({
+        tag: remaining ? "send.temporal_guard.remaining" : "send.temporal_guard.repaired",
+        chatId: cid,
+        reqId,
+        kind: remaining?.kind || contradiction.kind,
+        reason: remaining?.reason || contradiction.reason,
+      });
       return { text, usage };
     };
 
@@ -3272,6 +3363,12 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           });
           raw = recognitionChecked.text;
           combinedUsage = recognitionChecked.usage;
+          const temporalChecked = await enforceTemporalConsistency({
+            text: raw,
+            usage: combinedUsage,
+          });
+          raw = temporalChecked.text;
+          combinedUsage = temporalChecked.usage;
 
           combinedRaw = raw;
           const latestUsage: any = combinedUsage;
@@ -4599,6 +4696,12 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     });
     assistantText = recognitionChecked.text;
     latestUsage = recognitionChecked.usage;
+    const temporalChecked = await enforceTemporalConsistency({
+      text: assistantText,
+      usage: latestUsage,
+    });
+    assistantText = temporalChecked.text;
+    latestUsage = temporalChecked.usage;
 
     tEnd(tGemini);
     tStart(tPost);
