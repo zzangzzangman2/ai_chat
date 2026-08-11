@@ -266,12 +266,22 @@ function buildThinkingConfig(model: string, maxReasoningTokens: number, maxOutpu
     //
     // (보수적 매핑, 2026-05) thinkingLevel은 hard cap이 아니라 강도 힌트라서
     // "medium"으로 보내면 실제 reasoning이 2000~3500 토큰까지 쉽게 튀어오른다.
-    // Gemini 3.1 Pro cannot disable thinking. Use supported levels only:
-    // FAST/legacy LOW -> low, MID -> medium, HIGH -> high.
+    // Gemini 3.1 Pro cannot disable thinking. Use supported levels only.
+    //
+    // (2026-08-11) LOW를 "low"가 아니라 "medium"으로 올린다.
+    // low에서는 모델이 직전 턴과의 대조를 사실상 건너뛰어, 프롬프트에 있는 반복 방지
+    // 규칙(이미 밝힌 신상 재나열 금지 등)이 지켜지지 않았다.
+    // 동일 시나리오 A/B(5턴): low = 묻지 않은 신상 재서술 2/4턴, medium = 0/4턴.
+    // 사용자가 "반복을 잡는 쪽"을 택해 품질을 기본값으로 삼는다. 대가는 첫 토큰 지연 증가.
+    // 속도를 되찾고 싶으면 AI_G3PRO_LOW_LEVEL=low 로 예전 매핑으로 되돌릴 수 있다.
+    const lowLevel =
+      String(process.env.AI_G3PRO_LOW_LEVEL || "medium").trim().toLowerCase() === "low"
+        ? "low"
+        : "medium";
     if (t <= 0) {
-      return { thinkingLevel: "low" };
+      return { thinkingLevel: lowLevel };
     }
-    const level = t >= 1280 ? "high" : t >= 640 ? "medium" : "low";
+    const level = t >= 1280 ? "high" : t >= 640 ? "medium" : lowLevel;
     return { thinkingLevel: level };
   }
   if (isGemini36FlashModel(model)) {
