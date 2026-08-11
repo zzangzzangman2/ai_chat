@@ -1952,6 +1952,13 @@ ${body}`.trim();
         personaName: personaNameFinal,
         focusText: characterFocusText,
         recentFocusText: recentCharacterFocusText,
+        // (자동 퇴장 2026-08) 최근 사용자 입력만 모아 전달한다.
+        // 이름 생략 시의 자동 포커스를 "사용자가 실제로 부른 인물"로 제한해,
+        // 한 번 등장한 단역이 자기강화 루프로 매 턴 눌러앉는 것을 막는다.
+        userMentionText: [
+          userText,
+          ...tail.filter((m: any) => m?.role === "user").slice(-10).map((m: any) => String(m?.content || "")),
+        ].join("\n"),
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
         graph: relationshipGraph,
       });
