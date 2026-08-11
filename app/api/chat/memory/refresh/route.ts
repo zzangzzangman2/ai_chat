@@ -16,6 +16,12 @@ import {
 } from "@/lib/identity_memory";
 import { formatRelationshipGraphBlock, loadRelationshipGraph } from "@/lib/relationship_graph";
 import {
+  buildEpistemicPromptFirewall,
+  omitWorldOnlyRelationshipsFromPrompt,
+  sanitizeSharedEpistemicText,
+} from "@/lib/epistemic_prompt_firewall";
+import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
+import {
   applyStructuredCharacterGraph,
   extractStructuredCharacterGraph,
   loadStructuredCharacterIdentities,
@@ -448,7 +454,13 @@ async function detectCharactersFromWindow(params: {
   rawWindowText: string;
   personaName: string;
   existingNames: Set<string>;
-  llmOpts: { model: string; maxOutputTokens: number; maxReasoningTokens: number; thinkingBudget: number };
+  llmOpts: {
+    model: string;
+    maxOutputTokens: number;
+    maxReasoningTokens: number;
+    thinkingBudget: number;
+    signal?: AbortSignal;
+  };
   windowStartTurn: number;
   windowEndTurn: number;
 }): Promise<AutoDetectedCharacter[]> {
@@ -499,6 +511,7 @@ async function detectCharactersFromWindow(params: {
         thinkingBudget: 128,
         temperature: 0.1,
         topP: 0.9,
+        signal: params.llmOpts.signal,
       },
     });
     outText = String((r as any)?.text || "").trim();
@@ -591,6 +604,7 @@ async function refreshStructuredCharacterState(params: {
   graphWindowStartTurn: number;
   graphWindowEndTurn: number;
   now: number;
+  signal?: AbortSignal;
 }): Promise<StructuredGraphRefreshOutcome> {
   const empty = (): StructuredGraphRefreshOutcome => ({
     attempted: true,
@@ -633,6 +647,7 @@ async function refreshStructuredCharacterState(params: {
         maxOutputTokens: 4096,
         maxReasoningTokens: 128,
         thinkingBudget: 128,
+        signal: params.signal,
       },
       windowStartTurn: params.graphWindowStartTurn,
       windowEndTurn: params.graphWindowEndTurn,
@@ -683,6 +698,7 @@ async function refreshStructuredCharacterState(params: {
           maxOutputTokens: 600,
           maxReasoningTokens: 0,
           thinkingBudget: 0,
+          signal: params.signal,
         },
         windowStartTurn: params.graphWindowStartTurn,
         windowEndTurn: params.graphWindowEndTurn,
@@ -901,7 +917,13 @@ function firstBadSectionRange(summary: string, boundaryEndTurn: number) {
   const ordered = [...sections].sort((a, b) => a.startTurn - b.startTurn);
   for (const s of ordered) {
     if (s.endTurn > boundaryEndTurn) continue;
-    const q = analyzeLongMemoryBody(s.body);
+    // (변경 2026-08) 저장본 복구 판정에도 self-review 마커 검사를 적용한다.
+    // 모델의 사고/자기검증 텍스트("Wait, check...", "(71 chars) Total length...",
+    // "시스템 지침의 마크다운 금지는 오버라이드할 수 없다...")가 요약 본문으로 저장된
+    // 사례가 실제로 확인됐고, 기존 analyzeLongMemoryBody는 한국어 사고문을 걸러내지 못했다.
+    // 이 판정은 repairCorrupted=true 로 명시 요청했을 때만 사용되므로,
+    // "배포만으로 과거 채팅이 재작성되지 않는다"는 기존 원칙은 그대로 유지된다.
+    const q = analyzeGeneratedLongMemoryBody(s.body);
     if (!q.ok) return { startTurn: s.startTurn, endTurn: s.endTurn, title: s.title, quality: q };
   }
   return null;
@@ -967,11 +989,23 @@ export async function POST(req: Request) {
       )
       .all(chatId) as any[];
 
-    const all = rawAll.map((m) => ({
+    const decryptedAll = rawAll.map((m) => ({
       ...m,
       content: decryptIfPossible(m.content),
       imagesJson: decryptIfPossible(m.imagesJson),
     }));
+    const preRefreshGraph = loadRelationshipGraph(chatId);
+    const epistemicFirewall = buildEpistemicPromptFirewall(preRefreshGraph);
+    let all = decryptedAll.map((message) => {
+      if (message.role !== "assistant" && message.role !== "model") return message;
+      return {
+        ...message,
+        content: sanitizeSharedEpistemicText(
+          message.content,
+          epistemicFirewall
+        ).text,
+      };
+    });
 
     const completedTurnCount = countAssistantTurns(all);
     const summaryModel = pickLongMemorySummaryModel();
@@ -980,6 +1014,36 @@ export async function POST(req: Request) {
       ? ""
       : inferPersonaNameFromMessages(all);
     const personaName = configuredPersonaName || inferredPersonaName;
+    const legalStatusIdentities = [
+      ...(personaName
+        ? [{ name: personaName, aliases: [], isPersona: true }]
+        : []),
+      ...preRefreshGraph.nodes.map((node) => ({
+        name: node.name,
+        aliases: [],
+        isPersona: Boolean(node.isPersona),
+      })),
+    ];
+    const trustedLegalStatusUserTexts = decryptedAll
+      .filter((message) => message.role === "user")
+      .map((message) => String(message.content || ""));
+    // 이미 저장된 서술은 확정 사실이다. 요약을 만들기 전에 이걸 근거에서 빼면
+    // 서술로만 성립한 사건(예: 구속)이 사라진 채로 장기기억이 굳어버린다.
+    const trustedLegalStatusNarrationTexts = decryptedAll
+      .filter((message) => message.role === "assistant" || message.role === "model")
+      .map((message) => String(message.content || ""));
+    all = all.map((message) => {
+      if (message.role !== "assistant" && message.role !== "model") return message;
+      return {
+        ...message,
+        content: removeUnsupportedLegalStatusClaims({
+          text: message.content,
+          trustedUserTexts: trustedLegalStatusUserTexts,
+          trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+          identities: legalStatusIdentities,
+        }).text,
+      };
+    });
     const personaAge = Math.max(0, Math.trunc(Number(st?.personaAge) || 0));
     const personaGender = String(st?.personaGender || "").trim();
     const personaInfo = String(st?.personaInfo || "").trim();
@@ -1103,6 +1167,7 @@ export async function POST(req: Request) {
           graphWindowStartTurn,
           graphWindowEndTurn: boundaryEndTurn,
           now: Date.now(),
+          signal: req.signal,
         });
         const autoCharactersBackfilled = await backfillAutoCharacterMemories({
           req,
@@ -1241,6 +1306,7 @@ export async function POST(req: Request) {
       // Summaries should be stable/deterministic. Keep sampling conservative.
       temperature: 0.2,
       topP: 0.9,
+      signal: req.signal,
     };
 
     // Generate a single section: "### <title> (a-b턴)\n<body>"
@@ -1271,7 +1337,13 @@ export async function POST(req: Request) {
       personaName,
       characterSources: identityCharacters,
     });
-    const relationshipGraphBlock = formatRelationshipGraphBlock(loadRelationshipGraph(chatId));
+    const currentRelationshipGraph = loadRelationshipGraph(chatId);
+    const relationshipGraphBlock = formatRelationshipGraphBlock(
+      omitWorldOnlyRelationshipsFromPrompt(
+        currentRelationshipGraph,
+        buildEpistemicPromptFirewall(currentRelationshipGraph)
+      )
+    );
     const canonicalFacts = loadCanonicalCharacterFacts(chatId);
     const canonicalFactsBlock = formatCanonicalCharacterFactsBlock({
       persona: authoritativePersona,
@@ -1315,6 +1387,8 @@ export async function POST(req: Request) {
       relationshipGraphBlock,
       nameLockGuidance,
       "- 저장된 관계도는 인물별 가족관계·서사 관계 성격·현재 나이·호감도를 지키기 위한 연속성 기준이다.",
+      "- 세계관 정사와 인물 개인 지식을 구분한다. 현장에 없었거나 잠들었거나 보지 못했거나 정체를 확인하지 못한 인물이 비밀·진범·배후를 안다고 요약하지 않는다.",
+      "- 관계도에서 '알고 있는 인물'로 표시되지 않은 NPC에게 비밀 관계 사실을 옮기지 않는다. 객관적 사건을 요약하더라도 피해자·가족·목격자의 실제 지식 상태는 원문대로 유지한다.",
       "- 관계도 정보를 다른 인물에게 옮기지 말고, 이번 요약 구간 원문에 없는 과거 사건을 이번 구간 사건처럼 새로 쓰지 않는다.",
     ]
       .filter(Boolean)
@@ -1683,6 +1757,36 @@ export async function POST(req: Request) {
       nextSummary = normalizeStoredMemorySummary(normalizeSummaryTail(nextSummary), summaryEveryVal);
     }
 
+    // (가드 2026-08) 아카이브 축소 방지.
+    // 실제 사고: repairCorrupted 경로로 1-3턴을 재생성했더니 저장 직후 캐시가
+    // 66섹션(1-198턴, 14,376자) → 1섹션(1-3턴, 1,085자)으로 잘리고 커서가 198→3으로 후퇴했다.
+    // (정규화 체인 어딘가에서 연속성이 깨지면 그 뒤 섹션이 통째로 폐기되는데,
+    //  그 결과가 무가드로 DB에 덮어써져 자력 복구가 불가능해진다.)
+    // 새 요약의 섹션 수가 기존보다 줄어들면 저장하지 않고 건너뛴다.
+    // (정상 경로는 섹션이 늘거나 같으므로 영향 없음)
+    const prevSectionCount = extractSummarySections(String(recentSummary || "")).length;
+    const nextSectionCount = extractSummarySections(String(nextSummary || "")).length;
+    if (prevSectionCount > 0 && nextSectionCount < prevSectionCount) {
+      console.error("[memory/refresh] archive shrink blocked", {
+        chatId,
+        windowStartTurn,
+        windowEndTurn,
+        prevSectionCount,
+        nextSectionCount,
+        prevChars: strlenSummary(recentSummary),
+        nextChars: strlenSummary(nextSummary),
+      });
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: "archive_shrink_blocked",
+        windowStartTurn,
+        windowEndTurn,
+        prevSectionCount,
+        nextSectionCount,
+      });
+    }
+
     const nextEndTurn = Math.max(summarizedEndTurn, getSummarizedEndTurn(nextSummary));
 
     // Persist
@@ -1788,6 +1892,7 @@ export async function POST(req: Request) {
         graphWindowStartTurn,
         graphWindowEndTurn: windowEndTurn,
         now,
+        signal: req.signal,
       });
       autoCharactersAdded = graphOutcome.autoCharactersAdded;
       autoAliasesUpdated = graphOutcome.autoAliasesUpdated;

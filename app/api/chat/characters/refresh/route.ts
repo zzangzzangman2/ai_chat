@@ -19,6 +19,12 @@ import {
 } from "@/lib/relationship_graph";
 import { refreshRelationshipGraphIfDue } from "@/lib/relationship_graph_refresh";
 import {
+  buildEpistemicPromptFirewall,
+  omitWorldOnlyRelationshipsFromPrompt,
+  sanitizeSharedEpistemicText,
+} from "@/lib/epistemic_prompt_firewall";
+import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
+import {
   inferCriticalCoreMemoryType,
   isCoreMemoryCandidate,
   isNearDuplicateMemory,
@@ -310,7 +316,7 @@ export async function POST(req: Request) {
     const access = await requireChatAccess(chatId);
     if (!access.ok) return access.res;
 
-    const all = db
+    const decryptedAll = db
       .prepare(`SELECT id, role, content, createdAt FROM messages WHERE chatId=? ORDER BY createdAt ASC, id ASC`)
       .all(chatId)
       .map((row: any) => ({
@@ -319,12 +325,24 @@ export async function POST(req: Request) {
         content: decryptIfPossible(String(row?.content || "")),
         createdAt: Number(row?.createdAt || 0),
       })) as MsgRow[];
+    const preRefreshGraph = loadRelationshipGraph(chatId);
+    const epistemicFirewall = buildEpistemicPromptFirewall(preRefreshGraph);
+    let all = decryptedAll.map((message) => {
+      if (!isAssistantRole(message.role)) return message;
+      return {
+        ...message,
+        content: sanitizeSharedEpistemicText(
+          message.content,
+          epistemicFirewall
+        ).text,
+      };
+    });
 
     const requestedAssistantId = String(body?.assistantMessageId || "").trim();
     const assistantId = requestedAssistantId || latestAssistantId(all);
     if (!assistantId) return NextResponse.json({ ok: true, skipped: true, reason: "no_assistant" });
 
-    const assistant = all.find((m) => String(m.id) === assistantId && isAssistantRole(m.role));
+    let assistant = all.find((m) => String(m.id) === assistantId && isAssistantRole(m.role));
     if (!assistant) return NextResponse.json({ ok: true, skipped: true, reason: "assistant_not_found" });
 
     const turnNo = assistantTurnNo(all, assistantId);
@@ -336,11 +354,50 @@ export async function POST(req: Request) {
       ? ""
       : inferPersonaNameFromMessages(all);
     const personaName = configuredPersonaName || inferredPersonaName || "나";
+    const legalStatusIdentities = [
+      { name: personaName, aliases: [], isPersona: true },
+      ...preRefreshGraph.nodes.map((node) => ({
+        name: node.name,
+        aliases: [],
+        isPersona: Boolean(node.isPersona),
+      })),
+    ];
+    const trustedLegalStatusUserTexts = decryptedAll
+      .filter((message) => message.role === "user")
+      .map((message) => String(message.content || ""));
+    // 저장된 서술도 확정 사실이므로 근거에 포함한다. 빼면 서술로 성립한 신분이
+    // 캐릭터 카드 갱신 단계에서 사라진다.
+    const trustedLegalStatusNarrationTexts = decryptedAll
+      .filter((message) => isAssistantRole(message.role))
+      .map((message) => String(message.content || ""));
+    all = all.map((message) => {
+      if (!isAssistantRole(message.role)) return message;
+      return {
+        ...message,
+        content: removeUnsupportedLegalStatusClaims({
+          text: message.content,
+          trustedUserTexts: trustedLegalStatusUserTexts,
+          trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+          identities: legalStatusIdentities,
+        }).text,
+      };
+    });
+    assistant = all.find(
+      (message) => String(message.id) === assistantId && isAssistantRole(message.role)
+    );
+    if (!assistant) {
+      return NextResponse.json({
+        ok: true,
+        skipped: true,
+        reason: "assistant_removed_by_fact_guard",
+      });
+    }
 
     const relationshipGraphRefresh = await refreshRelationshipGraphIfDue({
       chatId,
       personaName,
       messages: all,
+      signal: req.signal,
     });
 
     const rosterAll = db
@@ -456,8 +513,18 @@ export async function POST(req: Request) {
       "A title used by one character never becomes a title that another character may use.",
       "If the persona corrects or denies a relationship/title, that correction overrides the assistant response and must remain negated.",
       identityCanon.block,
-      formatRelationshipGraphBlock(loadRelationshipGraph(chatId)),
+      (() => {
+        const currentGraph = loadRelationshipGraph(chatId);
+        return formatRelationshipGraphBlock(
+          omitWorldOnlyRelationshipsFromPrompt(
+            currentGraph,
+            buildEpistemicPromptFirewall(currentGraph)
+          )
+        );
+      })(),
       "The saved relationship graph is a continuity constraint. Use it to keep family roles, narrative relationship type, age, and affinity attached to the correct character.",
+      "World-canon relationship facts are not automatically known by either endpoint. A character may remember a secret, culprit, hidden identity, or off-screen event only when that character is listed as knowing it or this exact turn directly shows that character witnessing or being told it.",
+      "Never save omniscient narration as a character memory for somebody who was absent, asleep, unable to identify the actor, or otherwise lacked access to the information.",
       "Do not claim an older graph fact happened in this exact turn unless the exact-turn scene text supports it.",
       "For each saved direct conversation, estimate only THIS TURN's change in the character's affinity toward the persona.",
       "affinityDelta must be an integer from -3 to 3. Use 0 when the exchange does not clearly change affinity.",
@@ -521,6 +588,7 @@ export async function POST(req: Request) {
           thinkingBudget: 0,
           temperature: 0.1,
           topP: 0.8,
+          signal: req.signal,
         },
       });
       parsed = extractJson(String(r?.text || ""));

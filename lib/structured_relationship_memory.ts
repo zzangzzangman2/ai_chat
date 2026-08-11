@@ -7,6 +7,7 @@ import {
   inferCharacterOccupation,
   isValidDescriptiveRelationship,
 } from "@/lib/relationship_context";
+import { parseRelationshipKnownBy } from "@/lib/character_knowledge";
 import {
   CANONICAL_FACT_KEYS,
   canonicalFactConflictsWithPersona,
@@ -204,6 +205,8 @@ export type StructuredRelationship = {
   relation: string;
   details: string;
   evidence: string;
+  knownByNames: string[];
+  knowledgeEvidence: string;
 };
 
 export type StructuredCharacterFact = CanonicalFactObservation;
@@ -336,6 +339,8 @@ const STRUCTURED_GRAPH_SCHEMA = {
           "relation",
           "details",
           "evidence",
+          "known_by_ids",
+          "knowledge_evidence",
         ],
         properties: {
           source_id: { type: "string" },
@@ -343,6 +348,11 @@ const STRUCTURED_GRAPH_SCHEMA = {
           relation: { type: "string" },
           details: { type: "string" },
           evidence: { type: "string" },
+          known_by_ids: {
+            type: "array",
+            items: { type: "string" },
+          },
+          knowledge_evidence: { type: "string" },
         },
       },
     },
@@ -460,6 +470,8 @@ export async function extractStructuredCharacterGraph(params: {
     maxOutputTokens: number;
     maxReasoningTokens: number;
     thinkingBudget: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
   };
   windowStartTurn: number;
   windowEndTurn: number;
@@ -517,15 +529,22 @@ export async function extractStructuredCharacterGraph(params: {
     "2) 호칭 통합: 같은 인물의 이름, 성/이름 축약, 직함, 애칭, 가족 호칭을 한 main_name 아래 aliases로 묶는다.",
     "3) 직업·배경·기억 결합: 대화뿐 아니라 기존 레지스트리의 job, role, background, relationship_memory, recent_individual_memory를 함께 보고 관계를 추론한다.",
     "4) 관계 정의: 직접 대화가 없어도 제3자 언급, 직업, 배경 상황으로 확인되는 관계를 relationships에 기록한다.",
-    "5) 정본 사실 추출: 인물마다 다음 대화에서도 유지되어야 할 나이·성별·키·체중·체형·외모·직업·배경·정체·말투·거주지만 facts에 구조화한다.",
-    "6) 검증: 기존 인물 레지스트리와 같은 인물은 반드시 기존 id와 main_name을 그대로 재사용한다.",
-    "7) 출력: 지정된 JSON 스키마만 출력한다. 코드펜스, 설명, 분석문은 금지한다.",
+    "5) 지식 범위: 관계 사실을 직접 목격·경험했거나 명시적으로 전달받아 실제로 아는 인물만 known_by_ids에 기록한다.",
+    "6) 정본 사실 추출: 인물마다 다음 대화에서도 유지되어야 할 나이·성별·키·체중·체형·외모·직업·배경·정체·말투·거주지만 facts에 구조화한다.",
+    "7) 검증: 기존 인물 레지스트리와 같은 인물은 반드시 기존 id와 main_name을 그대로 재사용한다.",
+    "8) 출력: 지정된 JSON 스키마만 출력한다. 코드펜스, 설명, 분석문은 금지한다.",
     "",
     "중요 규칙:",
     "- relationships는 이름이 아니라 characters의 id로 연결한다.",
     "- 관계 방향은 'target_id가 source_id에게 relation에 해당한다'는 뜻이다. 예: source=아이, target=김철수, relation=아버지.",
     "- 형/누나/오빠/언니/선배/후배/대표님/주인님 같은 호칭은 동일 인물 통합과 가족·서열·직장 관계 판단에 활용한다.",
     "- 관계는 고정 설정이 아니다. 최신 대화에서 관계가 발전하거나 깨졌다면 초기 직업·초면 관계보다 최신 상태를 우선한다.",
+    "- known_by_ids는 관계의 양 끝 인물 목록이 아니다. 각 인물이 그 관계의 구체적 사실을 안다는 원문 근거가 있을 때만 넣는다.",
+    "- 현장에 없었거나 잠들었거나 보지 못했거나, 복면·변장 때문에 정체를 확인하지 못한 인물은 known_by_ids에 넣지 않는다.",
+    "- 전지적 지문이 범인·배후·비밀 정체를 확정해도 그 사실을 목격하거나 전달받지 못한 다른 인물은 알지 못한다.",
+    "- 어시스턴트 지문이 정보 획득 장면 없이 인물의 앎을 단정한 문장만으로는 known_by_ids를 새로 만들지 않는다. 실제 목격·경험·정보 전달 장면이 evidence에 있어야 한다.",
+    "- 가족·직장·친구처럼 당사자들이 통상 서로 아는 공개 관계는 양쪽 인물을 known_by_ids에 넣을 수 있다.",
+    "- knowledge_evidence는 known_by_ids의 인물들이 해당 사실을 목격·경험·전달받았음을 증명하는 원문의 짧은 구절을 그대로 복사한다. 그런 근거가 없으면 known_by_ids=[]와 knowledge_evidence=\"\"를 쓴다.",
     "- 예: '아이돌과 경비원'이 사귀기 시작하면 '연인', 결혼하면 '배우자', 이혼하면 '이혼한 전 배우자'로 갱신한다.",
     "- 각 character의 job에는 대화와 배경에서 확인되는 직업만 간결하게 기록한다. 확인되지 않으면 빈 문자열을 쓴다.",
     "- relation에 '미확인', '알 수 없음', '관계 미정', '중립'을 쓰는 것은 엄격히 금지한다.",
@@ -716,6 +735,18 @@ export async function extractStructuredCharacterGraph(params: {
     const target = resolveKnownCharacter(item?.target_id);
     const relation = cleanText(item?.relation, 40);
     const evidence = exactEvidence(raw, item?.evidence);
+    const knowledgeEvidence = exactEvidence(raw, item?.knowledge_evidence);
+    const knownByNames: string[] = [];
+    if (knowledgeEvidence && Array.isArray(item?.known_by_ids)) {
+      const seenKnownNames = new Set<string>();
+      for (const id of item.known_by_ids as unknown[]) {
+        const name = cleanText(resolveKnownCharacter(id)?.mainName, 80);
+        if (!name || seenKnownNames.has(name)) continue;
+        seenKnownNames.add(name);
+        knownByNames.push(name);
+        if (knownByNames.length >= 40) break;
+      }
+    }
     if (
       !source ||
       !target ||
@@ -741,6 +772,8 @@ export async function extractStructuredCharacterGraph(params: {
       relation,
       details: cleanText(item?.details, 500),
       evidence,
+      knownByNames,
+      knowledgeEvidence,
     });
   }
 
@@ -1027,7 +1060,7 @@ export function applyStructuredCharacterGraph(params: {
   applyCharacters();
 
   const findExistingRelation = db.prepare(
-    `SELECT id, firstSeenTurn
+    `SELECT id, firstSeenTurn, knownBy, knowledgeEvidence
      FROM chat_character_relations
      WHERE chatId=? AND subjectKey=? AND relation=? AND objectKey=?
      ORDER BY CASE WHEN slotKey LIKE 'structured:%' THEN 1 ELSE 0 END, updatedAt DESC
@@ -1035,8 +1068,8 @@ export function applyStructuredCharacterGraph(params: {
   );
   const updateRelation = db.prepare(
     `UPDATE chat_character_relations
-     SET subjectName=?, objectName=?, objectRole=?,
-         sourceOrder=MAX(sourceOrder, ?),
+     SET subjectName=?, objectName=?, objectRole=?, knownBy=?, knowledgeEvidence=?,
+          sourceOrder=MAX(sourceOrder, ?),
          lastSeenTurn=MAX(lastSeenTurn, ?),
          updatedAt=?
      WHERE id=? AND chatId=?`
@@ -1044,14 +1077,22 @@ export function applyStructuredCharacterGraph(params: {
   const insertRelation = db.prepare(
     `INSERT INTO chat_character_relations
        (id, chatId, subjectKey, subjectName, relation, slotKey, objectKey,
-        objectName, objectRole, sourceOrder, firstSeenTurn, lastSeenTurn,
-        createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         objectName, objectRole, knownBy, knowledgeEvidence, sourceOrder,
+         firstSeenTurn, lastSeenTurn, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chatId, subjectKey, relation, slotKey) DO UPDATE SET
        subjectName=excluded.subjectName,
        objectKey=excluded.objectKey,
        objectName=excluded.objectName,
        objectRole=excluded.objectRole,
+       knownBy=CASE
+         WHEN excluded.knownBy <> '[]' THEN excluded.knownBy
+         ELSE chat_character_relations.knownBy
+       END,
+       knowledgeEvidence=CASE
+         WHEN excluded.knowledgeEvidence <> '' THEN excluded.knowledgeEvidence
+         ELSE chat_character_relations.knowledgeEvidence
+       END,
        sourceOrder=MAX(chat_character_relations.sourceOrder, excluded.sourceOrder),
        lastSeenTurn=MAX(chat_character_relations.lastSeenTurn, excluded.lastSeenTurn),
        updatedAt=excluded.updatedAt`
@@ -1080,12 +1121,29 @@ export function applyStructuredCharacterGraph(params: {
         subjectKey,
         relation,
         objectKey
-      ) as { id?: string; firstSeenTurn?: number } | undefined;
+      ) as {
+        id?: string;
+        firstSeenTurn?: number;
+        knownBy?: string;
+        knowledgeEvidence?: string;
+      } | undefined;
+      const knownByNames = [
+        ...new Set([
+          ...parseRelationshipKnownBy(existingRelation?.knownBy),
+          ...(relationship.knownByNames || []).map((name) => cleanText(name, 80)),
+        ].filter(Boolean)),
+      ].slice(0, 40);
+      const knownBy = JSON.stringify(knownByNames);
+      const knowledgeEvidence =
+        cleanText(relationship.knowledgeEvidence, 500) ||
+        cleanText(existingRelation?.knowledgeEvidence, 500);
       if (existingRelation?.id) {
         updateRelation.run(
           subjectName,
           objectName,
           details,
+          knownBy,
+          knowledgeEvidence,
           turnNo,
           turnNo,
           now,
@@ -1103,6 +1161,8 @@ export function applyStructuredCharacterGraph(params: {
           objectKey,
           objectName,
           details,
+          knownBy,
+          knowledgeEvidence,
           turnNo,
           turnNo,
           turnNo,

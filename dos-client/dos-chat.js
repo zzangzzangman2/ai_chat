@@ -96,6 +96,14 @@ try {
 const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port || process.env.PORT || readPortFile() || 3000);
 const API_BASE = `http://127.0.0.1:${PORT}`;
+const sendInactivityTimeoutRaw = Number(process.env.DOS_SEND_INACTIVITY_TIMEOUT_MS || 45_000);
+const SEND_INACTIVITY_TIMEOUT_MS = Number.isFinite(sendInactivityTimeoutRaw)
+  ? Math.max(15_000, sendInactivityTimeoutRaw)
+  : 45_000;
+const maintenanceIdleDelayRaw = Number(process.env.DOS_MAINTENANCE_IDLE_DELAY_MS || 5_000);
+const MAINTENANCE_IDLE_DELAY_MS = Number.isFinite(maintenanceIdleDelayRaw)
+  ? Math.max(1_000, maintenanceIdleDelayRaw)
+  : 5_000;
 const ANSI = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
@@ -130,7 +138,66 @@ const state = {
   // readline prompt 대기 중 Ctrl+C / Ctrl+Z를 명령으로 처리하기 위한 컨트롤러.
   promptController: null,
   shortcutAction: "",
+  // 페르소나 안내를 이미 띄운 채팅. 한 방에서 두 번 붙잡지 않기 위한 것으로,
+  // 프로세스가 살아 있는 동안만 유지한다.
+  personaPromptedChatIds: new Set(),
+  // 답변 뒤 기억 갱신은 다음 사용자 입력보다 우선할 수 없다. 미처리 작업은 큐에
+  // 남기고, 새 입력이 오면 현재 HTTP/LLM 작업만 취소한 뒤 다음 idle 때 재개한다.
+  maintenanceTimer: null,
+  maintenanceController: null,
+  maintenanceGeneration: 0,
+  maintenanceRunning: false,
+  maintenancePaused: false,
+  pendingCharacterRefreshes: new Map(),
+  pendingMemoryRefreshes: new Map(),
 };
+
+function createInactivityWatchdog(parentSignal, timeoutMs = SEND_INACTIVITY_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const waitMs = Math.max(25, Number(timeoutMs) || SEND_INACTIVITY_TIMEOUT_MS);
+  let timer = null;
+  let timedOut = false;
+  let stopped = false;
+
+  const abortFromParent = () => {
+    if (controller.signal.aborted) return;
+    try {
+      controller.abort(parentSignal?.reason);
+    } catch {
+      controller.abort();
+    }
+  };
+  if (parentSignal?.aborted) abortFromParent();
+  else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+
+  const touch = () => {
+    if (stopped || controller.signal.aborted) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      timedOut = true;
+      try {
+        controller.abort(new Error(`response_inactive>${waitMs}ms`));
+      } catch {
+        controller.abort();
+      }
+    }, waitMs);
+  };
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    parentSignal?.removeEventListener("abort", abortFromParent);
+  };
+  touch();
+  return {
+    signal: controller.signal,
+    touch,
+    stop,
+    didTimeout: () => timedOut,
+  };
+}
 
 function restoreTerminal() {
   try {
@@ -1938,6 +2005,23 @@ function clearPreviousTerminalRows(rows) {
   return out;
 }
 
+// 입력 프롬프트가 차지한 영역을 통째로 지운다.
+//
+// terminalRowsForLine은 VT의 "보류 줄바꿈"을 가정한다. 오른쪽 끝 칸을 채워도
+// 커서는 그 칸에 머물고, 다음 글자를 쓸 때 비로소 줄이 넘어간다는 모델이다.
+// 그런데 conhost는 마지막 칸을 채우는 순간 바로 다음 줄로 내려간다. 그래서
+// 입력의 표시폭이 터미널 폭의 정확한 배수일 때만 두 모델이 한 줄 어긋나고,
+// 그 한 줄이 지워지지 않아 원문이 통째로 남는다.
+//
+// 폭을 더 정확히 세는 방법으로는 이 차이를 없앨 수 없다. 어느 쪽 터미널인지
+// 알아야 하는 문제라서다. 대신 프롬프트 앞에 우리가 넣은 빈 줄까지 한 줄 더
+// 거슬러 올라간 뒤 화면 끝까지 지운다. 두 모델 중 어느 쪽이든 원문은 남지
+// 않으며, 어긋나는 쪽에서는 빈 줄이 하나 더 생길 뿐이다.
+function clearEchoedPromptRegion(rows) {
+  const count = Math.max(1, Math.floor(Number(rows) || 1)) + 1;
+  return `\x1b[${count}A\r\x1b[0J`;
+}
+
 function fitDisplay(value, maxWidth) {
   const text = String(value || "");
   if (displayWidth(text) <= maxWidth) return text;
@@ -2437,6 +2521,113 @@ async function updateSetting(field, value) {
 // - /persona gender 남     : 성별
 // - /persona info 키 178...: 상세 설명 (한 줄 입력. 줄바꿈은 \n 으로 입력)
 // - /persona edit          : 대화형 4단계 입력 (각 항목 Enter 시 기존값 유지)
+// 전역 프로필의 페르소나. 새 채팅은 이 값을 물려받으므로 비어 있으면 방 페르소나도
+// 비어서 시작한다. 입장 안내에서 기본값으로 보여 주면 Enter만으로 재사용할 수 있다.
+function readGlobalPersonaDefaults() {
+  try {
+    const row = dbGet(
+      `SELECT personaName, personaAge, personaGender, personaInfo
+         FROM user_profile WHERE id=1`,
+      []
+    );
+    if (!row) return null;
+    return {
+      personaName: String(row.personaName || ""),
+      personaAge: String(row.personaAge || ""),
+      personaGender: String(row.personaGender || ""),
+      personaInfo: String(row.personaInfo || ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// 페르소나 4항목을 대화형으로 받는다. Enter는 현재값(또는 전역 기본값) 유지.
+async function promptPersonaFields(rl, settings) {
+  const globals = readGlobalPersonaDefaults() || {};
+  const pick = (key) =>
+    String(settings?.[key] || "") || String(globals[key] || "");
+  const current = {
+    personaName: pick("personaName"),
+    personaAge: pick("personaAge"),
+    personaGender: pick("personaGender"),
+    personaInfo: pick("personaInfo"),
+  };
+  const ask = async (label, value) => {
+    const promptStr = `${label} [${value || "비어있음"}] (Enter면 유지): `;
+    const ans = await rl.question(promptStr);
+    return String(ans || "").trim() || value;
+  };
+  return {
+    personaName: await ask("이름", current.personaName),
+    personaAge: await ask("나이(숫자)", current.personaAge),
+    personaGender: await ask("성별", current.personaGender),
+    personaInfo: await ask("정보", current.personaInfo),
+  };
+}
+
+async function savePersonaFields(settings, fields) {
+  const ageNum = Number(fields.personaAge);
+  const next = {
+    ...settings,
+    chatId: state.chatId,
+    personaName: fields.personaName,
+    personaAge: Number.isFinite(ageNum) && ageNum > 0 ? Math.floor(ageNum) : 0,
+    personaGender: fields.personaGender,
+    personaInfo: fields.personaInfo,
+  };
+  const json = await apiJson("/api/chat/settings", {
+    method: "POST",
+    body: JSON.stringify(next),
+  });
+  applySettings(json && json.settings ? json.settings : null);
+  return json && json.settings ? json.settings : null;
+}
+
+// 방에 들어왔는데 페르소나가 비어 있으면 첫 입력을 받기 전에 먼저 정하게 한다.
+//
+// 새 채팅은 전역 프로필에서 페르소나를 복사하는데 그 프로필이 비어 있으면 방도
+// 비어서 시작한다. 그 상태로 대화를 시작하면 프롬프트에 페르소나가 없는 채로
+// 턴이 쌓이고, 나중에 채워도 앞선 턴은 그대로 남는다.
+//
+// 한 방에서는 한 번만 묻는다. 이름을 비운 채 넘겨도 다시 붙잡지 않고, 나중에
+// /persona edit 으로 정할 수 있다고만 알린다.
+async function ensurePersonaConfigured(rl) {
+  if (!state.chatId) return;
+  if (state.personaPromptedChatIds.has(state.chatId)) return;
+
+  const st = await loadSettings().catch(() => null);
+  if (!st) return;
+
+  state.personaPromptedChatIds.add(state.chatId);
+  if (cleanPromptName(st.personaName)) return;
+
+  hr("페르소나 설정");
+  console.log("이 방에는 아직 페르소나가 없습니다. 먼저 정하고 시작합니다.");
+  console.log(`${ANSI.gray}Enter만 누르면 그 항목은 비워 둡니다. 나중에 /persona edit 으로도 바꿉니다.${ANSI.reset}`);
+  console.log("");
+
+  try {
+    const fields = await promptPersonaFields(rl, st);
+    if (!cleanPromptName(fields.personaName)) {
+      console.log("");
+      console.log("페르소나를 비워 둔 채로 시작합니다. /persona edit 으로 언제든 정할 수 있어요.");
+      return;
+    }
+    await savePersonaFields(st, fields);
+    console.log("");
+    console.log(`페르소나를 ${cleanPromptName(fields.personaName)}(으)로 저장했습니다.`);
+  } catch (err) {
+    // Ctrl+C 등으로 중단하면 조용히 넘어간다. 다음 방 입장에서 다시 묻는다.
+    if (err && err.name === "AbortError") {
+      state.personaPromptedChatIds.delete(state.chatId);
+      console.log("");
+      return;
+    }
+    throw err;
+  }
+}
+
 async function personaCommand(rl, arg) {
   const st = await loadSettings();
   if (!st) {
@@ -2465,37 +2656,8 @@ async function personaCommand(rl, arg) {
   const rest = restArr.join(" ").trim();
 
   if (sub === "edit") {
-    const cur = {
-      personaName: String(st.personaName || ""),
-      personaAge: String(st.personaAge || ""),
-      personaGender: String(st.personaGender || ""),
-      personaInfo: String(st.personaInfo || ""),
-    };
-    const ask = async (label, current) => {
-      const promptStr = `${label} [${current || "비어있음"}] (Enter면 유지): `;
-      const ans = await rl.question(promptStr);
-      const s = String(ans || "").trim();
-      return s || current;
-    };
-    const name = await ask("이름", cur.personaName);
-    const ageStr = await ask("나이(숫자)", cur.personaAge);
-    const gender = await ask("성별", cur.personaGender);
-    const info = await ask("정보", cur.personaInfo);
-
-    const ageNum = Number(ageStr);
-    const next = {
-      ...st,
-      chatId: state.chatId,
-      personaName: name,
-      personaAge: Number.isFinite(ageNum) && ageNum > 0 ? Math.floor(ageNum) : 0,
-      personaGender: gender,
-      personaInfo: info,
-    };
-    const json = await apiJson("/api/chat/settings", {
-      method: "POST",
-      body: JSON.stringify(next),
-    });
-    applySettings(json && json.settings ? json.settings : null);
+    const fields = await promptPersonaFields(rl, st);
+    await savePersonaFields(st, fields);
     console.log("페르소나 저장 완료.");
     await showSettings();
     return;
@@ -2680,6 +2842,191 @@ async function deleteRecent(arg) {
   await showHistory(40);
 }
 
+function isAbortLike(error) {
+  const message = String(error && error.message ? error.message : error || "");
+  return Boolean(
+    (error && error.name === "AbortError") ||
+      /aborted|abortsignal|abort\s*error/i.test(message)
+  );
+}
+
+function pauseBackgroundMaintenance() {
+  state.maintenancePaused = true;
+  state.maintenanceGeneration += 1;
+  if (state.maintenanceTimer) {
+    clearTimeout(state.maintenanceTimer);
+    state.maintenanceTimer = null;
+  }
+  if (state.maintenanceController) {
+    try { state.maintenanceController.abort(); } catch {}
+    state.maintenanceController = null;
+  }
+}
+
+function updateMaintenanceTiming(job, field, startedAt) {
+  const ms = Date.now() - startedAt;
+  if (job && job.timing) job.timing[field] = ms;
+  if (
+    state.lastTiming &&
+    job &&
+    job.timing &&
+    Number(state.lastTiming.startedAt || 0) === Number(job.timing.startedAt || 0)
+  ) {
+    state.lastTiming[field] = ms;
+    state.lastTiming.afterWorkMs =
+      (typeof state.lastTiming.memoryMs === "number" ? state.lastTiming.memoryMs : 0) +
+      (typeof state.lastTiming.characterMs === "number" ? state.lastTiming.characterMs : 0);
+    state.lastTiming.totalWithAfterMs = Date.now() - Number(state.lastTiming.startedAt || Date.now());
+  }
+}
+
+function scheduleBackgroundMaintenance(delayMs = MAINTENANCE_IDLE_DELAY_MS) {
+  if (
+    state.maintenancePaused ||
+    state.maintenanceRunning ||
+    state.maintenanceTimer ||
+    (!state.pendingCharacterRefreshes.size && !state.pendingMemoryRefreshes.size)
+  ) {
+    return;
+  }
+  const generation = state.maintenanceGeneration;
+  state.maintenanceTimer = setTimeout(() => {
+    state.maintenanceTimer = null;
+    void drainBackgroundMaintenance(generation);
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function resumeBackgroundMaintenance() {
+  state.maintenancePaused = false;
+  scheduleBackgroundMaintenance();
+}
+
+async function runBackgroundMaintenanceJob(kind, key, job, generation) {
+  if (state.maintenancePaused || generation !== state.maintenanceGeneration) return "paused";
+  const controller = new AbortController();
+  state.maintenanceController = controller;
+  const startedAt = Date.now();
+  let response = null;
+  try {
+    if (kind === "character") {
+      response = await fetch(`${API_BASE}/api/chat/characters/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId: job.chatId,
+          assistantMessageId: job.assistantMessageId || "",
+        }),
+        signal: controller.signal,
+      });
+    } else {
+      response = await fetch(`${API_BASE}/api/chat/memory/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId: job.chatId,
+          runtime: job.runtime || null,
+          mode: job.mode || "all",
+          allowBadOutputSave: false,
+        }),
+        signal: controller.signal,
+      });
+    }
+  } catch (error) {
+    if (isAbortLike(error) || controller.signal.aborted) return "paused";
+    job.attempts = Number(job.attempts || 0) + 1;
+    if (job.attempts >= 2) {
+      if (kind === "character") state.pendingCharacterRefreshes.delete(key);
+      else state.pendingMemoryRefreshes.delete(key);
+    }
+    return "retry";
+  } finally {
+    if (state.maintenanceController === controller) state.maintenanceController = null;
+    updateMaintenanceTiming(job, kind === "character" ? "characterMs" : "memoryMs", startedAt);
+  }
+
+  if (response && response.ok) {
+    if (kind === "character") state.pendingCharacterRefreshes.delete(key);
+    else state.pendingMemoryRefreshes.delete(key);
+    return "done";
+  }
+  job.attempts = Number(job.attempts || 0) + 1;
+  if (job.attempts >= 2 || (response && response.status >= 400 && response.status < 500)) {
+    if (kind === "character") state.pendingCharacterRefreshes.delete(key);
+    else state.pendingMemoryRefreshes.delete(key);
+  }
+  return "retry";
+}
+
+async function drainBackgroundMaintenance(generation) {
+  if (
+    state.maintenanceRunning ||
+    state.maintenancePaused ||
+    generation !== state.maintenanceGeneration
+  ) {
+    return;
+  }
+  state.maintenanceRunning = true;
+  let retryNeeded = false;
+  try {
+    while (!state.maintenancePaused && generation === state.maintenanceGeneration) {
+      const characterEntry = state.pendingCharacterRefreshes.entries().next().value;
+      const memoryEntry = state.pendingMemoryRefreshes.entries().next().value;
+      const entry = characterEntry || memoryEntry;
+      if (!entry) break;
+      const kind = characterEntry ? "character" : "memory";
+      const result = await runBackgroundMaintenanceJob(kind, entry[0], entry[1], generation);
+      if (result === "paused") break;
+      if (result === "retry") {
+        retryNeeded = true;
+        break;
+      }
+    }
+  } finally {
+    state.maintenanceRunning = false;
+    // 취소된 옛 작업이 늦게 끝난 사이 새 응답이 큐에 들어왔을 수 있다. 이때는
+    // 현재 generation으로 다시 예약해야 큐가 영원히 멈추지 않는다.
+    if (!state.maintenancePaused) {
+      scheduleBackgroundMaintenance(retryNeeded ? 30_000 : MAINTENANCE_IDLE_DELAY_MS);
+    }
+  }
+}
+
+function queueBackgroundMaintenance({
+  chatId,
+  assistantMessageId,
+  memoryRefresh,
+  runtime,
+  timing,
+}) {
+  const normalizedChatId = String(chatId || "").trim();
+  const normalizedAssistantId = String(assistantMessageId || "").trim();
+  if (!normalizedChatId) return;
+
+  if (normalizedAssistantId) {
+    const key = `${normalizedChatId}:${normalizedAssistantId}`;
+    state.pendingCharacterRefreshes.set(key, {
+      chatId: normalizedChatId,
+      assistantMessageId: normalizedAssistantId,
+      timing,
+      attempts: 0,
+    });
+  }
+  if (memoryRefresh && (memoryRefresh.shouldRefresh || memoryRefresh.mode)) {
+    const previous = state.pendingMemoryRefreshes.get(normalizedChatId);
+    state.pendingMemoryRefreshes.set(normalizedChatId, {
+      chatId: normalizedChatId,
+      runtime: (memoryRefresh && memoryRefresh.runtime) || runtime || null,
+      mode:
+        previous?.mode === "all" || memoryRefresh.mode === "all"
+          ? "all"
+          : memoryRefresh.mode || previous?.mode || "all",
+      timing,
+      attempts: 0,
+    });
+  }
+  resumeBackgroundMaintenance();
+}
+
 async function refreshCharacterMemory(assistantMessageId) {
   if (!state.chatId) return { ok: false, skipped: true, saved: 0 };
   try {
@@ -2749,6 +3096,8 @@ async function postSend(text) {
   if (!state.chatId) {
     throw new Error("열린 채팅이 없습니다. /chats, /open, /presets, /new 를 먼저 사용하세요.");
   }
+  // 이전 응답의 기억 갱신이 서버를 사용 중이어도 새 대화가 항상 먼저 처리되어야 한다.
+  pauseBackgroundMaintenance();
   const st = await loadSettings().catch(() => null);
   const runtime = st
     ? {
@@ -2778,6 +3127,10 @@ async function postSend(text) {
     characterMs: null,
     usage: null,
   };
+  const responseWatchdog = createInactivityWatchdog(
+    state.activeController ? state.activeController.signal : undefined
+  );
+  try {
   let res;
   try {
     res = await fetch(`${API_BASE}/api/chat/send`, {
@@ -2791,7 +3144,7 @@ async function postSend(text) {
         stream: wantStream,
       }),
       // Ctrl+C 취소 지원 (stream 응답 도중에도 abort됨)
-      signal: state.activeController ? state.activeController.signal : undefined,
+      signal: responseWatchdog.signal,
     });
   } catch (err) {
     status?.stop(true);
@@ -2799,6 +3152,7 @@ async function postSend(text) {
     throw err;
   }
   timing.headerAt = Date.now();
+  responseWatchdog.touch();
 
   if (!res.ok) {
     status?.stop(true);
@@ -2830,6 +3184,7 @@ async function postSend(text) {
       while (true) {
         const chunk = await reader.read();
         if (chunk.done) break;
+        responseWatchdog.touch();
         buf += dec.decode(chunk.value, { stream: true });
         let idx = -1;
         while ((idx = buf.indexOf("\n")) >= 0) {
@@ -2857,6 +3212,7 @@ async function postSend(text) {
           }
         }
       }
+      responseWatchdog.stop();
       // 스트림 종료: 보류분(마지막 미완 줄/미닫힘 fence)을 렌더러→페이서로 넘기고,
       // 남은 잔량은 빠른 타이핑 속도로 마저 출력한다 (통짜 덤프 방지)
       renderer.finish();
@@ -2869,6 +3225,7 @@ async function postSend(text) {
     printed = renderer.printedText();
   } else {
     doneObj = await res.json();
+    responseWatchdog.stop();
     timing.firstSignalAt = timing.firstSignalAt || Date.now();
     timing.doneAt = timing.doneAt || Date.now();
   }
@@ -2894,55 +3251,6 @@ const elapsed = Math.round((Date.now() - started) / 1000);
   const memoryRefresh = doneObj ? doneObj.memoryRefresh : null;
   const chatIdSnapshot = String(state.chatId || "");
   const assistantIdSnapshot = String((doneObj && doneObj.assistant && doneObj.assistant.id) || "");
-  const runtimeSnapshot = memoryRefresh && memoryRefresh.runtime ? memoryRefresh.runtime : runtime || null;
-
-  // 두 작업 모두 **완전히 조용히** 백그라운드 처리. 화면에 어떤 알림도 출력하지 않는다.
-  // 타이밍 정보(timing.memoryMs / characterMs)는 /time 명령용으로만 후속 갱신.
-  if (memoryRefresh && (memoryRefresh.shouldRefresh || memoryRefresh.mode)) {
-    const memStart = Date.now();
-    void (async () => {
-      try {
-        await fetch(`${API_BASE}/api/chat/memory/refresh`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chatId: chatIdSnapshot,
-            runtime: runtimeSnapshot,
-            mode: memoryRefresh.mode || "all",
-            allowBadOutputSave: false,
-          }),
-        });
-      } catch {
-        // silent
-      } finally {
-        const ms = Date.now() - memStart;
-        timing.memoryMs = ms;
-        if (state.lastTiming) state.lastTiming.memoryMs = ms;
-      }
-    })();
-  }
-
-  {
-    const charStart = Date.now();
-    void (async () => {
-      try {
-        await fetch(`${API_BASE}/api/chat/characters/refresh`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chatId: chatIdSnapshot,
-            assistantMessageId: assistantIdSnapshot || "",
-          }),
-        });
-      } catch {
-        // silent
-      } finally {
-        const ms = Date.now() - charStart;
-        timing.characterMs = ms;
-        if (state.lastTiming) state.lastTiming.characterMs = ms;
-      }
-    })();
-  }
 
   const firstSignalAt = timing.firstSignalAt || timing.doneAt || timing.responseEndAt;
   const firstOutputAt = timing.firstOutputAt || timing.doneAt || timing.responseEndAt;
@@ -2959,7 +3267,27 @@ const elapsed = Math.round((Date.now() - started) / 1000);
       (typeof timing.characterMs === "number" ? timing.characterMs : 0),
     totalWithAfterMs: Date.now() - started,
   };
+  queueBackgroundMaintenance({
+    chatId: chatIdSnapshot,
+    assistantMessageId: assistantIdSnapshot,
+    memoryRefresh,
+    runtime,
+    timing,
+  });
   printTimingSummary(state.lastTiming);
+  } catch (error) {
+    if (responseWatchdog.didTimeout()) {
+      throw new Error(
+        `서버가 ${Math.round(SEND_INACTIVITY_TIMEOUT_MS / 1000)}초 동안 응답 신호를 보내지 않아 요청을 중단했습니다. /history로 저장 여부를 확인한 뒤 다시 보내세요.`
+      );
+    }
+    throw error;
+  } finally {
+    responseWatchdog.stop();
+    status?.stop(true);
+    status = null;
+    resumeBackgroundMaintenance();
+  }
 }
 
 function help() {
@@ -3071,6 +3399,15 @@ async function main() {
 
   try {
     while (true) {
+      // 방에 들어온 직후 페르소나가 비어 있으면 첫 입력을 받기 전에 먼저 정한다.
+      // 생성(/new)·열기(/open)·시작 시 자동 복귀·뒤로가기까지 모든 입장 경로가
+      // 결국 이 지점을 지나므로 여기 한 곳만 두면 된다.
+      try {
+        await ensurePersonaConfigured(rl);
+      } catch {
+        // 설정 저장 실패가 대화 진입을 막지는 않게 한다.
+      }
+
       // 채팅 설정/전역 프로필에서 페르소나명을 즉시 반영한다.
       const promptName = getPromptDisplayName();
       const prompt = state.chatId
@@ -3113,9 +3450,11 @@ async function main() {
         try {
           const promptStr = prompt.replace(/^\n+/, ""); // 줄바꿈 제외한 prompt 본문
           const terminalColumns = Math.max(1, Number(process.stdout.columns || 80));
-          const echoedRows = terminalRowsForLine(`${promptStr}${line}`, terminalColumns);
-          process.stdout.write(clearPreviousTerminalRows(echoedRows));
-          process.stdout.write(`${promptStr}${colorNovelInline(line)}\n`);
+          // readline이 실제로 echo한 것은 트림 전 원문이다. 트림한 line으로 재면
+          // 앞뒤 공백만큼 줄 수가 모자랄 수 있다.
+          const echoedRows = terminalRowsForLine(`${promptStr}${lineRaw}`, terminalColumns);
+          process.stdout.write(clearEchoedPromptRegion(echoedRows));
+          process.stdout.write(`\n${promptStr}${colorNovelInline(line)}\n`);
         } catch {
           // 일부 TTY 환경에서 ANSI 이동이 실패하면 무시 (기능 영향 없음)
         }
@@ -3123,6 +3462,7 @@ async function main() {
 
       // 이번 명령에 대한 abort scope. Ctrl+C 시 SIGINT handler가 이 controller를 abort한다.
       state.activeController = new AbortController();
+      pauseBackgroundMaintenance();
       try {
         if (line.startsWith("/")) {
           const keep = await handleCommand(line, rl);
@@ -3142,9 +3482,11 @@ async function main() {
         }
       } finally {
         state.activeController = null;
+        resumeBackgroundMaintenance();
       }
     }
   } finally {
+    pauseBackgroundMaintenance();
     rl.close();
   }
   console.log("종료했습니다.");
@@ -3171,4 +3513,7 @@ module.exports = {
   settingsPanelRows,
   terminalRowsForLine,
   clearPreviousTerminalRows,
+  clearEchoedPromptRegion,
+  promptPersonaFields,
+  createInactivityWatchdog,
 };

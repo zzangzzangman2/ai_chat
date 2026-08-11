@@ -24,11 +24,25 @@ import { syncCharacterVitals } from "@/lib/character_vitals";
 import {
   loadRelationshipGraph,
   syncIdentityCanonRelations,
+  type RelationshipGraphData,
 } from "@/lib/relationship_graph";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
 import {
+  buildEpistemicPromptFirewall,
+  sanitizeGeneratedEpistemicText,
+  sanitizeSharedEpistemicText,
+} from "@/lib/epistemic_prompt_firewall";
+import {
+  removeUnsupportedLegalStatusClaims,
+  type LegalStatusIdentity,
+} from "@/lib/legal_status_consistency_guard";
+import { createGuardedTextStream } from "@/lib/guarded_text_stream";
+import {
+  deriveCurrentScenePresence,
   findRecognitionContradiction,
+  findScenePresenceContradiction,
   removeRecognitionContradictionPassages,
+  removeScenePresenceContradictionPassages,
 } from "@/lib/recognition_consistency_guard";
 import { selectConservativeMemoryRows } from "@/lib/character_memory_quality";
 import {
@@ -607,10 +621,15 @@ function parseLorebooksCached(raw: string): any[] {
   return arr;
 }
 
+// 상세 블록을 붙일 캐릭터 수 상한. 현재 입력에서 걸린 인물이 먼저 채우고, 남는
+// 자리에 최근 턴 등장 인물이 들어간다. 실측 장면 인물은 2~3명이라 넉넉하다.
+const MANUAL_ROSTER_DETAIL_LIMIT = 8;
+
 function buildManualCharacterRosterBlock(
   chatIdRaw: string,
   focusTextRaw = "",
-  personaNameOverride = ""
+  personaNameOverride = "",
+  recentFocusTextRaw = ""
 ) {
   const chatId = String(chatIdRaw || "").trim();
   if (!chatId) return "";
@@ -655,6 +674,22 @@ function buildManualCharacterRosterBlock(
     aliases: decryptIfPossible(String(row?.aliases || "")),
   }));
   const focusedIds = findFocusedCharacterIds(scopeRows, focusTextRaw);
+
+  // 최근 몇 턴에 등장한 캐릭터도 장면 인물로 본다.
+  //
+  // 이 블록은 이제 항상 주입되는데(AI_ALWAYS_INJECT_ROSTER), 포커스를 현재 입력
+  // 한 줄로만 잡으면 대부분의 턴에서 아무도 안 걸린다. 실측(로스터 13명) 최근 유저
+  // 턴 5개 중 4개가 현재 입력만으로는 0명이고 최근 4메시지로는 2~3명이었다. 그
+  // 차이만큼 관계·호칭·약속·조우 로그가 빠지고 이름만 남았다.
+  //
+  // 상세 블록은 캐릭터별 heading 안에만 들어가므로 대상을 넓혀도 관계가 다른
+  // 인물로 번지지는 않는다. 다만 대사가 큰 방에서 프롬프트가 붇지 않게 총량은
+  // 현재 입력에서 걸린 인물을 우선해 제한한다.
+  const recentFocusedIds = findFocusedCharacterIds(scopeRows, recentFocusTextRaw);
+  for (const id of recentFocusedIds) {
+    if (focusedIds.size >= MANUAL_ROSTER_DETAIL_LIMIT) break;
+    focusedIds.add(id);
+  }
 
   // 이름이 생략된 턴은 가장 최근에 실제 대화를 나눈 캐릭터를 장면 인물로 본다.
   // 모든 캐릭터의 상세 로그를 한꺼번에 넣으면 한 인물의 관계/호칭이 다른 인물로 번지기 쉽다.
@@ -1895,15 +1930,23 @@ ${body}`.trim();
       focusedRosterIds: [] as string[],
       focusedNames: [] as string[],
       includedNames: [] as string[],
+      personaAliases: [] as string[],
       recognition: [] as Array<{
         characterId: string;
         characterName: string;
+        characterAliases: string[];
         firstInteractionTurn: number;
         lastInteractionTurn: number;
         evidence: string;
       }>,
       relationshipCount: 0,
       eventCount: 0,
+    };
+    let relationshipGraph: RelationshipGraphData = {
+      personaName: personaNameFinal,
+      nodes: [],
+      relations: [],
+      affinities: [],
     };
     try {
       syncIdentityCanonRelations({
@@ -1918,13 +1961,21 @@ ${body}`.trim();
         personaName: personaNameFinal,
         personaAge: personaAgeFinal,
       });
+      relationshipGraph = loadRelationshipGraph(cid);
       dynamicCharacterContext = buildDynamicCharacterContext({
         chatId: cid,
         personaName: personaNameFinal,
         focusText: characterFocusText,
         recentFocusText: recentCharacterFocusText,
+        // (자동 퇴장 2026-08) 최근 사용자 입력만 모아 전달한다.
+        // 이름 생략 시의 자동 포커스를 "사용자가 실제로 부른 인물"로 제한해,
+        // 한 번 등장한 단역이 자기강화 루프로 매 턴 눌러앉는 것을 막는다.
+        userMentionText: [
+          userText,
+          ...tail.filter((m: any) => m?.role === "user").slice(-10).map((m: any) => String(m?.content || "")),
+        ].join("\n"),
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
-        graph: loadRelationshipGraph(cid),
+        graph: relationshipGraph,
       });
     } catch (error) {
       console.error("[chat/send] dynamic character context failed", {
@@ -2019,15 +2070,22 @@ ${body}`.trim();
         relatedArchiveText,
       ].join("\n"),
     });
-    // 새 동적 조회가 비어 있거나 DB 조회에 실패한 경우에만 기존 등록 캐릭터
-    // 블록을 복구 경로로 사용한다. 정상 경로에서는 두 기억 블록을 중복 주입하지 않는다.
+    // (변경 2026-08) 등록 캐릭터/관계도는 "항상" 주입한다.
+    // - 기존에는 동적 조회(dynamicCharacterContext)가 비었을 때만 쓰는 복구 경로였는데,
+    //   동적 조회는 현재 입력에 이름이 언급된 캐릭터만 포커스하므로
+    //   "이름 없이 지칭한 인물"이나 "오래 안 나온 인물"의 관계가 통째로 빠졌다.
+    //   (실제 사고: 사용자가 새 인물을 이름 없이 도입하자 최근 캐릭터로 오인)
+    // - 관계도는 전체를 넣어도 1천자 내외라 비용이 미미하고, 관계 혼동을 크게 줄인다.
+    // - 롤백: AI_ALWAYS_INJECT_ROSTER=0 이면 기존처럼 fallback 전용으로 동작.
+    const alwaysInjectRoster = String(process.env.AI_ALWAYS_INJECT_ROSTER || "1").trim() !== "0";
     let manualCharacterRosterFallback = "";
-    if (!dynamicCharacterContext.block) {
+    if (alwaysInjectRoster || !dynamicCharacterContext.block) {
       try {
         manualCharacterRosterFallback = buildManualCharacterRosterBlock(
           cid,
           characterFocusText,
-          personaNameFinal
+          personaNameFinal,
+          recentCharacterFocusText
         );
       } catch (error) {
         console.error("[chat/send] manual character context fallback failed", {
@@ -2037,13 +2095,129 @@ ${body}`.trim();
         });
       }
     }
-    const historySummaryForPrompt = [
-      hybridMemory.currentArcText,
-      relatedArchiveText,
-      manualCharacterRosterFallback,
-    ]
+    const epistemicFirewall = buildEpistemicPromptFirewall(relationshipGraph);
+    const legalIdentityByName = new Map<string, LegalStatusIdentity>();
+    const addLegalIdentity = (identity: LegalStatusIdentity) => {
+      const name = String(identity.name || "").replace(/\s+/g, " ").trim();
+      if (!name) return;
+      const key = name.toLocaleLowerCase("ko-KR");
+      const previous = legalIdentityByName.get(key);
+      legalIdentityByName.set(key, {
+        name,
+        aliases: [
+          ...new Set([
+            ...(previous?.aliases || []),
+            ...(identity.aliases || []),
+          ].map((alias) => String(alias || "").trim()).filter(Boolean)),
+        ],
+        isPersona: Boolean(previous?.isPersona || identity.isPersona),
+      });
+    };
+    addLegalIdentity({
+      name: personaNameFinal,
+      aliases: dynamicCharacterContext.personaAliases,
+      isPersona: true,
+    });
+    for (const identity of continuityIdentities) {
+      let aliases: string[] = [];
+      const rawAliases = String(identity.aliases || "").trim();
+      try {
+        const parsed = JSON.parse(rawAliases);
+        aliases = Array.isArray(parsed) ? parsed.map(String) : [];
+      } catch {
+        aliases = rawAliases.split(/[\n,;\/|]+/u);
+      }
+      addLegalIdentity({ name: identity.name, aliases });
+    }
+    for (const node of relationshipGraph.nodes) {
+      addLegalIdentity({ name: node.name, isPersona: node.isPersona });
+    }
+    const legalStatusIdentities = [...legalIdentityByName.values()];
+    const trustedLegalStatusUserTexts = all
+      .filter((message) => String(message?.role || "") === "user")
+      .map((message) => String(message?.content || ""));
+    // 저장된 서술도 근거다. 롤플레이 사건은 대부분 서술로 성립하므로, 사용자가
+    // 그 단어를 직접 친 적이 없다는 이유로 확정 사실을 지우면 안 된다. 지어내기는
+    // 생성 시점 가드가 막는다(아래 createGuardedTextStream).
+    const trustedLegalStatusNarrationTexts = all
+      .filter((message) => {
+        const role = String(message?.role || "");
+        return role === "assistant" || role === "model";
+      })
+      .map((message) => String(message?.content || ""));
+    // Transient presence belongs to the recent raw scene, not long memory or
+    // residence canon. Strong entry/active-state evidence keeps a character in
+    // the current scene until a recent exit or explicit scene cut removes them.
+    const currentScenePresence = deriveCurrentScenePresence({
+      messages: tail.map((message: any) => ({
+        role: String(message?.role || ""),
+        content: String(message?.content || ""),
+      })),
+      identities: legalStatusIdentities
+        .filter((identity) => !identity.isPersona)
+        .map((identity) => ({
+          name: identity.name,
+          aliases: identity.aliases || [],
+        })),
+      maxMessages: 14,
+    });
+    // (변경 2026-08) 장기기억 "전체 주입" 모드.
+    // - 기존: 검색으로 최근 15턴(3200자) + 관련 과거 6섹션(2400자)만 주입 → 나머지 아카이브는 버려짐.
+    //   키워드 substring 매칭이라 다른 표현으로 물으면 회수 실패, 검색 실패 시 폴백도 '최신 2섹션'이라
+    //   초반 기억이 구조적으로 소환되지 않았다.
+    // - 변경: 정규화된 누적 요약(historySummary) 전문을 그대로 넣는다.
+    //   실측 200턴 = 약 9천 토큰(컨텍스트의 0.9%, 턴당 +15원)이라 비용/지연 영향이 미미하다.
+    // - 상한(AI_FULL_LONG_MEMORY_MAX_CHARS, 기본 64000자 ≈ 4만 토큰) 초과 시에만
+    //   섹션 단위로 오래된 구간부터 탈락시킨다. (문장 중간 절단 방지)
+    // - 롤백: AI_FULL_LONG_MEMORY=0 이면 기존 검색/선별 경로로 되돌아간다.
+    const fullLongMemoryEnabled = String(process.env.AI_FULL_LONG_MEMORY || "1").trim() !== "0";
+    const fullLongMemoryMaxChars = (() => {
+      const raw = Number(process.env.AI_FULL_LONG_MEMORY_MAX_CHARS ?? 64000);
+      if (!Number.isFinite(raw) || raw <= 0) return 64000;
+      return Math.max(4000, Math.floor(raw));
+    })();
+    const clampLongMemoryBySection = (text: string, maxChars: number) => {
+      const s = String(text || "");
+      if (s.length <= maxChars) return s;
+      const sections = extractSummarySections(s);
+      if (!sections.length) return s.slice(-maxChars);
+      const kept: string[] = [];
+      let used = 0;
+      // 최신 섹션부터 채우고, 예산을 넘기면 더 오래된 구간은 제외한다.
+      for (let i = sections.length - 1; i >= 0; i -= 1) {
+        const section = sections[i];
+        const range =
+          section.startTurn === section.endTurn
+            ? `${section.endTurn}턴`
+            : `${section.startTurn}-${section.endTurn}턴`;
+        const piece = `### ${section.title} (${range})\n${section.body}`.trim();
+        if (used > 0 && used + piece.length + 2 > maxChars) break;
+        kept.unshift(piece);
+        used += piece.length + 2;
+      }
+      return kept.join("\n\n");
+    };
+    const fullLongMemoryText = fullLongMemoryEnabled
+      ? clampLongMemoryBySection(String(historySummary || "").trim(), fullLongMemoryMaxChars)
+      : "";
+    const historySummaryForPromptRaw = (
+      fullLongMemoryText
+        ? [fullLongMemoryText, manualCharacterRosterFallback]
+        : [hybridMemory.currentArcText, relatedArchiveText, manualCharacterRosterFallback]
+    )
       .filter((x) => String(x || "").trim())
       .join("\n\n");
+    const historyEpistemicView = sanitizeSharedEpistemicText(
+      historySummaryForPromptRaw,
+      epistemicFirewall
+    );
+    const historyLegalStatusView = removeUnsupportedLegalStatusClaims({
+      text: historyEpistemicView.text,
+      trustedUserTexts: trustedLegalStatusUserTexts,
+      trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+      identities: legalStatusIdentities,
+    });
+    const historySummaryForPrompt = historyLegalStatusView.text;
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -2084,7 +2258,18 @@ ${body}`.trim();
         firstTurn: item.firstInteractionTurn,
         lastTurn: item.lastInteractionTurn,
       })),
+      currentScenePresence: currentScenePresence.map((item) => ({
+        name: item.characterName,
+        evidence: item.evidence,
+      })),
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
+      // (2026-08) 전체 주입 모드 진단
+      fullLongMemory: fullLongMemoryEnabled,
+      fullLongMemoryChars: strlen(fullLongMemoryText),
+      fullLongMemoryTruncated: fullLongMemoryEnabled
+        ? strlen(String(historySummary || "").trim()) > strlen(fullLongMemoryText)
+        : false,
+      alwaysInjectRoster,
       identityCanonChars: strlen(identityCanonBlock),
       canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
       spatialCanonChars: strlen(spatialCanon.block),
@@ -2093,11 +2278,21 @@ ${body}`.trim();
       identityNameFacts: identityCanon.canon.nameFacts.length,
       identityRoleAnchors: identityCanon.canon.roleAnchors.length,
       inferredPersonaName: inferredPersonaName || "",
+      epistemicProtectedFactCount: epistemicFirewall.facts.length,
+      epistemicWorldOnlyFactCount: epistemicFirewall.worldOnlyRelationIds.size,
+      epistemicSummaryRedactions: historyEpistemicView.redactedSegments,
+      legalStatusSummaryRedactions: historyLegalStatusView.removed,
     });
     const memoryBlock = [
-      `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
-      `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
-      `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
+      fullLongMemoryText
+        ? `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 전체 요약 아카이브)`
+        : `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
+      fullLongMemoryText
+        ? `- 아래 요약 아카이브는 이 대화의 처음부터 최근까지 전 구간이다. 오래된 구간도 사실 확인에 그대로 사용한다.`
+        : `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
+      fullLongMemoryText
+        ? `- 사용자가 과거 사건/인물/약속을 물으면 이 아카이브에서 근거를 찾아 답하고, 근거가 없으면 지어내지 말고 모른다고 처리한다.`
+        : `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
       `- 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
       `- 인물 연속성 장부가 있으면 과거 캐릭터 기록과 최신 일반 장면 지시보다 우선한다.`,
       `- 별도의 인물 정체성·가족관계 정사 블록이 있으면 이 통합 장기기억보다 우선한다.`,
@@ -2659,8 +2854,39 @@ const systemRaw = (cacheFriendlyLayout
             return `- ${item.characterName} ↔ ${personaNameFinal || "주인공"}: 기존 대면 이력 ${range}. ${item.evidence}`;
           }),
           `- 응답에서 위 인물이 페르소나에게 '누구냐', '처음 본다', '낯선 사람'처럼 반응하려 하면 그 문장을 출력하지 말고, 저장된 관계·감정·과거 사건을 알아보는 반응으로 다시 쓴다.`,
+          `- 두 사람의 실명이 같은 문장에 없어도 동일 규칙을 적용한다. '노인', '학생', 직업·관계 호칭, 별칭, 대명사로 표현된 인물을 앞뒤 지문과 연결해 같은 인물로 인식한다.`,
+          `- 페르소나의 범행·비밀·의도를 모르는 상태는 유지할 수 있지만, 그 사실을 모른다는 이유로 이미 만난 페르소나 자체를 초면으로 처리하지 않는다.`,
         ].join("\n")
       : "";
+    const scenePresencePriorityBlock = currentScenePresence.length
+      ? [
+          `# [CURRENT SCENE PRESENCE HARD GUARD — RESPONSE VALIDATION]`,
+          `- 아래 인물은 최근 원문 장면에서 이미 입장했고, 명시적으로 퇴장하거나 장면이 전환되지 않아 지금도 같은 현장에 있다.`,
+          ...currentScenePresence.map(
+            (item) => `- 현재 현장에 있음: ${item.characterName}. 최근 근거(인용 데이터): ${JSON.stringify(item.evidence)}`
+          ),
+          `- 최신 입력이 '그다음 사람', '다음 여자/남자', '한 명 더', '다음 차례'를 요구하면 위 인물은 후보에서 반드시 제외한다. 아직 현장에 없는 다른 인물을 선택한다.`,
+          `- 위 인물을 새로 들어오거나, 끌려오거나, 나타나거나, 도착한 사람처럼 다시 연출하지 않는다. 이미 한 자기소개도 반복시키지 않는다.`,
+          `- 현장 안에서 자리 이동·표정·대사·반응을 이어가는 것은 허용한다. 재입장은 최근 원문에 실제 퇴장 후 귀환이 명시된 경우에만 허용한다.`,
+          `- 응답을 내기 직전에 새 입장 인물의 이름을 위 목록과 대조한다. 겹치면 해당 입장 장면을 폐기하고 현장 밖 인물로 다시 쓴다.`,
+        ].join("\n")
+      : "";
+    const epistemicPriorityBlock = epistemicFirewall.facts.length
+      ? [
+          `# [CHARACTER KNOWLEDGE FIREWALL — RESPONSE VALIDATION]`,
+          `- 세계관의 민감한 사실과 등장인물이 실제로 아는 사실을 분리한다. 이번 프롬프트에서 비공개 사실 ${epistemicFirewall.facts.length}건을 지식 허용목록으로 관리하며, 그중 ${epistemicFirewall.worldOnlyRelationIds.size}건은 아는 NPC가 없어 원문 자체를 숨겼다.`,
+          `- 숨겨진 사실을 이상 행동, 현장 방문, 표정, 말투, 수사 대상이라는 이유만으로 재구성하거나 확정하지 않는다. 관찰자는 직접 본 행동만 말할 수 있고, 그 의미는 의심·가설·미상으로 남긴다.`,
+          `- 과거 어시스턴트 지문이나 통합 요약이 정보 획득 장면 없이 범인·원흉·배후·정체·누명 같은 결론을 단정했다면 그 문장은 정사가 아니라 지식 경계 오류다. 이번 응답에서 반복·인용·전제하지 않는다.`,
+          `- 응답을 내기 전에 각 NPC의 대사·생각·시점 지문에 쓰인 결론마다 직접 목격, 전달, 조사로 얻은 근거가 있는지 검사한다. 근거가 없으면 확정 표현을 관찰 가능한 사실 또는 불확실한 추측으로 낮춘다.`,
+        ].join("\n")
+      : "";
+    const legalStatusPriorityBlock = [
+      `# [LEGAL/PROCEDURAL STATUS HARD GUARD — RESPONSE VALIDATION]`,
+      `- 사건 관계자, 조사 대상, 감시 대상, 수상한 인물, 현장 방문자는 그 이유만으로 피의자·피고인·수배자·구속자·유죄 확정자가 아니다.`,
+      `- 입건, 피의자 전환, 체포, 구속, 기소, 수배, 유죄 확정 같은 법적·절차적 상태는 최신 사용자 지문이나 저장된 명시적 절차 사건에 실제로 발생했다고 기록된 경우에만 사용한다.`,
+      `- 경찰·수사관이 경계하거나 출입을 막는 장면에서도 근거 없는 법적 신분을 새로 만들지 않는다. 필요하면 '사건 관계자', '방문자', '신원 확인 대상'처럼 관찰 가능한 중립 표현을 쓴다.`,
+      `- 이번 응답에서 법적 지위를 한 단계라도 올리기 전, 누가 언제 어떤 절차를 집행했는지 근거 문장을 확인한다. 근거가 없으면 승격하지 않는다.`,
+    ].join("\n");
     const system = [
       systemWithIdentityCanon,
       sanitizePromptCached(spatialCanon.block),
@@ -2668,6 +2894,9 @@ const systemRaw = (cacheFriendlyLayout
       continuityPriorityBlock,
       temporalPriorityBlock,
       recognitionPriorityBlock,
+      scenePresencePriorityBlock,
+      epistemicPriorityBlock,
+      legalStatusPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -2772,8 +3001,50 @@ const systemRaw = (cacheFriendlyLayout
       .trim();
   };
 
-    const contextRaw = formatStoryTurnsForMode(tail, personaName, npcName, renderMode);
+    let epistemicTailRedactions = 0;
+    let legalStatusTailRedactions = 0;
+    const epistemicTail = tail.map((message) => {
+      const role = String(message?.role || "");
+      if (role !== "assistant" && role !== "model") return message;
+      const sanitized = sanitizeSharedEpistemicText(
+        String(message?.content || ""),
+        epistemicFirewall
+      );
+      epistemicTailRedactions += sanitized.redactedSegments;
+      const legalStatus = removeUnsupportedLegalStatusClaims({
+        text: sanitized.text,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+        identities: legalStatusIdentities,
+      });
+      legalStatusTailRedactions += legalStatus.removed;
+      return { ...message, content: legalStatus.text };
+    });
+    const contextRaw = formatStoryTurnsForMode(
+      epistemicTail,
+      personaName,
+      npcName,
+      renderMode
+    );
     const context = stripUrlsAndMediaMarkdown(stripStatusErrorFences(contextRaw));
+    if (
+      historyEpistemicView.redactedSegments ||
+      epistemicTailRedactions ||
+      historyLegalStatusView.removed ||
+      legalStatusTailRedactions
+    ) {
+      dbg({
+        tag: "send.epistemic-firewall",
+        chatId: cid,
+        reqId,
+        protectedFacts: epistemicFirewall.facts.length,
+        worldOnlyFacts: epistemicFirewall.worldOnlyRelationIds.size,
+        summaryRedactions: historyEpistemicView.redactedSegments,
+        recentAssistantRedactions: epistemicTailRedactions,
+        legalStatusSummaryRedactions: historyLegalStatusView.removed,
+        recentLegalStatusRedactions: legalStatusTailRedactions,
+      });
+    }
     // 사용자 입력을 모드에 맞춰 전달한다.
     const userLine = continueMode ? "[이어쓰기]" : buildUserLineForMode(userText, personaName, renderMode);
 
@@ -2889,6 +3160,9 @@ const systemRaw = (cacheFriendlyLayout
       const contradiction = findRecognitionContradiction({
         text: args.text,
         personaName: personaNameFinal,
+        personaAliases: dynamicCharacterContext.personaAliases,
+        currentUserText: userText,
+        sceneCharacterNames: dynamicCharacterContext.includedNames,
         recognition: dynamicCharacterContext.recognition,
       });
       if (!contradiction) return args;
@@ -2940,12 +3214,18 @@ const systemRaw = (cacheFriendlyLayout
       const remaining = findRecognitionContradiction({
         text,
         personaName: personaNameFinal,
+        personaAliases: dynamicCharacterContext.personaAliases,
+        currentUserText: userText,
+        sceneCharacterNames: dynamicCharacterContext.includedNames,
         recognition: dynamicCharacterContext.recognition,
       });
       if (remaining) {
         const filtered = removeRecognitionContradictionPassages({
           text,
           personaName: personaNameFinal,
+          personaAliases: dynamicCharacterContext.personaAliases,
+          currentUserText: userText,
+          sceneCharacterNames: dynamicCharacterContext.includedNames,
           recognition: dynamicCharacterContext.recognition,
         });
         if (filtered.text) text = filtered.text;
@@ -3042,6 +3322,102 @@ const systemRaw = (cacheFriendlyLayout
       return { text, usage };
     };
 
+    const enforceScenePresenceConsistency = async (args: {
+      text: string;
+      usage: any;
+      allowRepair?: boolean;
+    }) => {
+      if (!currentScenePresence.length) return args;
+      const contradiction = findScenePresenceContradiction({
+        text: args.text,
+        currentUserText: userText,
+        presentCharacters: currentScenePresence,
+      });
+      if (!contradiction) return args;
+
+      dbg({
+        tag: "send.scene_presence_guard.detected",
+        chatId: cid,
+        reqId,
+        characterName: contradiction.characterName,
+        kind: contradiction.kind,
+        matchedText: contradiction.matchedText,
+        presentCharacters: currentScenePresence.map((item) => item.characterName),
+      });
+
+      let text = args.text;
+      let usage = args.usage;
+      if (args.allowRepair !== false) {
+        try {
+          const repairUser = [
+            user,
+            "",
+            "# [서버 검수 실패 — 전체 답변 재작성]",
+            `- 초안에서 이미 현재 현장에 있는 ${contradiction.characterName}을(를) 새로 등장시키거나 다시 소개하는 장면 연속성 모순이 발견됐다.`,
+            `- 현재 현장 인물: ${currentScenePresence.map((item) => item.characterName).join(", ")}. 이들은 명시적 퇴장 전까지 '그다음 사람/다음 차례' 후보가 아니다.`,
+            `- ${contradiction.characterName}의 현재 위치와 기존 등장을 유지한다. 최신 입력이 다음 인물을 요구하면 현재 현장 목록에 없는 인물을 선택한다.`,
+            "- 중복 입장, 중복 호송, 중복 등장, 반복 자기소개를 모두 없애고 답변 전체를 처음부터 다시 쓴다.",
+            "- 최신 사용자 입력은 반복하지 않고 직후 반응부터 시작하며, 원래 요구된 분량과 상태창 형식은 유지한다.",
+            "",
+            "[폐기할 초안 — 장면 체류 모순을 고쳐 새로 쓸 것]",
+            text,
+          ].join("\n");
+          const repaired = await generateText({
+            system: [systemMain, scenePresencePriorityBlock]
+              .filter(Boolean)
+              .join("\n\n"),
+            user: repairUser,
+            opts: {
+              ...opts,
+              maxOutputTokens: maxOutputTokensForCall,
+              maxOutputTokensRequested: opts.maxOutputTokens,
+            },
+          });
+          if (String(repaired?.text || "").trim()) {
+            text = String(repaired.text).trim();
+            usage = mergeStreamUsage(usage, repaired.usage);
+          }
+        } catch (error) {
+          console.error("[chat/send] scene presence repair failed", {
+            chatId: cid,
+            reqId,
+            error: String((error as { message?: unknown })?.message || error),
+          });
+        }
+      }
+
+      const remaining = findScenePresenceContradiction({
+        text,
+        currentUserText: userText,
+        presentCharacters: currentScenePresence,
+      });
+      if (remaining) {
+        const filtered = removeScenePresenceContradictionPassages({
+          text,
+          currentUserText: userText,
+          presentCharacters: currentScenePresence,
+        });
+        text = filtered.text;
+        dbg({
+          tag: "send.scene_presence_guard.filtered",
+          chatId: cid,
+          reqId,
+          characterName: remaining.characterName,
+          kind: remaining.kind,
+          removedPassages: filtered.removed,
+        });
+      } else {
+        dbg({
+          tag: "send.scene_presence_guard.repaired",
+          chatId: cid,
+          reqId,
+          characterName: contradiction.characterName,
+          kind: contradiction.kind,
+        });
+      }
+      return { text, usage };
+    };
+
     const persistCharacterEventsForMessage = (_args: { messageId: string; assistantContent: string; createdAt: number }) => {
       // character card/relationship logging disabled
     };
@@ -3079,7 +3455,7 @@ let cancelStreamWork: (() => void) | null = null;
         let lastDeltaAt = 0;
         let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
-        const safeEnqueue = (obj: any) => {
+        const enqueueWire = (obj: any) => {
           if (streamClosed) return false;
           try {
             const now = Date.now();
@@ -3106,6 +3482,35 @@ let cancelStreamWork: (() => void) | null = null;
             if (STREAM_DEBUG) console.warn(`${streamTag} enqueue ignored (closed)`, e?.message || e);
             return false;
           }
+        };
+        let streamEpistemicRedactions = 0;
+        let streamLegalStatusRedactions = 0;
+        let streamScenePresenceRedactions = 0;
+        const guardedTextStream = createGuardedTextStream((text) => {
+          const epistemic = sanitizeGeneratedEpistemicText(text, epistemicFirewall);
+          const legalStatus = removeUnsupportedLegalStatusClaims({
+            text: epistemic.text,
+            trustedUserTexts: trustedLegalStatusUserTexts,
+            trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+            identities: legalStatusIdentities,
+          });
+          const scenePresence = removeScenePresenceContradictionPassages({
+            text: legalStatus.text,
+            currentUserText: userText,
+            presentCharacters: currentScenePresence,
+          });
+          streamEpistemicRedactions += epistemic.redactedSegments;
+          streamLegalStatusRedactions += legalStatus.removed;
+          streamScenePresenceRedactions += scenePresence.removed;
+          return scenePresence.text;
+        });
+        const safeEnqueue = (obj: any) => {
+          if (obj?.type !== "delta" || typeof obj?.text !== "string") {
+            return enqueueWire(obj);
+          }
+          const safeText = guardedTextStream.push(obj.text);
+          if (!safeText) return !streamClosed;
+          return enqueueWire({ ...obj, text: safeText });
         };
 
         const safeClose = () => {
@@ -3369,6 +3774,15 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           });
           raw = temporalChecked.text;
           combinedUsage = temporalChecked.usage;
+          const scenePresenceChecked = await enforceScenePresenceConsistency({
+            text: raw,
+            usage: combinedUsage,
+            // Live deltas cannot be replaced after emission; their deterministic
+            // sentence gate below handles the backstop without a wasted LLM call.
+            allowRepair: usedBufferedTransport,
+          });
+          raw = scenePresenceChecked.text;
+          combinedUsage = scenePresenceChecked.usage;
 
           combinedRaw = raw;
           const latestUsage: any = combinedUsage;
@@ -3561,6 +3975,29 @@ if (!TRANSPORT_STREAMING) {
             } catch {
               // ignore
             }
+          }
+
+          const guardedTail = guardedTextStream.finish();
+          if (guardedTail) enqueueWire({ type: "delta", text: guardedTail });
+          assistantText = guardedTextStream.output();
+          if (!assistantText.trim()) {
+            const safeFallback = "*현장 관계자들은 확인되지 않은 사실을 단정하지 않고 방문 목적과 출입 가능 여부부터 확인했다.*";
+            safeEnqueue({ type: "delta", text: safeFallback });
+            assistantText = guardedTextStream.output();
+          }
+          if (
+            streamEpistemicRedactions ||
+            streamLegalStatusRedactions ||
+            streamScenePresenceRedactions
+          ) {
+            dbg({
+              tag: "send.stream.output-fact-guard",
+              chatId: cid,
+              reqId,
+              epistemicRedactions: streamEpistemicRedactions,
+              legalStatusRedactions: streamLegalStatusRedactions,
+              scenePresenceRedactions: streamScenePresenceRedactions,
+            });
           }
 
 // messages 저장
@@ -4702,6 +5139,12 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     });
     assistantText = temporalChecked.text;
     latestUsage = temporalChecked.usage;
+    const scenePresenceChecked = await enforceScenePresenceConsistency({
+      text: assistantText,
+      usage: latestUsage,
+    });
+    assistantText = scenePresenceChecked.text;
+    latestUsage = scenePresenceChecked.usage;
 
     tEnd(tGemini);
     tStart(tPost);
@@ -4770,6 +5213,44 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
 
     if (continueMode && continueBaseText) {
       assistantText = mergeContinuationBase(continueBaseText, assistantText);
+    }
+
+    const epistemicOutputChecked = sanitizeGeneratedEpistemicText(
+      assistantText,
+      epistemicFirewall
+    );
+    assistantText = epistemicOutputChecked.text;
+    const legalStatusOutputChecked = removeUnsupportedLegalStatusClaims({
+      text: assistantText,
+      trustedUserTexts: trustedLegalStatusUserTexts,
+      trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+      identities: legalStatusIdentities,
+    });
+    const scenePresenceOutputChecked = removeScenePresenceContradictionPassages({
+      text: legalStatusOutputChecked.text,
+      currentUserText: userText,
+      presentCharacters: currentScenePresence,
+    });
+    assistantText = scenePresenceOutputChecked.text;
+    if (
+      epistemicOutputChecked.redactedSegments ||
+      legalStatusOutputChecked.removed ||
+      scenePresenceOutputChecked.removed
+    ) {
+      dbg({
+        tag: "send.output-fact-guard",
+        chatId: cid,
+        reqId,
+        epistemicRedactions: epistemicOutputChecked.redactedSegments,
+        legalStatusRedactions: legalStatusOutputChecked.removed,
+        legalStatuses: legalStatusOutputChecked.statuses,
+        legalCharacters: legalStatusOutputChecked.characterNames,
+        scenePresenceRedactions: scenePresenceOutputChecked.removed,
+        scenePresenceCharacters: scenePresenceOutputChecked.characterNames,
+      });
+    }
+    if (!assistantText.trim()) {
+      assistantText = "*현장 관계자들은 확인되지 않은 사실을 단정하지 않고 방문 목적과 출입 가능 여부부터 확인했다.*";
     }
 
 	    let assistantMsg: any = {
