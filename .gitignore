@@ -48,6 +48,8 @@ next-env.d.ts
 /.dos-server-port
 /.dos-server-runner-pid
 /.dos-server-child-pid
+/.dos-maintenance-port
+/.dos-maintenance-child-pid
 /.codex-next-dev.*.log
 /.dos-next.*.log
 

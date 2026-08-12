@@ -8,12 +8,17 @@ const { spawn, spawnSync } = require("child_process");
 const ROOT = path.resolve(__dirname, "..");
 const args = parseArgs(process.argv.slice(2));
 const port = Number(args.port || process.env.PORT || 3000);
+const maintenancePort = Number(
+  args.maintenancePort || process.env.DOS_MAINTENANCE_PORT || port + 1000
+);
 const parentPid = Number(args.parentPid || 0);
 const outLog = path.resolve(args.out || path.join(ROOT, ".dos-next.out.log"));
 const errLog = path.resolve(args.err || path.join(ROOT, ".dos-next.err.log"));
 const portFile = path.join(ROOT, ".dos-server-port");
 const runnerPidFile = path.join(ROOT, ".dos-server-runner-pid");
 const childPidFile = path.join(ROOT, ".dos-server-child-pid");
+const maintenancePortFile = path.join(ROOT, ".dos-maintenance-port");
+const maintenanceChildPidFile = path.join(ROOT, ".dos-maintenance-child-pid");
 
 function parseArgs(argv) {
   const out = {};
@@ -21,6 +26,10 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--port") out.port = argv[++i];
     else if (a.startsWith("--port=")) out.port = a.slice("--port=".length);
+    else if (a === "--maintenancePort") out.maintenancePort = argv[++i];
+    else if (a.startsWith("--maintenancePort=")) {
+      out.maintenancePort = a.slice("--maintenancePort=".length);
+    }
     else if (a === "--parentPid") out.parentPid = argv[++i];
     else if (a.startsWith("--parentPid=")) out.parentPid = a.slice("--parentPid=".length);
     else if (a === "--out") out.out = argv[++i];
@@ -82,50 +91,73 @@ const out = fs.createWriteStream(outLog, { flags: "a" });
 const err = fs.createWriteStream(errLog, { flags: "a" });
 
 const command = process.platform === "win32" ? "cmd.exe" : "npm";
-const commandArgs =
-  process.platform === "win32"
-    ? ["/d", "/s", "/c", "npm.cmd", "run", "dev", "--", "--hostname", "127.0.0.1", "--port", String(port)]
-    : ["run", "dev", "--", "--hostname", "127.0.0.1", "--port", String(port)];
-const child = spawn(
-  command,
-  commandArgs,
-  {
+function commandArgs(serverPort) {
+  return process.platform === "win32"
+    ? ["/d", "/s", "/c", "npm.cmd", "run", "start", "--", "--hostname", "127.0.0.1", "--port", String(serverPort)]
+    : ["run", "start", "--", "--hostname", "127.0.0.1", "--port", String(serverPort)];
+}
+
+function spawnServer(serverPort, role) {
+  return spawn(command, commandArgs(serverPort), {
     cwd: ROOT,
-    env: cleanEnv({ PORT: String(port), ARCA_DOS_SERVER: "1" }),
+    env: cleanEnv({
+      PORT: String(serverPort),
+      ARCA_DOS_SERVER: "1",
+      ARCA_DOS_SERVER_ROLE: role,
+    }),
     windowsHide: true,
     detached: false,
     stdio: ["pipe", "pipe", "pipe"],
-  }
-);
+  });
+}
+
+const child = spawnServer(port, "chat");
+const maintenanceChild = spawnServer(maintenancePort, "maintenance");
 
 try {
   fs.writeFileSync(runnerPidFile, String(process.pid || ""), "ascii");
   fs.writeFileSync(childPidFile, String(child.pid || ""), "ascii");
+  fs.writeFileSync(portFile, String(port), "ascii");
+  fs.writeFileSync(maintenancePortFile, String(maintenancePort), "ascii");
+  fs.writeFileSync(maintenanceChildPidFile, String(maintenanceChild.pid || ""), "ascii");
 } catch {}
 
 child.stdout.pipe(out);
 child.stderr.pipe(err);
+maintenanceChild.stdout.pipe(out);
+maintenanceChild.stderr.pipe(err);
+
+function cleanupPidFiles() {
+  try {
+    fs.rmSync(childPidFile, { force: true });
+    fs.rmSync(maintenanceChildPidFile, { force: true });
+    fs.rmSync(runnerPidFile, { force: true });
+    fs.rmSync(portFile, { force: true });
+    fs.rmSync(maintenancePortFile, { force: true });
+  } catch {}
+}
 
 let stopping = false;
 function stop(exitCode = 0) {
   if (stopping) return;
   stopping = true;
+  killTree(maintenanceChild.pid);
   killTree(child.pid);
-  try {
-    fs.rmSync(childPidFile, { force: true });
-    fs.rmSync(runnerPidFile, { force: true });
-    fs.rmSync(portFile, { force: true });
-  } catch {}
+  cleanupPidFiles();
   setTimeout(() => process.exit(exitCode), 300);
 }
 
 child.on("exit", (code) => {
-  try {
-    fs.rmSync(childPidFile, { force: true });
-    fs.rmSync(runnerPidFile, { force: true });
-    fs.rmSync(portFile, { force: true });
-  } catch {}
-  if (!stopping) process.exit(Number.isFinite(code) ? code : 0);
+  if (!stopping) stop(Number.isFinite(code) ? code : 0);
+});
+
+maintenanceChild.on("exit", (code) => {
+  try { fs.rmSync(maintenanceChildPidFile, { force: true }); } catch {}
+  if (!stopping) {
+    try {
+      err.write(`${new Date().toISOString()} maintenance server exited (${String(code)})\n`);
+    } catch {}
+  }
 });
 
 child.on("error", (e) => {
@@ -133,6 +165,12 @@ child.on("error", (e) => {
     err.write(`${new Date().toISOString()} ${String(e && e.stack ? e.stack : e)}\n`);
   } catch {}
   stop(1);
+});
+
+maintenanceChild.on("error", (e) => {
+  try {
+    err.write(`${new Date().toISOString()} maintenance server error ${String(e && e.stack ? e.stack : e)}\n`);
+  } catch {}
 });
 
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {

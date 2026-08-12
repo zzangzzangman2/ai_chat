@@ -19,9 +19,10 @@ $portFile = Join-Path $PSScriptRoot ".dos-server-port"
 $localPortFile = Join-Path $PSScriptRoot ".local-server-port"
 $runnerPidFile = Join-Path $PSScriptRoot ".dos-server-runner-pid"
 $childPidFile = Join-Path $PSScriptRoot ".dos-server-child-pid"
+$maintenancePortFile = Join-Path $PSScriptRoot ".dos-maintenance-port"
+$maintenanceChildPidFile = Join-Path $PSScriptRoot ".dos-maintenance-child-pid"
 $outLog = Join-Path $PSScriptRoot ".dos-next.out.log"
 $errLog = Join-Path $PSScriptRoot ".dos-next.err.log"
-$nextLockFile = Join-Path $PSScriptRoot ".next\dev\lock"
 
 function Add-LocalNodeToPath {
   $portableNodeDir = Join-Path $PSScriptRoot ".codex-tools\node20\node-v20.19.5-win-x64"
@@ -217,7 +218,7 @@ function Test-ProjectServerProcess {
   if (-not $cmd) { return $false }
   $rootPattern = [regex]::Escape($PSScriptRoot)
   if ($cmd -notmatch $rootPattern) { return $false }
-  return $cmd -match "dos-client\\dos-server\.js|dos-client\\dos-chat\.js|next\\dist\\server\\lib\\start-server\.js|npm-cli\.js.*run dev|next dev"
+  return $cmd -match "dos-client\\dos-server\.js|dos-client\\dos-chat\.js|next\\dist\\server\\lib\\start-server\.js|npm-cli\.js.*run (?:dev|start)|next (?:dev|start)"
 }
 
 function Test-PidFileServerProcess {
@@ -225,7 +226,7 @@ function Test-PidFileServerProcess {
   $cmd = Get-ProcessCommandLine -ProcessId $ProcessId
   if (-not $cmd) { return $false }
   if (Test-ProjectServerProcess -ProcessId $ProcessId) { return $true }
-  return $cmd -match "npm\.cmd.*run dev.*--hostname 127\.0\.0\.1.*--port|next dev.*--hostname 127\.0\.0\.1.*--port"
+  return $cmd -match "npm\.cmd.*run (?:dev|start).*--hostname 127\.0\.0\.1.*--port|next (?:dev|start).*--hostname 127\.0\.0\.1.*--port"
 }
 
 function Stop-ProcessTree {
@@ -266,6 +267,8 @@ function Start-DosServer {
     exit 1
   }
 
+  Write-Host "Building the text-only internal server..." -ForegroundColor Cyan
+  Invoke-Npm run build
   Write-Host "Starting text-only internal server. Port: $Port" -ForegroundColor Cyan
   $env:PORT = "$Port"
   $runner = Join-Path $PSScriptRoot "dos-client\dos-server.js"
@@ -281,7 +284,7 @@ function Start-DosServer {
   $startupLimitSeconds = 90
   $startedAt = Get-Date
   $lastProgressAt = -99
-  Write-Host "Next dev is starting. First launch or code changes can take 10-40s." -ForegroundColor DarkGray
+  Write-Host "Next production server is starting." -ForegroundColor DarkGray
   while (((Get-Date) - $startedAt).TotalSeconds -lt $startupLimitSeconds) {
     $elapsed = [int][Math]::Floor(((Get-Date) - $startedAt).TotalSeconds)
     if ($elapsed -eq 0 -or ($elapsed - $lastProgressAt) -ge 3) {
@@ -303,14 +306,6 @@ function Start-DosServer {
       Show-ServerLogs
       exit 1
     }
-    if ($i -ge 3 -and (Test-Path -LiteralPath $nextLockFile)) {
-      $healthyPort = Find-HealthyAppPort
-      if ($healthyPort -gt 0 -and $healthyPort -ne $Port) {
-        try { taskkill /PID $($proc.Id) /T /F 2>$null | Out-Null } catch {}
-        Write-Host "Using existing text-only internal server. Port: $healthyPort" -ForegroundColor Green
-        return [pscustomobject]@{ Port = $healthyPort; Started = $false }
-      }
-    }
     Start-Sleep -Seconds 1
   }
 
@@ -329,7 +324,7 @@ function Stop-DosServerByPort {
       if (Test-ProjectServerProcess -ProcessId $owner) { $pids += $owner }
     }
   }
-  foreach ($pidFile in @($childPidFile, $runnerPidFile)) {
+  foreach ($pidFile in @($maintenanceChildPidFile, $childPidFile, $runnerPidFile)) {
     if (Test-Path -LiteralPath $pidFile) {
       try {
         $pidFromFile = [int]((Get-Content -LiteralPath $pidFile -TotalCount 1).Trim())
@@ -346,6 +341,8 @@ function Stop-DosServerByPort {
   Remove-Item -LiteralPath $portFile -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $runnerPidFile -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $childPidFile -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $maintenancePortFile -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $maintenanceChildPidFile -Force -ErrorAction SilentlyContinue
 }
 
 function Stop-ExistingDosInstance {
@@ -418,23 +415,10 @@ if ($port -gt 0) {
   if ($port -gt 0) {
     Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
   } else {
-    if (Test-Path -LiteralPath $nextLockFile) {
-      Write-Host "Existing Next dev server is starting. Waiting for it instead of opening another port..." -ForegroundColor Cyan
-      $port = Wait-HealthyAppPort -Seconds 30 -Message "Waiting for existing Next dev server..."
-      if ($port -gt 0) {
-        Write-Host "Using existing text-only internal server. Port: $port" -ForegroundColor Green
-      } else {
-        Write-Host "Next dev lock exists, but no healthy internal server responded." -ForegroundColor Red
-        Write-Host "Close the other ARCA DOS/Next window and run this again." -ForegroundColor Yellow
-        Show-ServerLogs
-        exit 1
-      }
-    } else {
-      $port = Find-FreePort
-      $startResult = Start-DosServer -Port $port
-      $port = [int]$startResult.Port
-      $startedByThisScript = [bool]$startResult.Started
-    }
+    $port = Find-FreePort
+    $startResult = Start-DosServer -Port $port
+    $port = [int]$startResult.Port
+    $startedByThisScript = [bool]$startResult.Started
   }
 }
 

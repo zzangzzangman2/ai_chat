@@ -96,6 +96,13 @@ try {
 const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port || process.env.PORT || readPortFile() || 3000);
 const API_BASE = `http://127.0.0.1:${PORT}`;
+const MAINTENANCE_PORT = Number(
+  args.maintenancePort ||
+    process.env.DOS_MAINTENANCE_PORT ||
+    readMaintenancePortFile() ||
+    PORT + 1000
+);
+const MAINTENANCE_API_BASE = `http://127.0.0.1:${MAINTENANCE_PORT}`;
 const sendInactivityTimeoutRaw = Number(process.env.DOS_SEND_INACTIVITY_TIMEOUT_MS || 45_000);
 const SEND_INACTIVITY_TIMEOUT_MS = Number.isFinite(sendInactivityTimeoutRaw)
   ? Math.max(15_000, sendInactivityTimeoutRaw)
@@ -293,6 +300,10 @@ function parseArgs(argv) {
     if (a === "--check") out.check = true;
     else if (a === "--port") out.port = argv[++i];
     else if (a.startsWith("--port=")) out.port = a.slice("--port=".length);
+    else if (a === "--maintenancePort") out.maintenancePort = argv[++i];
+    else if (a.startsWith("--maintenancePort=")) {
+      out.maintenancePort = a.slice("--maintenancePort=".length);
+    }
     else if (a === "--chat" || a === "--chatId") out.chat = argv[++i];
     else if (a.startsWith("--chat=")) out.chat = a.slice("--chat=".length);
   }
@@ -2850,6 +2861,24 @@ function isAbortLike(error) {
   );
 }
 
+async function maintenanceHealth() {
+  try {
+    const res = await fetch(`${MAINTENANCE_API_BASE}/api/auth/me`, { cache: "no-store" });
+    return res.status >= 200 && res.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+function readMaintenancePortFile() {
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, ".dos-maintenance-port"), "utf8").trim();
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  return 0;
+}
+
 function pauseBackgroundMaintenance() {
   state.maintenancePaused = true;
   state.maintenanceGeneration += 1;
@@ -2909,7 +2938,7 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   let response = null;
   try {
     if (kind === "character") {
-      response = await fetch(`${API_BASE}/api/chat/characters/refresh`, {
+      response = await fetch(`${MAINTENANCE_API_BASE}/api/chat/characters/refresh`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2919,7 +2948,7 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
         signal: controller.signal,
       });
     } else {
-      response = await fetch(`${API_BASE}/api/chat/memory/refresh`, {
+      response = await fetch(`${MAINTENANCE_API_BASE}/api/chat/memory/refresh`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3361,6 +3390,9 @@ async function handleCommand(line, rl) {
 async function checkMode() {
   console.log(`폴더: ${ROOT}`);
   console.log(`내부 서버: ${API_BASE} ${await health() ? "OK" : "연결 안 됨"}`);
+  console.log(
+    `기억 서버: ${MAINTENANCE_API_BASE} ${await maintenanceHealth() ? "OK" : "연결 안 됨"}`
+  );
   console.log(`DB: ${fs.existsSync(DB_PATH) ? "OK" : "없음"}`);
   const chats = fs.existsSync(DB_PATH) ? listChats(5) : [];
   console.log(`최근 채팅: ${chats.length}개`);
