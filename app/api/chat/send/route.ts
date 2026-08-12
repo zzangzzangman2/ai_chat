@@ -2741,6 +2741,13 @@ const recentExpressionAvoidanceBlock = buildRecentExpressionAvoidanceBlock(tail)
     // 호명된 인물이 없어 필터가 무력화되고, 최근 원문 tail에 남아 있는 곁다리 인물을
     // 모델이 계속 이어서 등장시킨다(실사고: 논평 역 NPC가 156턴 중 126턴, 사용자 호명은 10턴 중 1회).
     // 그래서 "최근 연속 등장 + 사용자가 최근에 부르지 않은" 인물을 직접 집어 퇴장을 지시한다.
+    // 연속 등장 N턴 이상이면 "장면에 눌러앉았다"로 본다.
+    // 실측 분포(160턴 대화): 고착 인물 159/85턴 vs 정상 인물 16/12/9턴 — 20이 안전한 경계.
+    const STICKY_MIN_STREAK = (() => {
+      const raw = Number(process.env.AI_STICKY_NPC_MIN_STREAK ?? 20);
+      return Number.isFinite(raw) ? Math.max(6, Math.min(200, Math.floor(raw))) : 20;
+    })();
+    const STICKY_SCAN_TURNS = Math.max(STICKY_MIN_STREAK * 3, 60);
     const overusedCharacterBlock = (() => {
       try {
         if (String(process.env.AI_RETIRE_OVERUSED_NPC || "1").trim() === "0") return "";
@@ -2751,31 +2758,47 @@ const recentExpressionAvoidanceBlock = buildRecentExpressionAvoidanceBlock(tail)
           .filter((name) => name.length >= 2);
         if (!roster.length) return "";
 
-        const assistantTurns = tail
-          .filter((m: any) => String(m?.role || "") !== "user")
-          .slice(-5)
-          .map((m: any) => String(m?.content || ""));
         const userTurns = [userText, ...tail.filter((m: any) => String(m?.role || "") === "user").slice(-3).map((m: any) => String(m?.content || ""))].join("\n");
-        if (assistantTurns.length < 4) return "";
+
+        // 판정 기준은 "최근 몇 턴 연속"이 아니라 "얼마나 오래 눌러앉았는가"다.
+        // 최근 5턴만 보면 현재 장면의 주역까지 똑같이 걸린다(실측: 곁다리 논평역 85턴 연속과
+        // 사용자가 상대 중인 주역 9턴 연속이 같은 조건에 잡힘).
+        // 전체 응답 기준 연속 등장 길이로 보면 둘이 명확히 갈린다.
+        const recentAssistants = (all as any[])
+          .filter((m: any) => String(m?.role || "") !== "user")
+          .slice(-STICKY_SCAN_TURNS)
+          .map((m: any) => String(m?.content || ""));
+        if (recentAssistants.length < STICKY_MIN_STREAK) return "";
+
+        const streakOf = (name: string) => {
+          let streak = 0;
+          for (let i = recentAssistants.length - 1; i >= 0; i -= 1) {
+            if (!recentAssistants[i].includes(name)) break;
+            streak += 1;
+          }
+          return streak;
+        };
 
         const overused = roster.filter((name) => {
-          const appearances = assistantTurns.filter((text) => text.includes(name)).length;
-          if (appearances < assistantTurns.length) return false; // 연속 전부 등장한 인물만
+          if (streakOf(name) < STICKY_MIN_STREAK) return false; // 장기 고착만
           if (userTurns.includes(name)) return false; // 사용자가 최근에 부른 인물은 제외
           if (name === personaNameFinal || name === npcName) return false; // 주역/페르소나 보호
           return true;
         });
         if (!overused.length) return "";
 
-        // 강제 퇴장은 위험하다. 사용자가 대명사로만 상대하는 주역까지 목록에 들어오기 때문에
-        // (실측: 곁다리 논평 역과 현재 장면의 주 상대가 같은 조건에 걸림) 제거 대상을 서버가
-        // 확정하지 않고, "곁다리부터 빼라 + 남기려면 역할을 바꿔라"를 모델에게 맡긴다.
+        // 연속 등장 길이로 거르면 현재 장면의 주역은 포함되지 않으므로(실측 9~16턴 대 85~159턴)
+        // 여기서는 완곡하게 권하지 않고 이번 턴 제외를 명확히 지시한다.
+        const named = overused
+          .map((name) => `${name}(${streakOf(name)}턴 연속)`)
+          .slice(0, 4)
+          .join(", ");
         return [
-          "# [연속 등장 인물 점검 — 현재 턴]",
-          `- 다음 인물은 최근 ${assistantTurns.length}개 답변에 빠짐없이 등장했고, 사용자는 최근 입력에서 이들을 부르지 않았다: ${overused.slice(0, 4).join(", ")}`,
-          "- 이 중 사용자가 지금 직접 상대하는 인물만 장면에 남긴다. 곁에서 논평·해설·복창만 하던 인물은 이번 답변에서 빼고, 자리를 뜰 이유가 있으면 짧게 처리한 뒤 다음 턴부터 언급하지 않는다.",
-          "- 남기는 인물도 직전 답변과 같은 기능을 반복시키지 않는다. 감상평·상황 요약·주인 칭송을 되풀이하는 배치를 그만두고, 행동이나 국면을 바꾸는 역할만 준다.",
-          "- 사용자가 다시 부르거나 사건상 반드시 필요할 때만 복귀시킨다.",
+          "# [고착 인물 퇴장 — 현재 턴 필수]",
+          `- 다음 인물은 최근 답변마다 빠짐없이 등장해 장면에 눌러앉았고, 사용자는 최근 입력에서 이들을 부르지 않았다: ${named}`,
+          "- 이번 답변에서는 이들을 등장시키지 않는다. 이름을 부르지도, 대사를 주지도, 시선·표정·내심을 묘사하지도 않는다.",
+          "- 아직 그 자리에 있어야 하는 인물이라면 물러나거나 자리를 비우는 과정을 한 문장으로 처리하고 그대로 장면에서 뺀다.",
+          "- 사용자가 이름을 다시 부르거나 사건상 반드시 필요해질 때만 복귀시킨다. 빠진 자리는 사용자가 지금 상대하는 인물에게 준다.",
         ].join("\n");
       } catch {
         return "";
