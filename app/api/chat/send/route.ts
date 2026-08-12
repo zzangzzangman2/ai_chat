@@ -1970,9 +1970,13 @@ ${body}`.trim();
         // (자동 퇴장 2026-08) 최근 사용자 입력만 모아 전달한다.
         // 이름 생략 시의 자동 포커스를 "사용자가 실제로 부른 인물"로 제한해,
         // 한 번 등장한 단역이 자기강화 루프로 매 턴 눌러앉는 것을 막는다.
+        //
+        // 창(window)은 좁게 잡는다. 10턴까지 보면 오래 전에 한 번 부른 인물이 계속
+        // 후보로 남아 필터가 무력해진다(실사고: 최근 10턴 중 1회 호명된 논평 역 NPC가
+        // 126턴 연속 등장). 현재 입력 + 직전 사용자 발화 3개면 "지금 상대하는 인물"에 충분하다.
         userMentionText: [
           userText,
-          ...tail.filter((m: any) => m?.role === "user").slice(-10).map((m: any) => String(m?.content || "")),
+          ...tail.filter((m: any) => m?.role === "user").slice(-3).map((m: any) => String(m?.content || "")),
         ].join("\n"),
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
         graph: relationshipGraph,
@@ -2732,6 +2736,51 @@ const formatGuide = buildFormatGuide({
           metaTemplateFence: metaFenceTemplateHint ? metaFenceTemplateHint : undefined,
         });
 const recentExpressionAvoidanceBlock = buildRecentExpressionAvoidanceBlock(tail);
+    // (과다 등장 인물 퇴장 2026-08)
+    // 캐릭터 포커스 필터만으로는 막히지 않는 경로가 있다. 사용자가 대명사("너")만 쓰면
+    // 호명된 인물이 없어 필터가 무력화되고, 최근 원문 tail에 남아 있는 곁다리 인물을
+    // 모델이 계속 이어서 등장시킨다(실사고: 논평 역 NPC가 156턴 중 126턴, 사용자 호명은 10턴 중 1회).
+    // 그래서 "최근 연속 등장 + 사용자가 최근에 부르지 않은" 인물을 직접 집어 퇴장을 지시한다.
+    const overusedCharacterBlock = (() => {
+      try {
+        if (String(process.env.AI_RETIRE_OVERUSED_NPC || "1").trim() === "0") return "";
+        const roster = (db
+          .prepare(`SELECT name FROM chat_character_roster WHERE chatId=? AND enabled != 0 LIMIT 60`)
+          .all(cid) as Array<{ name?: unknown }>)
+          .map((row) => String(row?.name || "").trim())
+          .filter((name) => name.length >= 2);
+        if (!roster.length) return "";
+
+        const assistantTurns = tail
+          .filter((m: any) => String(m?.role || "") !== "user")
+          .slice(-5)
+          .map((m: any) => String(m?.content || ""));
+        const userTurns = [userText, ...tail.filter((m: any) => String(m?.role || "") === "user").slice(-3).map((m: any) => String(m?.content || ""))].join("\n");
+        if (assistantTurns.length < 4) return "";
+
+        const overused = roster.filter((name) => {
+          const appearances = assistantTurns.filter((text) => text.includes(name)).length;
+          if (appearances < assistantTurns.length) return false; // 연속 전부 등장한 인물만
+          if (userTurns.includes(name)) return false; // 사용자가 최근에 부른 인물은 제외
+          if (name === personaNameFinal || name === npcName) return false; // 주역/페르소나 보호
+          return true;
+        });
+        if (!overused.length) return "";
+
+        // 강제 퇴장은 위험하다. 사용자가 대명사로만 상대하는 주역까지 목록에 들어오기 때문에
+        // (실측: 곁다리 논평 역과 현재 장면의 주 상대가 같은 조건에 걸림) 제거 대상을 서버가
+        // 확정하지 않고, "곁다리부터 빼라 + 남기려면 역할을 바꿔라"를 모델에게 맡긴다.
+        return [
+          "# [연속 등장 인물 점검 — 현재 턴]",
+          `- 다음 인물은 최근 ${assistantTurns.length}개 답변에 빠짐없이 등장했고, 사용자는 최근 입력에서 이들을 부르지 않았다: ${overused.slice(0, 4).join(", ")}`,
+          "- 이 중 사용자가 지금 직접 상대하는 인물만 장면에 남긴다. 곁에서 논평·해설·복창만 하던 인물은 이번 답변에서 빼고, 자리를 뜰 이유가 있으면 짧게 처리한 뒤 다음 턴부터 언급하지 않는다.",
+          "- 남기는 인물도 직전 답변과 같은 기능을 반복시키지 않는다. 감상평·상황 요약·주인 칭송을 되풀이하는 배치를 그만두고, 행동이나 국면을 바꾸는 역할만 준다.",
+          "- 사용자가 다시 부르거나 사건상 반드시 필요할 때만 복귀시킨다.",
+        ].join("\n");
+      } catch {
+        return "";
+      }
+    })();
 const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
   ? ""
   : buildWorldDirectorBlock({
@@ -2775,6 +2824,8 @@ const systemRaw = (cacheFriendlyLayout
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
         worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
+        overusedCharacterBlock ? `` : "",
+        overusedCharacterBlock ? sanitizePromptCached(overusedCharacterBlock) : "",
       ]
     : [
         dynamicCharacterContext.block
@@ -2800,6 +2851,8 @@ const systemRaw = (cacheFriendlyLayout
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
         worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
+        overusedCharacterBlock ? `` : "",
+        overusedCharacterBlock ? sanitizePromptCached(overusedCharacterBlock) : "",
       ]).join("\n");
     const npcName = preset.characterName || (preset as any).name || "상대";
     const systemBase = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });

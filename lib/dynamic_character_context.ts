@@ -318,12 +318,24 @@ export function buildDynamicCharacterContext(params: {
   const focusedIds = findFocusedCharacterIds(scopeRows, params.focusText);
   const currentFocusedIds = new Set(focusedIds);
 
+  // (자동 퇴장 2026-08) 사용자가 최근 입력에서 실제로 부른 인물 집합.
+  // 폴백 경로들이 어시스턴트 자신의 직전 출력을 근거로 인물을 되살리는 것을 막는 기준선이다.
+  const userCalledIds = params.userMentionText
+    ? findFocusedCharacterIds(scopeRows, params.userMentionText)
+    : new Set<string>();
+
   // A character explicitly named in the current user input owns this turn's
   // character context. Recent dialogue is only a pronoun/name-omission fallback;
   // mixing both sources activated unrelated recent characters and caused their
   // events and locations to be fused into the requested character's memory.
+  //
+  // (2026-08) recentFocusText는 어시스턴트 응답까지 포함하므로, 모델이 한 번 등장시킨
+  // 곁다리 인물이 다음 턴 포커스를 얻고 또 등장하는 자기강화 루프가 생긴다.
+  // (실사고: 논평 역 NPC가 156턴 중 126턴 등장, 사용자는 최근 10턴 중 1번만 호명)
+  // 사용자가 최근에 부른 인물이 하나라도 있으면, 이 폴백은 그 인물들로만 제한한다.
   if (!personaMentioned && focusedIds.size === 0 && params.recentFocusText) {
     for (const id of findFocusedCharacterIds(scopeRows, params.recentFocusText)) {
+      if (userCalledIds.size > 0 && !userCalledIds.has(id)) continue;
       focusedIds.add(id);
     }
   }
@@ -339,9 +351,6 @@ export function buildDynamicCharacterContext(params: {
     // 실제 사고: 정보 전달용으로 한 번 만들어진 단역(기록원)이 41턴 연속 매 턴 등장.
     // 따라서 사용자가 최근 입력에서 실제로 부른 적 있는 인물이 존재하면,
     // 자동 포커스 후보를 그 인물들로 제한한다. (사용자가 아무도 안 불렀으면 기존 동작)
-    const userCalledIds = params.userMentionText
-      ? findFocusedCharacterIds(scopeRows, params.userMentionText)
-      : new Set<string>();
     const restrictToUserCalled = userCalledIds.size > 0;
 
     const latestRows = db
