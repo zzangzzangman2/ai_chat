@@ -1972,13 +1972,24 @@ ${body}`.trim();
           return streak;
         };
 
+        // 주의: npcName은 이 지점보다 한참 뒤(프롬프트 조립부)에서 선언된다.
+        // 여기서 참조하면 TDZ ReferenceError가 나고 아래 catch가 삼켜서
+        // 감지기가 항상 빈 배열을 반환한다(실제로 그렇게 죽어 있었다).
+        // preset은 이미 로드돼 있으므로 원본 필드를 직접 쓴다.
+        const presetCharacterName = String((preset as any)?.characterName || "").trim();
         return roster.filter((name) => {
           if (streakOf(name) < STICKY_MIN_STREAK) return false; // 장기 고착만
           if (userTurns.includes(name)) return false; // 사용자가 최근에 부른 인물은 제외
-          if (name === personaNameFinal || name === npcName) return false; // 주역/페르소나 보호
+          if (name === personaNameFinal || (presetCharacterName && name === presetCharacterName)) return false; // 주역/페르소나 보호
           return true;
         });
-      } catch {
+      } catch (error) {
+        // 조용한 실패가 이 기능을 몇 차례 무력화했다. 반드시 남긴다.
+        console.error("[chat/send] sticky character detection failed", {
+          chatId: cid,
+          reqId,
+          error: String((error as { message?: unknown })?.message || error),
+        });
         return [];
       }
     })();
