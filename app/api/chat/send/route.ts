@@ -1930,17 +1930,20 @@ ${body}`.trim();
     // 호명된 인물이 없어 필터가 무력화되고, 최근 원문 tail에 남아 있는 곁다리 인물을
     // 모델이 계속 이어서 등장시킨다(실사고: 논평 역 NPC가 156턴 중 126턴, 사용자 호명은 10턴 중 1회).
     // 그래서 "최근 연속 등장 + 사용자가 최근에 부르지 않은" 인물을 직접 집어 퇴장을 지시한다.
-    // 연속 등장 N턴 이상이면 "장면에 눌러앉았다"로 본다.
-    // 실측 분포(160턴 대화): 고착 인물 159/85턴 vs 정상 인물 16/12/9턴 — 20이 안전한 경계.
-    const STICKY_MIN_STREAK = (() => {
-      const raw = Number(process.env.AI_STICKY_NPC_MIN_STREAK ?? 20);
-      return Number.isFinite(raw) ? Math.max(6, Math.min(200, Math.floor(raw))) : 20;
+    // 고착 판정 지표.
+    // 연속 등장(streak)으로 재던 이전 방식은 한 턴만 빠져도 0으로 리셋돼, 퇴장 → 즉시 복귀 →
+    // 한 턴 걸러 등장하는 진동을 만들었다(실측 패턴: O O O O O O O O O O . O).
+    // 실측 분포(164턴 대화)에서 갈리는 건 "누적 등장 턴수"다:
+    //   고착 최학수 164턴 / 카와무라 134턴  vs  정상 송지연 31턴 / 송병택 30턴
+    // 최근 활성도(윈도우 비율)만으로는 구분되지 않는다(97% 대 90~93%).
+    // 그래서 "최근에도 계속 나오고(비율) + 아주 오래 눌러앉았다(누적)"를 함께 본다.
+    const STICKY_WINDOW = 30;
+    const STICKY_MIN_RATIO = 0.7;
+    const STICKY_MIN_TOTAL = (() => {
+      const raw = Number(process.env.AI_STICKY_NPC_MIN_TOTAL ?? 60);
+      return Number.isFinite(raw) ? Math.max(10, Math.min(1000, Math.floor(raw))) : 60;
     })();
-    const STICKY_SCAN_TURNS = Math.max(STICKY_MIN_STREAK * 3, 60);
-    // 고착 인물 이름 목록. 프롬프트 지시(아래 블록)와 캐릭터 컨텍스트 제외에 함께 쓴다.
-    // 지시만으로는 모델이 무시했다(실측: 블록 발동 확인 후에도 3턴 연속 등장).
-    // 그래서 같은 목록을 dynamicCharacterContext에서도 빼서, 그 인물의 기억·관계가
-    // 애초에 프롬프트에 실리지 않게 한다.
+    // 고착 인물 이름 목록. 프롬프트 퇴장 지시(아래 블록)에 사용한다.
     const stickyOverusedNames: string[] = (() => {
       try {
         if (String(process.env.AI_RETIRE_OVERUSED_NPC || "1").trim() === "0") return [];
@@ -1957,20 +1960,11 @@ ${body}`.trim();
         // 최근 5턴만 보면 현재 장면의 주역까지 똑같이 걸린다(실측: 곁다리 논평역 85턴 연속과
         // 사용자가 상대 중인 주역 9턴 연속이 같은 조건에 잡힘).
         // 전체 응답 기준 연속 등장 길이로 보면 둘이 명확히 갈린다.
-        const recentAssistants = (all as any[])
+        const assistantTexts = (all as any[])
           .filter((m: any) => String(m?.role || "") !== "user")
-          .slice(-STICKY_SCAN_TURNS)
           .map((m: any) => String(m?.content || ""));
-        if (recentAssistants.length < STICKY_MIN_STREAK) return [];
-
-        const streakOf = (name: string) => {
-          let streak = 0;
-          for (let i = recentAssistants.length - 1; i >= 0; i -= 1) {
-            if (!recentAssistants[i].includes(name)) break;
-            streak += 1;
-          }
-          return streak;
-        };
+        if (assistantTexts.length < STICKY_MIN_TOTAL) return [];
+        const windowTexts = assistantTexts.slice(-STICKY_WINDOW);
 
         // 주의: npcName은 이 지점보다 한참 뒤(프롬프트 조립부)에서 선언된다.
         // 여기서 참조하면 TDZ ReferenceError가 나고 아래 catch가 삼켜서
@@ -1978,10 +1972,12 @@ ${body}`.trim();
         // preset은 이미 로드돼 있으므로 원본 필드를 직접 쓴다.
         const presetCharacterName = String((preset as any)?.characterName || "").trim();
         return roster.filter((name) => {
-          if (streakOf(name) < STICKY_MIN_STREAK) return false; // 장기 고착만
           if (userTurns.includes(name)) return false; // 사용자가 최근에 부른 인물은 제외
           if (name === personaNameFinal || (presetCharacterName && name === presetCharacterName)) return false; // 주역/페르소나 보호
-          return true;
+          const recentHits = windowTexts.filter((text) => text.includes(name)).length;
+          if (recentHits / windowTexts.length < STICKY_MIN_RATIO) return false; // 이미 물러난 인물은 대상 아님
+          const totalHits = assistantTexts.filter((text) => text.includes(name)).length;
+          return totalHits >= STICKY_MIN_TOTAL; // 누적으로 오래 눌러앉은 인물만
         });
       } catch (error) {
         // 조용한 실패가 이 기능을 몇 차례 무력화했다. 반드시 남긴다.
@@ -1993,25 +1989,17 @@ ${body}`.trim();
         return [];
       }
     })();
-    const stickyStreakOf = (name: string) => {
-      const recentAssistants = (all as any[])
+    const stickyTotalOf = (name: string) =>
+      (all as any[])
         .filter((m: any) => String(m?.role || "") !== "user")
-        .slice(-STICKY_SCAN_TURNS)
-        .map((m: any) => String(m?.content || ""));
-      let streak = 0;
-      for (let i = recentAssistants.length - 1; i >= 0; i -= 1) {
-        if (!recentAssistants[i].includes(name)) break;
-        streak += 1;
-      }
-      return streak;
-    };
-    // 연속 등장 길이로 거르면 현재 장면의 주역은 포함되지 않으므로(실측 9~16턴 대 85~159턴)
+        .reduce((count: number, m: any) => (String(m?.content || "").includes(name) ? count + 1 : count), 0);
+    // 누적 등장으로 거르면 현재 장면의 주역은 포함되지 않으므로(실측 30~31턴 대 134~164턴)
     // 완곡하게 권하지 않고 이번 턴 제외를 명확히 지시한다.
     const overusedCharacterBlock = stickyOverusedNames.length
       ? [
           "# [고착 인물 퇴장 — 현재 턴 필수]",
-          `- 다음 인물은 최근 답변마다 빠짐없이 등장해 장면에 눌러앉았고, 사용자는 최근 입력에서 이들을 부르지 않았다: ${stickyOverusedNames
-            .map((name) => `${name}(${stickyStreakOf(name)}턴 연속)`)
+          `- 다음 인물은 장면에 너무 오래 눌러앉았고, 사용자는 최근 입력에서 이들을 부르지 않았다: ${stickyOverusedNames
+            .map((name) => `${name}(누적 ${stickyTotalOf(name)}턴 등장)`)
             .slice(0, 4)
             .join(", ")}`,
           "- 이번 답변에서는 이들을 등장시키지 않는다. 이름을 부르지도, 대사를 주지도, 시선·표정·내심을 묘사하지도 않는다.",
