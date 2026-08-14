@@ -26,6 +26,10 @@ export type EpistemicSanitizeResult = {
   redactedSegments: number;
 };
 
+export type GeneratedEpistemicOptions = {
+  groundedFactIds?: ReadonlySet<string>;
+};
+
 function splitLineSentences(line: string) {
   const marked = String(line || "").replace(
     /([.!?。！？](?:["”']|\*+)?)(\s+)/gu,
@@ -172,6 +176,48 @@ function segmentAssertsProtectedFact(
   return false;
 }
 
+function segmentAttributesKnowledge(value: unknown) {
+  const text = String(value || "").trim();
+  return (
+    /^["“]/u.test(text) ||
+    /(?:알고\s*있|알고\s*있었|알았|안다|아는\s*(?:사실|눈치)|깨달|눈치챘|인지했|파악했|확신했|기억했|정체를\s*알|사실을\s*알)/u.test(text)
+  );
+}
+
+/**
+ * Finds confidential relationship facts that are already established by the
+ * user or by stored narration. A grounded world fact may remain in neutral
+ * narration, but it still cannot be promoted to an NPC's personal knowledge.
+ */
+export function buildGroundedEpistemicFactIds(
+  firewall: EpistemicPromptFirewall,
+  trustedTexts: unknown[]
+) {
+  const grounded = new Set<string>();
+  const segments = (trustedTexts || []).flatMap((value) =>
+    String(value || "")
+      .split(/\r?\n/u)
+      .flatMap(splitLineSentences)
+      .filter(Boolean)
+  );
+  for (const fact of firewall.facts) {
+    const subject = nameKey(fact.subjectName);
+    const object = nameKey(fact.objectName);
+    const supported = segments.some((segment) => {
+      const normalized = segment.toLocaleLowerCase("ko-KR");
+      if (
+        !(subject && normalized.includes(subject)) &&
+        !(object && normalized.includes(object))
+      ) {
+        return false;
+      }
+      return segmentAssertsProtectedFact(segment, fact);
+    });
+    if (supported) grounded.add(fact.relationId);
+  }
+  return grounded;
+}
+
 function normalizeAfterRedaction(value: string) {
   return value
     .replace(/\n[ \t]+\n/g, "\n\n")
@@ -259,7 +305,8 @@ export function sanitizeCharacterEpistemicText(
  */
 export function sanitizeGeneratedEpistemicText(
   value: unknown,
-  firewall: EpistemicPromptFirewall
+  firewall: EpistemicPromptFirewall,
+  options: GeneratedEpistemicOptions = {}
 ): EpistemicSanitizeResult {
   const source = String(value || "");
   const facts = firewall.facts.filter((fact) => fact.knownByNames.length === 0);
@@ -277,9 +324,12 @@ export function sanitizeGeneratedEpistemicText(
     if (inFence || !line.trim()) return line;
 
     const kept = splitLineSentences(line).filter((sentence) => {
-      const unsupported = facts.some((fact) =>
-        segmentAssertsProtectedFact(sentence, fact)
-      );
+      const attributesKnowledge = segmentAttributesKnowledge(sentence);
+      const unsupported = facts.some((fact) => {
+        if (!segmentAssertsProtectedFact(sentence, fact)) return false;
+        const grounded = options.groundedFactIds?.has(fact.relationId) === true;
+        return !grounded || attributesKnowledge;
+      });
       if (unsupported) redactedSegments += 1;
       return !unsupported;
     });

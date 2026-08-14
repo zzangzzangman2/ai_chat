@@ -28,6 +28,7 @@ import {
 } from "@/lib/relationship_graph";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
 import {
+  buildGroundedEpistemicFactIds,
   buildEpistemicPromptFirewall,
   sanitizeGeneratedEpistemicText,
   sanitizeSharedEpistemicText,
@@ -2231,6 +2232,24 @@ ${body}`.trim();
         return role === "assistant" || role === "model";
       })
       .map((message) => String(message?.content || ""));
+    const groundedEpistemicFactIds = buildGroundedEpistemicFactIds(
+      epistemicFirewall,
+      [...trustedLegalStatusUserTexts, ...trustedLegalStatusNarrationTexts]
+    );
+    const sanitizeGeneratedFacts = (text: unknown) =>
+      sanitizeGeneratedEpistemicText(text, epistemicFirewall, {
+        groundedFactIds: groundedEpistemicFactIds,
+      });
+    const recoverAfterOverfilter = (text: unknown) => {
+      const epistemic = sanitizeGeneratedFacts(text);
+      const legalStatus = removeUnsupportedLegalStatusClaims({
+        text: epistemic.text,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+        identities: legalStatusIdentities,
+      });
+      return legalStatus.text;
+    };
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
     // the current scene until a recent exit or explicit scene cut removes them.
@@ -3588,7 +3607,7 @@ let cancelStreamWork: (() => void) | null = null;
         let streamLegalStatusRedactions = 0;
         let streamScenePresenceRedactions = 0;
         const guardedTextStream = createGuardedTextStream((text) => {
-          const epistemic = sanitizeGeneratedEpistemicText(text, epistemicFirewall);
+          const epistemic = sanitizeGeneratedFacts(text);
           const legalStatus = removeUnsupportedLegalStatusClaims({
             text: epistemic.text,
             trustedUserTexts: trustedLegalStatusUserTexts,
@@ -4078,13 +4097,19 @@ if (!TRANSPORT_STREAMING) {
             }
           }
 
+          const factGuardRecoverySource = assistantText;
           const guardedTail = guardedTextStream.finish();
           if (guardedTail) enqueueWire({ type: "delta", text: guardedTail });
           assistantText = guardedTextStream.output();
           if (!assistantText.trim()) {
-            const safeFallback = "*현장 관계자들은 확인되지 않은 사실을 단정하지 않고 방문 목적과 출입 가능 여부부터 확인했다.*";
-            safeEnqueue({ type: "delta", text: safeFallback });
-            assistantText = guardedTextStream.output();
+            const recovered = recoverAfterOverfilter(factGuardRecoverySource).trim();
+            if (recovered) {
+              // Epistemic/legal guards have passed. Only the transient scene
+              // presence guard over-filtered the draft, so preserve the scene
+              // instead of replacing it with a repeated canned sentence.
+              enqueueWire({ type: "delta", text: recovered });
+              assistantText = recovered;
+            }
           }
           if (
             streamEpistemicRedactions ||
@@ -5316,10 +5341,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       assistantText = mergeContinuationBase(continueBaseText, assistantText);
     }
 
-    const epistemicOutputChecked = sanitizeGeneratedEpistemicText(
-      assistantText,
-      epistemicFirewall
-    );
+    const factGuardRecoverySource = assistantText;
+    const epistemicOutputChecked = sanitizeGeneratedFacts(assistantText);
     assistantText = epistemicOutputChecked.text;
     const legalStatusOutputChecked = removeUnsupportedLegalStatusClaims({
       text: assistantText,
@@ -5351,7 +5374,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       });
     }
     if (!assistantText.trim()) {
-      assistantText = "*현장 관계자들은 확인되지 않은 사실을 단정하지 않고 방문 목적과 출입 가능 여부부터 확인했다.*";
+      assistantText = recoverAfterOverfilter(factGuardRecoverySource).trim();
     }
 
 	    let assistantMsg: any = {
