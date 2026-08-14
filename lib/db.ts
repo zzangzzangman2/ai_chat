@@ -374,15 +374,15 @@ if (!hasColumn("chat_settings", "narrationColor")) {
      SET model='gemini-2.5-pro'
      WHERE model IN ('gemini-2.5-flash', 'gemini-2-5-pro', 'gemini-2-5-flash')`
   ).run();
-  // Gemini 3.6 Flash replaces 3.5 Flash. Its lowest supported thinking level is medium.
+  // Gemini 3.7 Flash replaces 3.6/3.5 Flash. Its lowest supported thinking level is medium.
   db.prepare(
     `UPDATE chat_settings
-     SET model='gemini-3.6-flash',
+     SET model='gemini-3.7-flash',
          maxReasoningTokens=CASE
            WHEN COALESCE(maxReasoningTokens, 0) >= 1024 THEN maxReasoningTokens
            ELSE 640
          END
-     WHERE model IN ('gemini-3-flash', 'gemini-3-flash-preview', 'gemini-3.1-flash', 'gemini-3.1-flash-lite', 'gemini-3.1-flash-lite-preview', 'gemini-3.1-flash-preview', 'gemini-3.5-flash', 'gemini-3.5-flash-preview', 'gemini-3.5-flash-lite', 'gemini-3.6-flash-preview')`
+     WHERE model IN ('gemini-3-flash', 'gemini-3-flash-preview', 'gemini-3.1-flash', 'gemini-3.1-flash-lite', 'gemini-3.1-flash-lite-preview', 'gemini-3.1-flash-preview', 'gemini-3.5-flash', 'gemini-3.5-flash-preview', 'gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.6-flash-preview', 'gemini-3.7-flash-preview')`
   ).run();
   db.prepare(
     `UPDATE chat_settings

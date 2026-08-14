@@ -10,10 +10,10 @@ const readline = require("readline/promises");
 const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, "data", "data.sqlite3");
 const ENC_PREFIX = "enc:v1:";
-const MODELS = ["gemini-2.5-pro", "gemini-3.6-flash", "gemini-3.1-pro-preview"];
+const MODELS = ["gemini-2.5-pro", "gemini-3.7-flash", "gemini-3.1-pro-preview"];
 const MODEL_OPTIONS = [
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
+  { id: "gemini-3.7-flash", label: "Gemini 3.6 Flash" },
   { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview" },
 ];
 

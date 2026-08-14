@@ -1,6 +1,7 @@
 export const GEMINI_25_PRO_MODEL = "gemini-2.5-pro" as const;
 // Legacy constant name is preserved for callers while the selected Flash model advances.
-export const GEMINI_3_FLASH_MODEL = "gemini-3.6-flash" as const;
+// (2026-08-14) 3.6 → 3.7. Vertex(global)에서 gemini-3.7-flash 제공 확인.
+export const GEMINI_3_FLASH_MODEL = "gemini-3.7-flash" as const;
 export const GEMINI_31_PRO_MODEL = "gemini-3.1-pro-preview" as const;
 export const DEFAULT_CHAT_MODEL = GEMINI_31_PRO_MODEL;
 
@@ -38,7 +39,10 @@ export function normalizeModelId(model: string): string {
     m === "gemini-3.5-flash" ||
     m === "gemini-3.5-flash-preview" ||
     m === "gemini-3.5-flash-lite" ||
-    m === "gemini-3.6-flash-preview"
+    m === "gemini-3.6-flash-preview" ||
+    // 3.6에서 3.7로 올리면서, 기존 대화/설정에 저장된 3.6 값도 현재 Flash로 흡수한다.
+    m === "gemini-3.6-flash" ||
+    m === "gemini-3.7-flash-preview"
   ) {
     return GEMINI_3_FLASH_MODEL;
   }

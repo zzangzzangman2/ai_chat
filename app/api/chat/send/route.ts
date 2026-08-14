@@ -3665,7 +3665,7 @@ let cancelStreamWork: (() => void) | null = null;
             const _metaCompletionModel =
               (process.env.AI_META_COMPLETION_MODEL || "").trim() ||
               ((isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
-                ? "gemini-3.6-flash"
+                ? "gemini-3.7-flash"
                 : String((opts as any)?.model || (settings as any)?.model || ""));
             const _metaOverlapTriggerRatio = (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || ""))) ? 0.65 : 0.85;
             const _metaOverlapTriggerChars = Math.max(420, Math.min(promptMaxChars, Math.floor(targetChars * _metaOverlapTriggerRatio)));
@@ -5111,7 +5111,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           user: statusUser,
           opts: {
             ...opts,
-            model: "gemini-3.6-flash",
+            model: "gemini-3.7-flash",
             // Gemini 3.6 Flash의 공식 최저 단계인 medium을 사용한다.
             maxReasoningTokens: 640,
             maxOutputTokens: 640,
@@ -5181,7 +5181,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           system: systemStatus,
           user: statusUser,
 	          opts: (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
-	            ? { ...opts, model: "gemini-3.6-flash", maxReasoningTokens: 640, maxOutputTokens: 640 }
+	            ? { ...opts, model: "gemini-3.7-flash", maxReasoningTokens: 640, maxOutputTokens: 640 }
 	            : { ...opts, maxOutputTokens: Math.min(1024, maxOutputTokensForCall) },
         });
 

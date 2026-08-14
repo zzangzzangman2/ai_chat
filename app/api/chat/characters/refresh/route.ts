@@ -574,7 +574,7 @@ export async function POST(req: Request) {
       "No markdown. No extra text.",
     ].join("\n");
 
-    const model = String(process.env.CHARACTER_TURN_MEMORY_MODEL || "gemini-3.6-flash").trim();
+    const model = String(process.env.CHARACTER_TURN_MEMORY_MODEL || "gemini-3.7-flash").trim();
     let parsed: any = null;
     let generationError = "";
     try {

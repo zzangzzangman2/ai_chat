@@ -9,6 +9,8 @@ export function getModelPricing(model: string): ModelPricing {
     // Gemini 2.5
     "gemini-2.5-pro": { inPer1M: 1.25, outPer1M: 10.0 },
     // Official on-demand Gemini API pricing (USD per 1M tokens).
+    // 3.7 Flash 공식 단가는 아직 확인 전이라 3.6과 동일하게 둔다(비용 표시는 근사치).
+    "gemini-3.7-flash": { inPer1M: 1.5, outPer1M: 7.5 },
     "gemini-3.6-flash": { inPer1M: 1.5, outPer1M: 7.5 },
     "gemini-3.5-flash": { inPer1M: 1.5, outPer1M: 9.0 },
     "gemini-3-flash-preview": { inPer1M: 0.3, outPer1M: 2.5 },

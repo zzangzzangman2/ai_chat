@@ -455,7 +455,8 @@ export function stripLeadingTitleForDisplay(text: string): string {
 export function getModelDisplayLabel(rawModel: string): string {
   const m = String(rawModel || "").replace(/^google\//i, "").trim().toLowerCase();
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) return "3.1-pro";
-  if (/^gemini-3\.6-flash(?:-|$)/i.test(m)) return "3.6-flash";
+  // 3.6에서 3.7로 올렸다. 기존 대화에 남은 3.6 값도 현재 Flash 뱃지로 표시한다.
+  if (/^gemini-3\.[67]-flash(?:-|$)/i.test(m)) return "3.7-flash";
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) return "3.5-flash";
   if (/^gemini-3-pro(?:-|$)/i.test(m)) return "3.1-pro";
   if (/^gemini-2\.5-flash(?:-|$)/i.test(m)) return "2.5-pro";
@@ -468,8 +469,8 @@ export function getModelBadge(rawModel: string): { label: string; bg: string; fg
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) {
     return { label: "3.1-pro", bg: "rgba(255, 75, 75, 0.22)", fg: "rgba(255, 165, 165, 0.98)" };
   }
-  if (/^gemini-3\.6-flash(?:-|$)/i.test(m)) {
-    return { label: "3.6-flash", bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };
+  if (/^gemini-3\.[67]-flash(?:-|$)/i.test(m)) {
+    return { label: "3.7-flash", bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };
   }
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) {
     return { label: "3.5-flash", bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };

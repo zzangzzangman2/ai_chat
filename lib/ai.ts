@@ -285,8 +285,11 @@ function buildThinkingConfig(model: string, maxReasoningTokens: number, maxOutpu
     return { thinkingLevel: level };
   }
   if (isGemini36FlashModel(model)) {
-    // Gemini 3.6 Flash supports medium/high; legacy zero/LOW maps to medium.
-    return { thinkingLevel: t >= 1024 ? "high" : "medium" };
+    // (2026-08-14) 현재 Flash는 3.7. 실측 결과 3.6과 지원 레벨이 다르다:
+    //   minimal → 400 미지원 / low → OK(1.4s, thoughts 0) / medium → OK(2.0s) / high → OK(2.2s)
+    // 3.6은 medium이 최저여서 LOW 슬라이더도 medium으로 올려 보냈지만,
+    // 3.7은 low를 받으므로 슬라이더 의미를 그대로 살린다. minimal만 피하면 된다.
+    return { thinkingLevel: t >= 1024 ? "high" : t >= 640 ? "medium" : "low" };
   }
   if (isGemini3Flash(model)) {
     // Gemini 3 Flash defaults to dynamic/high thinking if omitted.
@@ -2005,7 +2008,7 @@ ${cleanDialogue}`;
   const summaryModel = noDownshift
     ? String(opts.model || "").trim()
     : opts.model && opts.model.startsWith("gemini-3")
-      ? "gemini-3.6-flash"
+      ? "gemini-3.7-flash"
       : opts.model;
 
   const summaryMaxOutputTokens =
@@ -2197,7 +2200,7 @@ ${cleanDialogue}`;
   const summaryModel = noDownshift
     ? String(opts.model || "").trim()
     : opts.model && opts.model.startsWith("gemini-3")
-      ? "gemini-3.6-flash"
+      ? "gemini-3.7-flash"
       : opts.model;
 
   const summaryMaxOutputTokens =

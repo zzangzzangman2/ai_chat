@@ -65,7 +65,7 @@ function pickLongMemorySummaryModel() {
   if (forced) return forced;
 
   // Long-memory refresh always prefers fast/cheap summarization.
-  return "gemini-3.6-flash";
+  return "gemini-3.7-flash";
 }
 
 function pickLongMemorySummaryFallbackModel() {
@@ -498,7 +498,7 @@ async function detectCharactersFromWindow(params: {
         // 작은 cap을 주면 reasoning이 다 먹어버려 text가 빈 채로 MAX_TOKENS로 잘린다.
         // 추출 출력은 짧지만 reasoning 헤드룸을 충분히 확보해 둔다.
         //
-        // (2026-07-30 실측, 현재 모델 gemini-3.6-flash 기준) 아래 thinkingBudget /
+        // (2026-07-30 실측, 현재 모델 gemini-3.7-flash 기준) 아래 thinkingBudget /
         // maxReasoningTokens=128은 강제되지 않는다. buildThinkingConfig가 3.6-flash에서
         // 128(<1024)을 thinkingLevel="medium"으로 매핑하고(3.6의 최저 지원 레벨),
         // medium이 reasoning 2576~2581 토큰을 쓴다.
