@@ -3142,7 +3142,7 @@ const systemRaw = (cacheFriendlyLayout
     // 사용자 입력을 모드에 맞춰 전달한다.
     const userLine = continueMode ? "[이어쓰기]" : buildUserLineForMode(userText, personaName, renderMode);
 
-    // Gemini 3.6 Flash: use MID by default and reserve HIGH for heavy reasoning.
+    // Gemini Flash(현재 3.7): keep the slider level and reserve HIGH for heavy reasoning.
     // Raise MID to HIGH only when the *user's current request* asks for reasoning over the heavy context.
     // Otherwise long-memory/status/character-heavy chats would make MID behave like HIGH on every turn.
     if (
@@ -3170,9 +3170,16 @@ const systemRaw = (cacheFriendlyLayout
       if (/며칠|몇\s*주|일주일|다음날|시간\s*후|개월|년\s*후|스킵|경과/.test(userText)) intentHits.push("timeskip");
       if ((userText.match(/[가-힣A-Za-z0-9]{2,}/g) || []).length >= 12) intentHits.push("denseInput");
 
-      if (intentHits.length > 0 && contextHits.length >= 2) {
+      // (2026-08-14) denseInput은 승격 근거에서 제외한다.
+      // "입력에 단어가 12개 이상"이라는 뜻일 뿐 추론 요청이 아닌데, 대화가 길어지면
+      // contextHits(longMemory/longChat 등)는 항상 2개를 넘으므로 조금만 길게 써도
+      // 매 턴 HIGH로 올라갔다. 3.7 실측(동일 프롬프트): low 7.8s / medium 4.7s / high 15.3s
+      // (thoughts 0 / 142 / 1416) — 승격 한 번에 3배 느려지고, 그 지연이 요청 취소로 이어졌다.
+      // 주석에 적힌 원래 의도대로 "사용자가 실제로 추론을 요구할 때만" 올린다.
+      const reasoningIntents = intentHits.filter((hit) => hit !== "denseInput");
+      if (reasoningIntents.length > 0 && contextHits.length >= 2) {
         opts.maxReasoningTokens = 1024;
-        debugReasons.push(`reason:auto_flash_high(intent=${intentHits.join("+")};ctx=${contextHits.join("+")})`);
+        debugReasons.push(`reason:auto_flash_high(intent=${reasoningIntents.join("+")};ctx=${contextHits.join("+")})`);
       }
     }
 
