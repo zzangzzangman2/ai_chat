@@ -3512,14 +3512,21 @@ const systemRaw = (cacheFriendlyLayout
         presentCharacters: currentScenePresence,
       });
       if (remaining) {
+        const beforeFilter = text;
         const filtered = removeScenePresenceContradictionPassages({
           text,
           currentUserText: userText,
           presentCharacters: currentScenePresence,
         });
-        text = filtered.text;
+        // A continuity backstop may remove a local duplicate-arrival passage,
+        // but it must never erase the entire generated turn. If every passage
+        // matched, the scene detector is over-broad for this response; preserve
+        // the draft and let the narrower sentence gate handle local conflicts.
+        text = filtered.text.trim() ? filtered.text : beforeFilter;
         dbg({
-          tag: "send.scene_presence_guard.filtered",
+          tag: filtered.text.trim()
+            ? "send.scene_presence_guard.filtered"
+            : "send.scene_presence_guard.overfilter_preserved",
           chatId: cid,
           reqId,
           characterName: remaining.characterName,
@@ -3881,6 +3888,51 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           });
           raw = shortContinue.raw;
           combinedUsage = shortContinue.combinedUsage;
+
+          // Provider/SDK edge case: Gemini can report hundreds of candidate
+          // tokens while exposing no visible text. Retry only this failed turn
+          // once in buffered mode with thinking disabled; ordinary turns remain
+          // strict single-call streaming.
+          if (!String(raw || "").trim()) {
+            try {
+              const emptyRescue = await generateText({
+                system: systemMain,
+                user: [
+                  user,
+                  "",
+                  "# [EMPTY OUTPUT RECOVERY]",
+                  "- 직전 생성은 가시 본문이 없었다. 최신 사용자 입력 직후의 장면 반응을 반드시 1문장 이상 출력한다.",
+                  "- 원래 요구된 소설 형식, 분량, INFO/STATUS 형식을 유지한다.",
+                ].join("\n"),
+                opts: {
+                  ...opts,
+                  maxReasoningTokens: 0,
+                  maxOutputTokens: maxOutputTokensForCall,
+                  maxOutputTokensRequested: opts.maxOutputTokens,
+                  disableMaxTokensFallback: true,
+                  disableRefusalFallback: true,
+                },
+              });
+              const rescuedText = String(emptyRescue?.text || "").trim();
+              if (rescuedText) {
+                raw = rescuedText;
+                combinedUsage = mergeStreamUsage(combinedUsage, emptyRescue.usage);
+                safeEnqueue({ type: "delta", text: rescuedText });
+                dbg({
+                  tag: "send.stream.empty_output_recovered",
+                  chatId: cid,
+                  reqId,
+                  outputChars: rescuedText.length,
+                });
+              }
+            } catch (error) {
+              console.error("[chat/send] empty output recovery failed", {
+                chatId: cid,
+                reqId,
+                error: String((error as { message?: unknown })?.message || error),
+              });
+            }
+          }
 
           const recognitionChecked = await enforceRecognitionConsistency({
             text: raw,
