@@ -831,12 +831,19 @@ export async function generateText(params: {
     return typeof r?.text === "string" ? r.text : joined0;
   };
 
+  const extractOutputTokensQuick = (r: any): number => {
+    const u = r?.usageMetadata || r?.usage || {};
+    return Number(u?.candidatesTokenCount ?? u?.output_tokens ?? 0) || 0;
+  };
+
   const isLikelyEmptyResponse = (r: any): boolean => {
     const t = String(extractTextQuick(r) || "");
-    // candidatesTokenCount can be positive even when the response contains no
-    // visible text (thought/signature-only candidate or a blocked candidate).
-    // The UI cannot render token metadata, so visible text is the authority.
-    return !t.trim();
+    if (t.trim()) return false;
+    const out = extractOutputTokensQuick(r);
+    const noCandidates = !Array.isArray(r?.candidates) || r.candidates.length === 0;
+    // Do not issue another billable request when the provider reports a
+    // completed candidate. Local route guards handle their own over-filtering.
+    return out === 0 || noCandidates;
   };
 
   const modelIs3Pro = isGemini3Pro(opts.model);
@@ -889,7 +896,11 @@ export async function generateText(params: {
 
       if (isLikelyEmptyResponse(r)) {
         attempts.push({ label, ok: false, ms: Date.now() - t1, err: "empty_output" });
-        continue;
+        // Empty/blocked responses can still be billable. A successful provider
+        // response ends this attempt; only a thrown config error may fall
+        // through to a compatibility request shape.
+        resp = r;
+        break;
       }
 
       resp = r;
@@ -976,13 +987,13 @@ export async function generateText(params: {
   // 모델이 thinking에 maxOutputTokens를 전부 써버리면 outputTokens=0이 되며 화면엔 빈 응답이 나타난다.
   // 이 경우 1회만 'output 자리'를 확보해 재시도한다.
   const isG3 = isGemini3(opts.model);
+  const fr = String(finalFinishReason || "").toUpperCase();
   const isEmptyG3 = isG3 && !finalText.trim();
-  const isEmptyMax = isEmptyG3;
+  const isEmptyMax =
+    isEmptyG3 &&
+    (fr.includes("MAX") || Number(finalUsage.outputTokens || 0) === 0 || !Array.isArray(resp?.candidates) || resp.candidates.length === 0);
 
-  // Empty visible output is never a usable chat result. Keep the exceptional
-  // one-time rescue on by default; set AI_EMPTY_OUTPUT_RESCUE=0 only for
-  // provider diagnostics where the raw empty response must be observed.
-  const emptyOutputRescueEnabled = String(process.env.AI_EMPTY_OUTPUT_RESCUE || "1").trim() !== "0";
+  const emptyOutputRescueEnabled = String(process.env.AI_EMPTY_OUTPUT_RESCUE || "").trim() === "1";
   if (emptyOutputRescueEnabled && isEmptyMax && !modelIs3Pro) {
     // Gemini 3 Pro can sometimes spend the entire budget on thinking and return empty visible text.
     // Do ONE rescue call on the SAME model to secure visible output.

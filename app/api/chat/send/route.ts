@@ -1324,6 +1324,10 @@ export async function POST(req: Request) {
         return Math.max(minReasoning, Math.min(8192, Math.floor(v)));
       })(),
       signal: generationAbortController.signal,
+      // ONE_SHOT is also a billing contract: internal max-token/refusal
+      // fallbacks must not silently issue another provider request.
+      disableMaxTokensFallback: ONE_SHOT,
+      disableRefusalFallback: ONE_SHOT,
     };
 
     try {
@@ -2241,6 +2245,7 @@ ${body}`.trim();
         groundedFactIds: groundedEpistemicFactIds,
       });
     const recoverAfterOverfilter = (text: unknown) => {
+      const original = String(text || "");
       const epistemic = sanitizeGeneratedFacts(text);
       const legalStatus = removeUnsupportedLegalStatusClaims({
         text: epistemic.text,
@@ -2248,7 +2253,11 @@ ${body}`.trim();
         trustedNarrationTexts: trustedLegalStatusNarrationTexts,
         identities: legalStatusIdentities,
       });
-      return legalStatus.text;
+      // The guards may remove unsupported local passages, but a false-positive
+      // match must never erase an otherwise completed provider response. Keep
+      // the single-call draft only when the combined filters would return no
+      // visible text at all; partial redactions remain fully enforced.
+      return String(legalStatus.text || "").trim() ? legalStatus.text : original;
     };
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
@@ -3297,7 +3306,7 @@ const systemRaw = (cacheFriendlyLayout
 
       let text = args.text;
       let usage = args.usage;
-      try {
+      if (!ONE_SHOT) try {
         const repairUser = [
           user,
           "",
@@ -3393,7 +3402,7 @@ const systemRaw = (cacheFriendlyLayout
 
       let text = args.text;
       let usage = args.usage;
-      try {
+      if (!ONE_SHOT) try {
         const repairUser = [
           user,
           "",
@@ -3467,7 +3476,7 @@ const systemRaw = (cacheFriendlyLayout
 
       let text = args.text;
       let usage = args.usage;
-      if (args.allowRepair !== false) {
+      if (args.allowRepair !== false && !ONE_SHOT) {
         try {
           const repairUser = [
             user,
@@ -3888,51 +3897,6 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           });
           raw = shortContinue.raw;
           combinedUsage = shortContinue.combinedUsage;
-
-          // Provider/SDK edge case: Gemini can report hundreds of candidate
-          // tokens while exposing no visible text. Retry only this failed turn
-          // once in buffered mode with thinking disabled; ordinary turns remain
-          // strict single-call streaming.
-          if (!String(raw || "").trim()) {
-            try {
-              const emptyRescue = await generateText({
-                system: systemMain,
-                user: [
-                  user,
-                  "",
-                  "# [EMPTY OUTPUT RECOVERY]",
-                  "- 직전 생성은 가시 본문이 없었다. 최신 사용자 입력 직후의 장면 반응을 반드시 1문장 이상 출력한다.",
-                  "- 원래 요구된 소설 형식, 분량, INFO/STATUS 형식을 유지한다.",
-                ].join("\n"),
-                opts: {
-                  ...opts,
-                  maxReasoningTokens: 0,
-                  maxOutputTokens: maxOutputTokensForCall,
-                  maxOutputTokensRequested: opts.maxOutputTokens,
-                  disableMaxTokensFallback: true,
-                  disableRefusalFallback: true,
-                },
-              });
-              const rescuedText = String(emptyRescue?.text || "").trim();
-              if (rescuedText) {
-                raw = rescuedText;
-                combinedUsage = mergeStreamUsage(combinedUsage, emptyRescue.usage);
-                safeEnqueue({ type: "delta", text: rescuedText });
-                dbg({
-                  tag: "send.stream.empty_output_recovered",
-                  chatId: cid,
-                  reqId,
-                  outputChars: rescuedText.length,
-                });
-              }
-            } catch (error) {
-              console.error("[chat/send] empty output recovery failed", {
-                chatId: cid,
-                reqId,
-                error: String((error as { message?: unknown })?.message || error),
-              });
-            }
-          }
 
           const recognitionChecked = await enforceRecognitionConsistency({
             text: raw,
@@ -4560,7 +4524,7 @@ try {
       ""
   ).toUpperCase();
   const _bodyShort = String(assistantText || "").trim().length < 100;
-  if (_finishStr === "MAX_TOKENS" && _bodyShort) {
+  if (!ONE_SHOT && _finishStr === "MAX_TOKENS" && _bodyShort) {
     const _origOut = Number((opts as any)?.maxOutputTokens || 1200);
     const _origReason = Number((opts as any)?.maxReasoningTokens || 768);
     const _expandedOut = Math.min(5000, Math.max(2000, Math.floor(_origOut * 2)));
@@ -4616,6 +4580,7 @@ try {
 try {
   const refusalFallbackEnabled = String(process.env.AI_REFUSAL_FALLBACK || "0").trim() === "1";
   if (
+    !ONE_SHOT &&
     refusalFallbackEnabled &&
     String(opts.model || "").trim() !== REFUSAL_FALLBACK_MODEL &&
     isRefusalText(assistantText)
