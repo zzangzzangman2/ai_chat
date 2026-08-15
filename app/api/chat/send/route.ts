@@ -1887,6 +1887,40 @@ ${body}`.trim();
       .slice(-4)
       .map((m: any) => String(m?.content || ""))
       .join("\n");
+
+    // (2026-08-15) 사용자 호명 창 — 자동 퇴장/자동 포커스 두 경로가 공유한다.
+    //
+    // 기존에는 두 곳이 각자 "현재 입력 + 직전 사용자 발화 3개"를 썼다. 그 창은
+    // "지금 상대하는 인물"의 근사치로 쓰기엔 너무 좁다. 사용자가 이름 없이 같은 상대를
+    // 계속 이어가면서 중간에 다른 인물을 한 번씩 호명하면, 정작 진행 중인 상대가
+    // "최근에 안 불린 인물"로 분류된다.
+    //
+    // 실사고(2026-08-15): 사용자가 카리나를 마지막으로 친 건 380턴이고 이후 384/386/388/394턴은
+    // 전부 이름 없는 연속 동작이었다. 그 사이 390턴에 '윈터'(성대모사 지시), 392턴에 '이서연'
+    // (전화 대사 지시)이 곁가지로 불렸다. 3턴 창에서는 호명 집합이 {윈터, 이서연}이 되어
+    //   - dynamic_character_context: 카리나가 포커스 폴백에서 제외
+    //   - stickyOverusedNames: 카리나가 퇴장 지시 대상(최근 30턴 97% 등장 / 누적 60)
+    // 두 경로 모두에서 카리나가 장면 밖으로 밀려났고, 395턴 응답에서는 현장 인물 명단에서
+    // 아예 사라진 채 다른 인물로 행위 대상이 바뀌었다.
+    //
+    // 8턴이면 위 사례의 380턴이 창에 들어온다. 창을 넓히면 오래전 단역이 다시 후보가 될
+    // 여지는 커지지만, 오래 눌러앉은 단역은 stickyOverusedNames의 누적/비율 기준이 따로
+    // 잡아낸다(그 감지기는 TDZ 버그가 고쳐진 뒤로 실제 동작 중이다).
+    //
+    // NOTE: tail은 keepUserTurns(7)만 담으므로 8턴을 보려면 all에서 직접 세야 한다.
+    const USER_MENTION_TURN_WINDOW = (() => {
+      const raw = Number(process.env.AI_USER_MENTION_TURN_WINDOW ?? 8);
+      return Number.isFinite(raw) ? Math.max(1, Math.min(30, Math.floor(raw))) : 8;
+    })();
+    const recentUserMentionText = (() => {
+      const parts: string[] = [String(userText || "")];
+      for (let i = all.length - 1; i >= 0 && parts.length <= USER_MENTION_TURN_WINDOW; i--) {
+        const m: any = all[i];
+        if (String(m?.role || "") !== "user") continue;
+        parts.push(String(m?.content || ""));
+      }
+      return parts.join("\n");
+    })();
     // The active-state ledger must see the full enabled roster, including the
     // persona. The narrower NPC-only list remains for identity canon/world
     // direction so a large cast cannot bloat those unrelated prompt blocks.
@@ -1960,7 +1994,7 @@ ${body}`.trim();
           .filter((name) => name.length >= 2);
         if (!roster.length) return [];
 
-        const userTurns = [userText, ...tail.filter((m: any) => String(m?.role || "") === "user").slice(-3).map((m: any) => String(m?.content || ""))].join("\n");
+        const userTurns = recentUserMentionText;
 
         // 판정 기준은 "최근 몇 턴 연속"이 아니라 "얼마나 오래 눌러앉았는가"다.
         // 최근 5턴만 보면 현재 장면의 주역까지 똑같이 걸린다(실측: 곁다리 논평역 85턴 연속과
@@ -1976,10 +2010,44 @@ ${body}`.trim();
         // 여기서 참조하면 TDZ ReferenceError가 나고 아래 catch가 삼켜서
         // 감지기가 항상 빈 배열을 반환한다(실제로 그렇게 죽어 있었다).
         // preset은 이미 로드돼 있으므로 원본 필드를 직접 쓴다.
-        const presetCharacterName = String((preset as any)?.characterName || "").trim();
+        // (2026-08-15) preset.characterName은 신뢰할 수 없다.
+        // 실측: 이 컬럼에 캐릭터 이름이 아니라 프리셋 제목이 들어있는 방이 있다
+        // (예: "아일릿 신입 매니저 데뷔일지"). 그러면 아래 주역 보호 비교가 로스터의
+        // 어떤 이름과도 일치하지 않아 보호받는 인물이 0명이 된다.
+        // 로스터에 실제로 존재하는 이름일 때만 주역으로 인정한다.
+        const rawPresetCharacterName = String((preset as any)?.characterName || "").trim();
+        const presetCharacterName = roster.includes(rawPresetCharacterName)
+          ? rawPresetCharacterName
+          : "";
+
+        // 프리셋이 주역을 알려주지 못하는 방을 위한 보완 신호:
+        // "최근 사용자가 가장 자주 호명한 인물"을 주역으로 보고 퇴장 대상에서 제외한다.
+        // 전체 대화 누적으로 세면 안 된다 — 장면이 바뀐 뒤에도 옛 주역이 1위로 남는다
+        // (실측: 전체 기준 1위는 이미 퇴장한 인물이었고, 최근 30턴 기준 1위가 현재 주역이었다).
+        const LEAD_USER_MENTION_WINDOW = 30;
+        const leadNames = (() => {
+          const recentUserTexts: string[] = [];
+          for (let i = all.length - 1; i >= 0 && recentUserTexts.length < LEAD_USER_MENTION_WINDOW; i--) {
+            const m: any = all[i];
+            if (String(m?.role || "") !== "user") continue;
+            recentUserTexts.push(String(m?.content || ""));
+          }
+          const counted = roster
+            .map((name) => ({
+              name,
+              count: recentUserTexts.filter((text) => text.includes(name)).length,
+            }))
+            .filter((row) => row.count >= 2)
+            .sort((a, b) => b.count - a.count);
+          if (!counted.length) return new Set<string>();
+          const top = counted[0].count;
+          return new Set(counted.filter((row) => row.count === top).map((row) => row.name));
+        })();
+
         return roster.filter((name) => {
           if (userTurns.includes(name)) return false; // 사용자가 최근에 부른 인물은 제외
           if (name === personaNameFinal || (presetCharacterName && name === presetCharacterName)) return false; // 주역/페르소나 보호
+          if (leadNames.has(name)) return false; // 최근 사용자가 가장 자주 부른 인물(주역) 보호
           const recentHits = windowTexts.filter((text) => text.includes(name)).length;
           if (recentHits / windowTexts.length < STICKY_MIN_RATIO) return false; // 이미 물러난 인물은 대상 아님
           const totalHits = assistantTexts.filter((text) => text.includes(name)).length;
@@ -2059,13 +2127,11 @@ ${body}`.trim();
         // 이름 생략 시의 자동 포커스를 "사용자가 실제로 부른 인물"로 제한해,
         // 한 번 등장한 단역이 자기강화 루프로 매 턴 눌러앉는 것을 막는다.
         //
-        // 창(window)은 좁게 잡는다. 10턴까지 보면 오래 전에 한 번 부른 인물이 계속
-        // 후보로 남아 필터가 무력해진다(실사고: 최근 10턴 중 1회 호명된 논평 역 NPC가
-        // 126턴 연속 등장). 현재 입력 + 직전 사용자 발화 3개면 "지금 상대하는 인물"에 충분하다.
-        userMentionText: [
-          userText,
-          ...tail.filter((m: any) => m?.role === "user").slice(-3).map((m: any) => String(m?.content || "")),
-        ].join("\n"),
+        // (2026-08-15) 창을 3턴에서 USER_MENTION_TURN_WINDOW(기본 8턴)로 넓히고
+        // stickyOverusedNames와 같은 텍스트를 쓰도록 통일했다. 3턴은 "이름 없이 같은 상대를
+        // 이어가는 중에 다른 인물을 한 번 호명하는" 패턴에서 진행 중인 상대를 탈락시켰다.
+        // 자세한 경위는 recentUserMentionText 정의부 주석 참고.
+        userMentionText: recentUserMentionText,
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
         graph: relationshipGraph,
       });
