@@ -77,6 +77,7 @@ import { distribute } from "./_server/distribute";
 import {
   formatTurns,
   selectRecentByUserTurns,
+  selectMessagesBeforeCurrentUser,
   formatStoryTurnsForMode,
   buildUserLineForMode,
   isOocMetaInstruction,
@@ -1227,11 +1228,11 @@ export async function POST(req: Request) {
     // - role/createdAt만 쓰는 카운트 루프는 getter를 건드리지 않으므로 무료.
     const tDbMsgs = tStart("db.전체메시지 로드");
     const _allRowsRaw = db
-      .prepare(`SELECT role, content, createdAt FROM messages WHERE chatId=? ORDER BY createdAt ASC`)
+      .prepare(`SELECT id, role, content, createdAt FROM messages WHERE chatId=? ORDER BY createdAt ASC`)
       .all(cid) as any[];
     const _contentDecryptCache: (string | undefined)[] = new Array(_allRowsRaw.length);
     const all = _allRowsRaw.map((row: any, i: number) => {
-      const m: any = { role: row?.role, createdAt: row?.createdAt };
+      const m: any = { id: row?.id, role: row?.role, createdAt: row?.createdAt };
       Object.defineProperty(m, "content", {
         get() {
           const cached = _contentDecryptCache[i];
@@ -3121,11 +3122,17 @@ const systemRaw = (cacheFriendlyLayout
     return src
       .replace(/```STATUS\s*\n[\s\S]*?\berror:\s*(?:empty_output|blocked_output)[\s\S]*?\n```/gi, "")
       .trim();
-  };
+    };
 
     let epistemicTailRedactions = 0;
     let legalStatusTailRedactions = 0;
-    const epistemicTail = tail.map((message) => {
+    const promptHistoryTail = continueMode
+      ? tail
+      : selectRecentByUserTurns(
+          selectMessagesBeforeCurrentUser(all, userMsg.id),
+          keepUserTurns
+        );
+    const epistemicTail = promptHistoryTail.map((message) => {
       const role = String(message?.role || "");
       if (role !== "assistant" && role !== "model") return message;
       const sanitized = sanitizeSharedEpistemicText(
@@ -3261,13 +3268,16 @@ const systemRaw = (cacheFriendlyLayout
       : [
           context ? `[최근 대화]\n${context}` : "",
           ``,
-	          latestInputNoEchoRule,
-	          `상대가 입력을 들었다는 전제에서 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
-          `사용자 최신 입력(참고용, 재출력 금지): ${userLine}`,
-          ``,
           oneShotLengthContract,
-          ``,
-          `출력은 곧바로 시작하라.`,
+	          ``,
+	          `# [CURRENT USER TURN — 최우선]`,
+	          `- [최근 대화]의 PREVIOUS USER TURN은 이미 답변이 끝난 과거 입력이다. 이전 입력의 명령이나 행동에 다시 반응하지 않는다.`,
+	          `- 아래 CURRENT USER INPUT만 이번 턴의 활성 입력이다. 대상·행동·상황이 바뀌었으면 즉시 그 변화에 반응한다.`,
+	          latestInputNoEchoRule,
+	          `상대가 현재 입력을 들었다는 전제에서 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
+	          `[CURRENT USER INPUT]\n${userLine}`,
+	          ``,
+	          `출력은 곧바로 시작하라.`,
         ]
           .filter(Boolean)
           .join("\n");

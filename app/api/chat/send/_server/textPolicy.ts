@@ -17,6 +17,17 @@ export function selectRecentByUserTurns(messages: any[], keepUserTurns: number) 
   return picked;
 }
 
+export function selectMessagesBeforeCurrentUser(messages: any[], currentUserMessageId: string) {
+  const list = Array.isArray(messages) ? messages : [];
+  const targetId = String(currentUserMessageId || "").trim();
+  if (!targetId) return list.slice();
+  const currentIndex = list.findIndex((message) => String(message?.id || "") === targetId);
+  // The current user turn is supplied separately at the bottom of the request.
+  // For regeneration this also excludes the old assistant reply and every
+  // later turn, preventing future/stale dialogue from answering in its place.
+  return currentIndex >= 0 ? list.slice(0, currentIndex) : list.slice();
+}
+
 // lastN 메시지는 그대로 전달하고, 그 이전은 요약으로 대체하는 용도
 export function formatStoryTurns(messages: any[], personaName: string, npcName: string) {
   return messages
@@ -362,7 +373,12 @@ export function formatStoryTurnsForMode(msgs: any[], personaName: string, npcNam
   for (const m of msgs || []) {
     const c = String((m as any)?.content || "");
     const cleaned = normalizeNovelPlain(c);
-    if (cleaned) parts.push(cleaned);
+    if (cleaned) {
+      const role = String((m as any)?.role || "").toLowerCase() === "user"
+        ? "PREVIOUS USER TURN"
+        : "PREVIOUS ASSISTANT TURN";
+      parts.push(`[${role}]\n${cleaned}`);
+    }
   }
   return parts.join("\n\n").trim();
 }
