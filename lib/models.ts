@@ -95,6 +95,49 @@ export function isGemini3Model(model: string): boolean {
   return /^gemini-3(?:[.-]|$)/i.test(normalizeModelId(model));
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// 추론(사고) 프리셋 — UI 버튼과 서버 매핑의 단일 출처
+// ──────────────────────────────────────────────────────────────────────
+//
+// (2026-08-15) 기존에는 UI(textUtils.getReasoningPresets)와 서버(ai.buildThinkingConfig)가
+// 각자 매핑 테이블을 들고 있었고, 그 사이에 낀 값이 서로 다르게 해석됐다.
+// 실측: 3.1 Pro(LOW=384)에서 3.7 Flash로 모델만 바꾼 방에 384가 그대로 남았는데
+//   - UI  : 최근접 반올림 → |0-384|=384 vs |640-384|=256 → "MID"로 표시
+//   - 서버: 하한 밴딩 → t>=256 → thinkingLevel "low"로 전송
+// 화면은 MID(medium)라고 하는데 실제로는 low가 나가고 reasoningTokens=0으로 돌았다.
+// 프리셋 표를 여기 한 곳에 두고 UI/서버가 같이 참조한다.
+export type ReasoningPresetLevel = "zero" | "low" | "middle" | "high";
+
+export function reasoningPresetsForModel(model: string): Record<ReasoningPresetLevel, number> {
+  if (isGemini3ProModel(model)) {
+    // zero 슬롯은 UI에서 FAST로 노출되며 공식 지원 레벨인 low에 매핑된다.
+    return { zero: 0, low: 384, middle: 768, high: 1536 };
+  }
+  // NOTE: isGemini36FlashModel()은 legacy 상수명이라 현재 GEMINI_3_FLASH_MODEL(=3.7)에
+  // 매치된다. 여기서는 "실제 3.6"만 걸러야 하므로 버전을 명시적으로 검사한다.
+  // (기존 UI 표와 동일하게 유지 — 3.7 Flash는 아래 3-flash 분기로 간다.)
+  if (/^gemini-3\.6-flash(?:-|$)/i.test(normalizeModelId(model))) {
+    return { zero: 640, low: 640, middle: 640, high: 1024 };
+  }
+  if (isGemini3FlashModel(model)) {
+    // LOW는 latency 우선 minimal, MID/HIGH는 thinkingLevel로 매핑한다.
+    return { zero: 0, low: 0, middle: 640, high: 1024 };
+  }
+  // gemini-2.5-pro
+  return { zero: 0, low: 384, middle: 768, high: 2048 };
+}
+
+/**
+ * 해당 모델의 UI 버튼으로 실제 만들 수 있는 값인지 검사한다.
+ * 모델 교체 시 이전 모델의 값이 "범위 안"이라는 이유만으로 살아남아
+ * 어느 버튼에도 대응하지 않는 고아 값이 되는 것을 막는 용도.
+ */
+export function isReasoningPresetValue(model: string, tokens: number): boolean {
+  const t = Number(tokens);
+  if (!Number.isFinite(t)) return false;
+  return Object.values(reasoningPresetsForModel(model)).includes(Math.floor(t));
+}
+
 export function isGemini25ProModel(model: string): boolean {
   const m = normalizeModelId(model);
   return m === GEMINI_25_PRO_MODEL || m.startsWith(`${GEMINI_25_PRO_MODEL}-`);

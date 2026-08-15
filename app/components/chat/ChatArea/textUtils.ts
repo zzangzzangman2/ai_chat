@@ -1,3 +1,5 @@
+import { isReasoningPresetValue, reasoningPresetsForModel } from "@/lib/models";
+
 // Remove explicit end markers ONLY.
 //
 // IMPORTANT:
@@ -386,38 +388,46 @@ export function getReasoningLevelOptions(model: string): ReasoningLevel[] {
 
 export function getReasoningPresets(model: string): Record<ReasoningLevel, number> {
   // UI choices are stored as the numeric maxReasoningTokens setting.
-  // UX 기준: 모두 LOW가 기본이며, 모델별로 기본 LOW 토큰만 다르게 둔다.
-  if (isGemini3ProFamily(model)) {
-    // The zero slot is shown as FAST and maps to the officially supported low level.
-    return { zero: 0, low: 384, middle: 768, high: 1536 };
-  }
-  if (/^gemini-3\.6-flash(?:-|$)/i.test(model)) {
-    // Gemini 3.6 Flash officially exposes medium/high thinking levels.
-    return { zero: 640, low: 640, middle: 640, high: 1024 };
-  }
-  if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(model)) {
-    // Gemini 3 Flash: LOW는 latency 우선 minimal, MID/HIGH는 thinkingLevel로 매핑한다.
-    return { zero: 0, low: 0, middle: 640, high: 1024 };
-  }
-  // gemini-2.5-pro
-  return { zero: 0, low: 384, middle: 768, high: 2048 };
+  // (2026-08-15) 표는 lib/models.ts로 옮겨 서버 매핑과 단일 출처를 공유한다.
+  return reasoningPresetsForModel(model);
+}
+
+export function isReasoningPresetTokens(model: string, tokens: number): boolean {
+  return isReasoningPresetValue(model, tokens);
 }
 
 export function inferReasoningLevel(model: string, tokens: number): ReasoningLevel {
   const p = getReasoningPresets(model);
   const t = Number(tokens) || 0;
   const options = getReasoningLevelOptions(model);
+
+  // (2026-08-15) 최근접 반올림 → 하한 밴딩(floor)으로 바꾼다.
+  // 서버(lib/ai.ts buildThinkingConfig)는 "t 이하의 가장 높은 구간"을 고르는
+  // 임계값 방식인데 여기만 최근접이라, 프리셋 사이에 낀 값에서 UI가 서버보다
+  // 높은 단계를 표시했다. 예) 3.7 Flash에 384가 남아 있으면
+  //   최근접 → MID(640에 더 가까움) / 서버 → low.
+  // 이제 프리셋 이하의 최대값을 고르므로 UI가 실제보다 높게 보이지 않는다.
   const entries: [ReasoningLevel, number][] = options.map((k) => [k, p[k]]);
-  let best: ReasoningLevel = options.includes("middle") ? "middle" : "low";
-  let bestDist = Infinity;
+  let best: ReasoningLevel | null = null;
+  let bestValue = -Infinity;
   for (const [k, v] of entries) {
-    const d = Math.abs(v - t);
-    if (d < bestDist) {
-      bestDist = d;
+    if (v <= t && v >= bestValue) {
+      bestValue = v;
       best = k;
     }
   }
-  return best;
+  if (best) return best;
+
+  // 모든 프리셋보다 작은 값이면 가장 낮은 단계로 본다.
+  let lowest: ReasoningLevel = options[0];
+  let lowestValue = Infinity;
+  for (const [k, v] of entries) {
+    if (v < lowestValue) {
+      lowestValue = v;
+      lowest = k;
+    }
+  }
+  return lowest;
 }
 
 export function stripLeadingTitleForDisplay(text: string): string {

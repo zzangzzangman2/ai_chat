@@ -130,6 +130,32 @@ function deterministicMemorySnippet(value: unknown, maxChars: number) {
   return `${head.trim()}…`;
 }
 
+// (2026-08-15) 어시스턴트 턴의 메타(INFO/STATUS) 코드블록에는 작성자 템플릿에 따라
+// '인수인계' 같은 한 줄 요약이 이미 들어 있는 경우가 많다.
+// 서사 본문 앞부분을 자른 조각보다 이 줄이 그 턴의 사건을 훨씬 정확히 담으므로,
+// 결정론적 폴백에서는 이 줄을 최우선으로 쓴다.
+// (deterministicMemorySnippet은 코드블록을 제거하므로 그 전에 뽑아내야 한다.)
+const HANDOFF_LINE_KEYS = ["인수인계", "요약", "핸드오프", "handoff"];
+
+function extractMetaHandoffLine(assistantText: unknown): string {
+  const src = String(assistantText || "");
+  if (!src.includes("```")) return "";
+  const fences = src.match(/```[\s\S]*?```/g) || [];
+  for (const key of HANDOFF_LINE_KEYS) {
+    for (const fence of fences) {
+      for (const line of fence.split(/\r?\n/)) {
+        const idx = line.indexOf(key);
+        if (idx < 0) continue;
+        const after = line.slice(idx + key.length).replace(/^\s*[:：]\s*/, "");
+        const value = after.replace(/\s+/g, " ").trim();
+        // "인수인계:" 뒤가 비어 있거나 라벨만 있는 줄은 건너뛴다.
+        if (value.length >= 10) return value;
+      }
+    }
+  }
+  return "";
+}
+
 function buildDeterministicMemorySection(params: {
   turns: Array<{ role: string; content: string }>;
   startTurn: number;
@@ -156,7 +182,21 @@ function buildDeterministicMemorySection(params: {
     .map((turn, index) => {
       // 모델 출력이 사용자 지문·설정 정정을 거슬렀을 수 있으므로,
       // 결정론적 최후 보존본은 해당 턴의 사용자 원문을 우선한다.
-      const snippet = deterministicMemorySnippet(turn.userText || turn.assistantText, perTurn);
+      //
+      // (2026-08-15) 다만 사용자 원문"만" 남기면 그 구간에 실제로 무슨 일이 벌어졌는지가
+      // 기억에서 통째로 사라진다. 실측: 187-195턴이 연속 폴백으로 떨어지면서
+      // "지젤과 통화가 연결됨 / 카리나가 윈터 목소리를 흉내 냄" 같은 사실이 장기기억에
+      // 한 줄도 남지 않았고, 이후 턴이 직전 장면과 모순되는 응답을 냈다.
+      // 사용자 원문 우선순위는 그대로 두되, 어시스턴트 서사를 뒤에 함께 보존한다.
+      const userSnippet = deterministicMemorySnippet(turn.userText, perTurn);
+      // 메타 블록의 인수인계 줄이 있으면 그것을, 없으면 서사 본문 앞부분을 쓴다.
+      // 인수인계 줄은 이미 압축된 한 줄이라 중간에서 잘리면 사건이 통째로 날아간다.
+      // 원문 앞부분(60자)보다 여유를 줘서 보통은 문장이 끝까지 남게 한다.
+      const handoff = extractMetaHandoffLine(turn.assistantText);
+      const assistantSnippet = handoff
+        ? deterministicMemorySnippet(handoff, Math.max(120, perTurn))
+        : deterministicMemorySnippet(turn.assistantText, Math.max(60, perTurn));
+      const snippet = [userSnippet, assistantSnippet].filter(Boolean).join(" / ");
       return snippet ? `${params.startTurn + index}턴: ${snippet}` : "";
     })
     .filter(Boolean);
@@ -874,6 +914,22 @@ function collectLikelyKoreanNames(text: string) {
   return out;
 }
 
+// (2026-08-15) 이름 드리프트는 "저장 차단" 사유에서 제외한다.
+// collectLikelyKoreanNames는 [성씨 1자] + [가-힣 2자] 휴리스틱이라
+// '강원도/고개를/강제로/서늘한' 같은 평범한 3음절 어절을 인명으로 오탐한다.
+// (NON_NAME_KR3 예외 목록은 24개뿐이라 사실상 방어가 되지 않는다.)
+// 실측(chat_memory_blocks 137개): 30개(21.9%)가 결정론적 폴백으로 떨어졌고
+// 그 사유가 100% unknown_name_in_summary였다. 같은 블록의 quality.ok는 전부 true였다.
+// 폴백은 그 구간의 서사를 통째로 잃게 만들므로, 오탐 1회의 비용이
+// "요약에 낯선 이름이 섞일 위험"보다 훨씬 비싸다.
+// 분석 결과는 meta/응답에 그대로 남겨 추적하되, 저장은 막지 않는다.
+const NAME_DRIFT_BLOCKS_SAVE =
+  String(process.env.LONG_MEMORY_NAME_DRIFT_BLOCKS_SAVE ?? "0").trim() === "1";
+
+function nameDriftBlocksSave(drift: NameDriftQuality): boolean {
+  return NAME_DRIFT_BLOCKS_SAVE && !drift.ok;
+}
+
 function analyzeNameDrift(body: string, sourceNames: Set<string>, allowNames: string[] = []): NameDriftQuality {
   const allow = new Set<string>();
   for (const n of sourceNames) allow.add(n);
@@ -1452,7 +1508,7 @@ export async function POST(req: Request) {
     });
 
     // 2) retry with stricter prompt and without model downshift (more reliable, higher cost, rare)
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
+    if (!q.ok || nameDriftBlocksSave(ndrift) || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -1488,7 +1544,7 @@ export async function POST(req: Request) {
     }
 
     // 3) last-resort: fallback summarizer (body-only) then wrap into a section.
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
+    if (!q.ok || nameDriftBlocksSave(ndrift) || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       const retryOpts = {
         ...llmOpts,
         noDownshift: true,
@@ -1524,7 +1580,7 @@ export async function POST(req: Request) {
 
     // 4) optional rescue pass: only when LONG_MEMORY_SUMMARY_FALLBACK_MODEL is explicitly set.
     // Default policy is flash-only (no automatic model bounce).
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
+    if (!q.ok || nameDriftBlocksSave(ndrift) || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       const fallbackModel = pickLongMemorySummaryFallbackModel();
       if (fallbackModel) {
         const rescueOpts = {
@@ -1570,7 +1626,7 @@ export async function POST(req: Request) {
     // 막히지 않도록, 실제 저장된 assistant 원문에서 결정론적 보존 요약을 만든다.
     let deterministicFallbackUsed = false;
     let deterministicFallbackReason = "";
-    if (!q.ok || !ndrift.ok || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
+    if (!q.ok || nameDriftBlocksSave(ndrift) || !relationshipDrift.ok || !identityDrift.ok || !canonicalFactDrift.ok) {
       deterministicFallbackReason = [
         !q.ok ? `quality:${q.reason}` : "",
         !ndrift.ok ? `name:${ndrift.reason}` : "",
@@ -1628,7 +1684,7 @@ export async function POST(req: Request) {
       });
     }
 
-    if (!q.ok || !ndrift.ok) {
+    if (!q.ok || nameDriftBlocksSave(ndrift)) {
       if (!allowBadOutputSave) {
         // Do NOT overwrite stored memory with garbage.
         return NextResponse.json({

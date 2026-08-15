@@ -26,6 +26,7 @@ import {
   getReasoningPresets,
   inferReasoningLevel,
   isAssistantLikeRole,
+  isReasoningPresetTokens,
   isLikelyStarLabel,
   maybeUnescapeJsonEscapes,
   normalizeStarVariants,
@@ -6590,22 +6591,30 @@ const insertNarrationMarkers = useCallback(() => {
                             const modelName = String(settings.model || "");
                             const isG3 = /^gemini-3(?:\.|-)/i.test(modelName);
                             const isG3Pro = /gemini-3(?:\.\d+)?-pro/i.test(modelName);
+                            const actualReasoning = Number(settings.maxReasoningTokens ?? presets[level]);
+
+                            // (2026-08-15) 표시 레벨은 저장값에서 직접 계산한다.
+                            // 이전에는 반올림된 `level`에서 역산해서, 저장값이 384인데도
+                            // "MID (thinking: medium)"라고 적혀 있었다. 실제 서버 전송은 low였다.
+                            // 서버(lib/ai.ts buildThinkingConfig)와 같은 임계값을 쓴다.
                             const g3Level = isG3Pro
-                              ? level === "zero"
-                                ? "low"
-                                : level === "high"
-                                  ? "high"
-                                  : level === "middle"
-                                    ? "medium"
-                                    : "low"
-                              : level === "high"
+                              ? actualReasoning >= 1280
                                 ? "high"
-                                : level === "middle"
+                                : "medium"
+                              : actualReasoning >= 1024
+                                ? "high"
+                                : actualReasoning >= 640
                                   ? "medium"
-                                  : "minimal";
-                            const actualReasoning = Number(settings.maxReasoningTokens || presets[level]);
-                            return `현재: ${label[level]}${
-                              isG3 ? ` (thinking: ${g3Level})` : ` (${actualReasoning} tokens)`
+                                  : "low";
+
+                            // 어느 버튼으로도 만들 수 없는 값이면(예: 모델 교체 후 남은 값)
+                            // 버튼 상태만 보고 오해하지 않도록 실제 저장값을 함께 노출한다.
+                            const orphan = !isReasoningPresetTokens(modelName, actualReasoning);
+                            const suffix = isG3
+                              ? ` (thinking: ${g3Level})`
+                              : ` (${actualReasoning} tokens)`;
+                            return `현재: ${label[level]}${suffix}${
+                              orphan ? ` ⚠ 저장값 ${actualReasoning} — 버튼을 다시 눌러 저장하세요` : ""
                             }`;
                           })()}
                         </div>
