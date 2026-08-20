@@ -17,6 +17,40 @@ export function selectRecentByUserTurns(messages: any[], keepUserTurns: number) 
   return picked;
 }
 
+/**
+ * Keeps the normal recent-user-turn window, but also includes every completed
+ * turn that has not reached the durable summary yet. This prevents a slow or
+ * interrupted background summarizer from creating a blind gap between the
+ * summary boundary and the raw tail.
+ */
+export function selectPromptHistoryWithSummaryCoverage(
+  messages: any[],
+  keepUserTurns: number,
+  summarizedEndTurn: number
+) {
+  const list = Array.isArray(messages) ? messages : [];
+  const recent = selectRecentByUserTurns(list, keepUserTurns);
+  const selected = new Set(recent);
+  const firstUserPos = list.findIndex((message) => message?.role === "user");
+  if (firstUserPos < 0) return recent;
+
+  const assistantPositions: number[] = [];
+  for (let index = firstUserPos + 1; index < list.length; index += 1) {
+    const role = String(list[index]?.role || "").toLowerCase();
+    if (role === "assistant" || role === "model") assistantPositions.push(index);
+  }
+
+  const coveredTurns = Math.max(0, Math.floor(Number(summarizedEndTurn) || 0));
+  if (coveredTurns >= assistantPositions.length) return recent;
+  const gapStart = coveredTurns > 0
+    ? Number(assistantPositions[coveredTurns - 1] ?? firstUserPos) + 1
+    : firstUserPos;
+  for (let index = gapStart; index < list.length; index += 1) {
+    selected.add(list[index]);
+  }
+  return list.filter((message) => selected.has(message));
+}
+
 export function selectMessagesBeforeCurrentUser(messages: any[], currentUserMessageId: string) {
   const list = Array.isArray(messages) ? messages : [];
   const targetId = String(currentUserMessageId || "").trim();

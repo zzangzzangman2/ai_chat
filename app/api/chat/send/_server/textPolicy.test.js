@@ -21,6 +21,7 @@ function loadTextPolicy() {
 const {
   formatStoryTurnsForMode,
   selectMessagesBeforeCurrentUser,
+  selectPromptHistoryWithSummaryCoverage,
 } = loadTextPolicy();
 
 test("current user turn is excluded from historical prompt context", () => {
@@ -63,4 +64,31 @@ test("novel history keeps explicit user and assistant roles", () => {
 
   assert.match(context, /^\[PREVIOUS USER TURN\]\n\*문을 열었다\*/);
   assert.match(context, /\[PREVIOUS ASSISTANT TURN\]\n"누구세요\?"$/);
+});
+
+test("unsummarized turns fill the gap before the recent raw window", () => {
+  const messages = [];
+  for (let turn = 1; turn <= 10; turn += 1) {
+    messages.push({ id: `u${turn}`, role: "user", content: `사용자 ${turn}` });
+    messages.push({ id: `a${turn}`, role: "assistant", content: `응답 ${turn}` });
+  }
+
+  const selected = selectPromptHistoryWithSummaryCoverage(messages, 3, 3);
+  assert.deepEqual(
+    selected.map((message) => message.id),
+    messages.slice(6).map((message) => message.id)
+  );
+});
+
+test("fully summarized history uses only the configured recent window", () => {
+  const messages = [];
+  for (let turn = 1; turn <= 10; turn += 1) {
+    messages.push({ id: `u${turn}`, role: "user" });
+    messages.push({ id: `a${turn}`, role: "assistant" });
+  }
+
+  assert.deepEqual(
+    selectPromptHistoryWithSummaryCoverage(messages, 3, 10).map((message) => message.id),
+    ["u8", "a8", "u9", "a9", "u10", "a10"]
+  );
 });

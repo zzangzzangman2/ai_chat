@@ -766,6 +766,26 @@ if (!hasColumn("chat_settings", "narrationColor")) {
       ON chat_character_vitals(chatId, personName ASC);
   `);
 
+  // Deterministic user-authored room/scene assignments. These are rebuilt from
+  // user turns and remain separate from permanent residence facts.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_spatial_states (
+      chatId TEXT NOT NULL,
+      stateKey TEXT NOT NULL,
+      stateType TEXT NOT NULL DEFAULT 'placement',
+      subjectName TEXT NOT NULL DEFAULT '',
+      location TEXT NOT NULL DEFAULT '',
+      companionsJson TEXT NOT NULL DEFAULT '[]',
+      evidence TEXT NOT NULL DEFAULT '',
+      sourceTurn INTEGER NOT NULL DEFAULT 0,
+      sourceOrder INTEGER NOT NULL DEFAULT 0,
+      updatedAt INTEGER NOT NULL,
+      PRIMARY KEY(chatId, stateKey)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_spatial_states_chat_turn
+      ON chat_spatial_states(chatId, sourceTurn DESC, sourceOrder DESC);
+  `);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS message_usage (
       messageId TEXT PRIMARY KEY,
@@ -1057,6 +1077,9 @@ if (!hasColumn("chat_settings", "narrationColor")) {
         DELETE FROM chat_character_vitals
         WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_character_vitals.chatId);
 
+        DELETE FROM chat_spatial_states
+        WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_spatial_states.chatId);
+
         DELETE FROM chat_character_facts
         WHERE NOT EXISTS (SELECT 1 FROM chats c WHERE c.id = chat_character_facts.chatId);
 
@@ -1125,6 +1148,7 @@ function deleteChatDataRows(targetChatId: string) {
   db.prepare(`DELETE FROM chat_character_relations WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_affinity WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_vitals WHERE chatId=?`).run(targetChatId);
+  db.prepare(`DELETE FROM chat_spatial_states WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_facts WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_roster WHERE chatId=?`).run(targetChatId);
   db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=?`).run(targetChatId);

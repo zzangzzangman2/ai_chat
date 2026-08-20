@@ -22,10 +22,29 @@ export type RelativeResidenceAnchor = {
   sourceOrder: number;
 };
 
+export type TemporarySpatialPlacement = {
+  subjectName: string;
+  location: string;
+  companionNames: string[];
+  purpose: "sleep" | "room";
+  evidence: string;
+  sourceOrder: number;
+  sourceTurn: number;
+};
+
+export type CurrentSceneAnchor = {
+  location: string;
+  evidence: string;
+  sourceOrder: number;
+  sourceTurn: number;
+};
+
 export type SpatialCanonResult = {
   block: string;
   residences: SpatialResidenceFact[];
   relativeAnchors: RelativeResidenceAnchor[];
+  temporaryPlacements: TemporarySpatialPlacement[];
+  currentScene: CurrentSceneAnchor | null;
 };
 
 const RELATIVE_PLACE_PATTERN =
@@ -145,6 +164,38 @@ function focusContainsName(focusText: string, name: string) {
   return Boolean(focus && key && focus.includes(key));
 }
 
+const SUBJECT_PARTICLE_PATTERN = String.raw`(?:이는|이가|은|는|이|가)?`;
+const PAIR_CONNECTOR_PATTERN = String.raw`(?:이랑|랑|이와|와|과)`;
+const TOGETHER_PATTERN = String.raw`(?:같이\s*(?:자|잘|잔다|자라|잠|있|쓰|사용)|한\s*방|같은\s*방)`;
+
+function explicitRoomInClause(
+  clause: string,
+  identities: Array<{ alias: string; canonicalName: string }>
+) {
+  if (/안방/u.test(clause)) return "안방";
+  for (const identity of identities) {
+    const room = new RegExp(`${escapeRegex(identity.alias)}(?:이|가)?(?:의)?\\s*방`, "iu");
+    if (room.test(clause)) return `${identity.canonicalName}의 방`;
+  }
+  const generic = clause.match(/(?:거실|창고|주방|침실|서재|욕실|화장실|베란다|지하실|다락방)/u);
+  return generic?.[0] || "";
+}
+
+function sceneAnchorFromClause(
+  clause: string,
+  identities: Array<{ alias: string; canonicalName: string }>
+) {
+  for (const identity of identities) {
+    const room = new RegExp(
+      `${escapeRegex(identity.alias)}(?:이|가)?(?:의)?\\s*방\\s*(?:상황|장면|시점|내부)`,
+      "iu"
+    );
+    if (room.test(clause)) return `${identity.canonicalName}의 방`;
+  }
+  const generic = clause.match(/(안방|거실|창고|주방|침실|서재|욕실|화장실|베란다|지하실|다락방)\s*(?:상황|장면|시점|내부)/u);
+  return generic?.[1] || "";
+}
+
 /**
  * Builds a compact, always-on location canon from explicit user narration.
  * This is intentionally independent from event retrieval: an old residence
@@ -160,14 +211,84 @@ export function buildSpatialCanon(params: {
   maxRows?: number;
 }): SpatialCanonResult {
   const identities = identityEntries(params);
+  const personaName = cleanText(params.personaName, 80);
+  const placementIdentities = [...identities];
+  if (personaName) placementIdentities.push({ alias: "나", canonicalName: personaName });
   const residencesBySubject = new Map<string, SpatialResidenceFact>();
   const anchorsBySlot = new Map<string, RelativeResidenceAnchor>();
+  const placementsBySubject = new Map<string, TemporarySpatialPlacement>();
+  let currentScene: CurrentSceneAnchor | null = null;
+  let userTurn = 0;
 
   for (let sourceOrder = 0; sourceOrder < (params.messages || []).length; sourceOrder += 1) {
     const message = params.messages[sourceOrder];
     if (String(message?.role || "").toLowerCase() !== "user") continue;
+    userTurn += 1;
     const text = stripQuotedDialogue(String(message?.content || ""));
     if (!text.trim()) continue;
+
+    const clauses = text
+      .split(/[\n.!?。！？]+/u)
+      .map((clause) => cleanText(clause, 500))
+      .filter(Boolean);
+    for (const clause of clauses) {
+      const sceneLocation = sceneAnchorFromClause(clause, placementIdentities);
+      if (sceneLocation) {
+        currentScene = {
+          location: sceneLocation,
+          evidence: clause,
+          sourceOrder,
+          sourceTurn: userTurn,
+        };
+      }
+
+      for (const left of placementIdentities) {
+        for (const right of placementIdentities) {
+          if (left.canonicalName === right.canonicalName) continue;
+          const leftName = escapeRegex(left.alias);
+          const rightName = escapeRegex(right.alias);
+          const subjectThenCompanion = new RegExp(
+            `${leftName}${SUBJECT_PARTICLE_PATTERN}\\s*.{0,36}?${rightName}${PAIR_CONNECTOR_PATTERN}\\s*.{0,24}?${TOGETHER_PATTERN}`,
+            "iu"
+          );
+          const joinedSubjects = new RegExp(
+            `${leftName}${PAIR_CONNECTOR_PATTERN}\\s*${rightName}${SUBJECT_PARTICLE_PATTERN}\\s*.{0,40}?(?:${TOGETHER_PATTERN}|(?:안방|거실|창고|주방|침실|서재|다락방)\\s*(?:쓰|사용|자))`,
+            "iu"
+          );
+          const subjectMatch = clause.match(subjectThenCompanion);
+          const joinedMatch = subjectMatch ? null : clause.match(joinedSubjects);
+          const matchedAssignment = subjectMatch?.[0] || joinedMatch?.[0] || "";
+          if (!matchedAssignment) continue;
+          const crossesAnotherNamedPerson = placementIdentities.some(
+            (identity) =>
+              identity.canonicalName !== left.canonicalName &&
+              identity.canonicalName !== right.canonicalName &&
+              identity.alias.length >= 2 &&
+              matchedAssignment.toLocaleLowerCase("ko-KR").includes(identity.alias)
+          );
+          if (crossesAnotherNamedPerson) continue;
+
+          const location = explicitRoomInClause(matchedAssignment, placementIdentities) || `${right.canonicalName}의 방`;
+          const purpose = /(?:자|잘|잔다|자라|잠)/u.test(matchedAssignment) ? "sleep" : "room";
+          const leftPlacement: TemporarySpatialPlacement = {
+            subjectName: left.canonicalName,
+            location,
+            companionNames: [right.canonicalName],
+            purpose,
+            evidence: clause,
+            sourceOrder,
+            sourceTurn: userTurn,
+          };
+          const rightPlacement: TemporarySpatialPlacement = {
+            ...leftPlacement,
+            subjectName: right.canonicalName,
+            companionNames: [left.canonicalName],
+          };
+          placementsBySubject.set(normalizedKey(left.canonicalName), leftPlacement);
+          placementsBySubject.set(normalizedKey(right.canonicalName), rightPlacement);
+        }
+      }
+    }
 
     const entries = [...identities, ...collectGenericAnchors(text)];
     const seenAliases = new Set<string>();
@@ -218,8 +339,10 @@ export function buildSpatialCanon(params: {
   const allAnchors = [...anchorsBySlot.values()].sort(
     (a, b) => a.sourceOrder - b.sourceOrder
   );
+  const temporaryPlacements = [...placementsBySubject.values()].sort(
+    (a, b) => a.sourceOrder - b.sourceOrder || a.subjectName.localeCompare(b.subjectName, "ko-KR")
+  );
   const focusText = cleanText(params.focusText, 20_000);
-  const personaName = cleanText(params.personaName, 80);
   const maxRows = Math.max(4, Math.min(80, Math.trunc(Number(params.maxRows) || 24)));
   const isFocused = (name: string) =>
     normalizedKey(name) === normalizedKey(personaName) || focusContainsName(focusText, name);
@@ -245,8 +368,17 @@ export function buildSpatialCanon(params: {
     "- 각 인물의 거주지는 서로 독립된 장소 노드다. 사용자가 같은 건물·같은 집이라고 명시하지 않은 두 거주지를 임의로 합치지 않는다.",
     "- 'A의 아랫집/윗집'은 오직 A의 거주지를 기준으로 한 상대 위치다. 현재 시점 인물이나 주인공의 집으로 그 이웃 관계를 옮겨 붙이지 않는다.",
     "- 방문·잠입·숙박·현재 장면의 위치는 거주지 변경이 아니다. 이사는 사용자의 명시적 변경이 있을 때만 최신 거주지로 갱신한다.",
+    "- 임시 방 배정·동행·취침 지정은 거주지와 별개지만, 사용자가 다시 바꾸거나 명시적으로 퇴장시키기 전까지 현재 장면 구성보다 우선한다.",
     "- 사용자 확정 공간 관계와 충돌하는 이전 AI 지문은 오기이므로 이어받지 않는다.",
   ];
+  if (currentScene) {
+    rows.push(`- 현재 장면 위치: ${currentScene.location} (사용자 ${currentScene.sourceTurn}턴 근거: ${currentScene.evidence})`);
+  }
+  for (const placement of temporaryPlacements) {
+    rows.push(
+      `- ${placement.subjectName}의 임시 위치: ${placement.location}; 함께 있는 인물: ${placement.companionNames.join(", ")} (사용자 ${placement.sourceTurn}턴 근거: ${placement.evidence})`
+    );
+  }
   for (const fact of selectedFacts) {
     if ("direction" in fact) {
       rows.push(
@@ -261,5 +393,7 @@ export function buildSpatialCanon(params: {
     block: rows.join("\n"),
     residences: allResidences,
     relativeAnchors: allAnchors,
+    temporaryPlacements,
+    currentScene,
   };
 }

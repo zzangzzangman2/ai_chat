@@ -9,6 +9,7 @@ const {
   isCtrlGShortcut,
   buildContinueInstruction,
   continuationDelta,
+  pickNextMaintenanceEntry,
   displayWidth,
   promptPersonaFields,
   terminalRowsForLine,
@@ -52,6 +53,24 @@ test("continue instruction includes the latest answer tail", () => {
 test("continuationDelta prints only newly appended content", () => {
   assert.equal(continuationDelta("기존 답변", "기존 답변\n새 문장"), "새 문장");
   assert.equal(continuationDelta("기존 답변", "완전히 교체된 답변"), "완전히 교체된 답변");
+});
+
+test("background maintenance prioritizes memory and newest character work", () => {
+  const characterJobs = new Map([
+    ["old", { id: "old" }],
+    ["new", { id: "new" }],
+  ]);
+  const memoryJobs = new Map([["chat", { id: "memory" }]]);
+
+  assert.deepEqual(pickNextMaintenanceEntry(characterJobs, memoryJobs), {
+    kind: "memory",
+    entry: ["chat", { id: "memory" }],
+  });
+  memoryJobs.clear();
+  assert.deepEqual(pickNextMaintenanceEntry(characterJobs, memoryJobs), {
+    kind: "character",
+    entry: ["new", { id: "new" }],
+  });
 });
 
 test("terminalRowsForLine counts a short input as one terminal row", () => {

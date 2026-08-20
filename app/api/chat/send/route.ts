@@ -78,6 +78,7 @@ import { distribute } from "./_server/distribute";
 import {
   formatTurns,
   selectRecentByUserTurns,
+  selectPromptHistoryWithSummaryCoverage,
   selectMessagesBeforeCurrentUser,
   formatStoryTurnsForMode,
   buildUserLineForMode,
@@ -2229,6 +2230,53 @@ ${body}`.trim();
         relatedArchiveText,
       ].join("\n"),
     });
+    try {
+      const replaceSpatialStates = db.transaction(() => {
+        db.prepare(`DELETE FROM chat_spatial_states WHERE chatId=?`).run(cid);
+        const insert = db.prepare(
+          `INSERT INTO chat_spatial_states
+             (chatId, stateKey, stateType, subjectName, location, companionsJson,
+              evidence, sourceTurn, sourceOrder, updatedAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        );
+        const now = Date.now();
+        for (const placement of spatialCanon.temporaryPlacements) {
+          insert.run(
+            cid,
+            `placement:${String(placement.subjectName || "").toLocaleLowerCase("ko-KR")}`,
+            "placement",
+            placement.subjectName,
+            placement.location,
+            encryptIfPossible(JSON.stringify(placement.companionNames)),
+            encryptIfPossible(placement.evidence),
+            placement.sourceTurn,
+            placement.sourceOrder,
+            now
+          );
+        }
+        if (spatialCanon.currentScene) {
+          insert.run(
+            cid,
+            "scene:current",
+            "scene",
+            "",
+            spatialCanon.currentScene.location,
+            encryptIfPossible("[]"),
+            encryptIfPossible(spatialCanon.currentScene.evidence),
+            spatialCanon.currentScene.sourceTurn,
+            spatialCanon.currentScene.sourceOrder,
+            now
+          );
+        }
+      });
+      replaceSpatialStates();
+    } catch (error) {
+      console.error("[chat/send] spatial state persistence failed", {
+        chatId: cid,
+        reqId,
+        error: String((error as { message?: unknown })?.message || error),
+      });
+    }
     // (변경 2026-08) 등록 캐릭터/관계도는 "항상" 주입한다.
     // - 기존에는 동적 조회(dynamicCharacterContext)가 비었을 때만 쓰는 복구 경로였는데,
     //   동적 조회는 현재 입력에 이름이 언급된 캐릭터만 포커스하므로
@@ -2460,6 +2508,8 @@ ${body}`.trim();
       spatialCanonChars: strlen(spatialCanon.block),
       spatialResidenceCount: spatialCanon.residences.length,
       spatialRelativeAnchorCount: spatialCanon.relativeAnchors.length,
+      spatialTemporaryPlacementCount: spatialCanon.temporaryPlacements.length,
+      spatialCurrentScene: spatialCanon.currentScene?.location || "",
       identityNameFacts: identityCanon.canon.nameFacts.length,
       identityRoleAnchors: identityCanon.canon.roleAnchors.length,
       inferredPersonaName: inferredPersonaName || "",
@@ -3193,12 +3243,25 @@ const systemRaw = (cacheFriendlyLayout
 
     let epistemicTailRedactions = 0;
     let legalStatusTailRedactions = 0;
-    const promptHistoryTail = continueMode
-      ? tail
-      : selectRecentByUserTurns(
-          selectMessagesBeforeCurrentUser(all, userMsg.id),
-          keepUserTurns
-        );
+    const promptHistorySource = continueMode
+      ? all
+      : selectMessagesBeforeCurrentUser(all, userMsg.id);
+    const promptHistoryTail = selectPromptHistoryWithSummaryCoverage(
+      promptHistorySource,
+      keepUserTurns,
+      summarizedEndTurn
+    );
+    const recentOnlyHistory = selectRecentByUserTurns(promptHistorySource, keepUserTurns);
+    dbg({
+      tag: "send.context.coverage",
+      chatId: cid,
+      reqId,
+      summarizedEndTurn,
+      completedTurnCount,
+      recentOnlyMessages: recentOnlyHistory.length,
+      promptHistoryMessages: promptHistoryTail.length,
+      gapMessagesAdded: Math.max(0, promptHistoryTail.length - recentOnlyHistory.length),
+    });
     const epistemicTail = promptHistoryTail.map((message) => {
       const role = String(message?.role || "");
       if (role !== "assistant" && role !== "model") return message;

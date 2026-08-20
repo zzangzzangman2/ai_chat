@@ -18,7 +18,7 @@ import { formatRelationshipGraphBlock, loadRelationshipGraph } from "@/lib/relat
 import {
   buildEpistemicPromptFirewall,
   omitWorldOnlyRelationshipsFromPrompt,
-  sanitizeSharedEpistemicText,
+  sanitizeRecentAssistantEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
 import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
 import {
@@ -1056,7 +1056,7 @@ export async function POST(req: Request) {
       if (message.role !== "assistant" && message.role !== "model") return message;
       return {
         ...message,
-        content: sanitizeSharedEpistemicText(
+        content: sanitizeRecentAssistantEpistemicText(
           message.content,
           epistemicFirewall
         ).text,

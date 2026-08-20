@@ -148,10 +148,11 @@ const state = {
   // 페르소나 안내를 이미 띄운 채팅. 한 방에서 두 번 붙잡지 않기 위한 것으로,
   // 프로세스가 살아 있는 동안만 유지한다.
   personaPromptedChatIds: new Set(),
-  // 답변 뒤 기억 갱신은 다음 사용자 입력보다 우선할 수 없다. 미처리 작업은 큐에
-  // 남기고, 새 입력이 오면 현재 HTTP/LLM 작업만 취소한 뒤 다음 idle 때 재개한다.
+  // 답변 뒤 기억 갱신은 별도 maintenance 서버에서 처리한다. 새 입력이 오면 느린
+  // 캐릭터 작업은 양보시키되, 진행 중인 장기기억 블록은 끝까지 저장하게 둔다.
   maintenanceTimer: null,
   maintenanceController: null,
+  maintenanceKind: "",
   maintenanceGeneration: 0,
   maintenanceRunning: false,
   maintenancePaused: false,
@@ -2886,14 +2887,17 @@ function readMaintenancePortFile() {
   return 0;
 }
 
-function pauseBackgroundMaintenance() {
+function pauseBackgroundMaintenance({ abortRunning = false } = {}) {
   state.maintenancePaused = true;
   state.maintenanceGeneration += 1;
   if (state.maintenanceTimer) {
     clearTimeout(state.maintenanceTimer);
     state.maintenanceTimer = null;
   }
-  if (state.maintenanceController) {
+  if (
+    state.maintenanceController &&
+    (abortRunning || state.maintenanceKind === "character")
+  ) {
     try { state.maintenanceController.abort(); } catch {}
     state.maintenanceController = null;
   }
@@ -2941,6 +2945,7 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   if (state.maintenancePaused || generation !== state.maintenanceGeneration) return "paused";
   const controller = new AbortController();
   state.maintenanceController = controller;
+  state.maintenanceKind = kind;
   const startedAt = Date.now();
   let response = null;
   try {
@@ -2970,27 +2975,53 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   } catch (error) {
     if (isAbortLike(error) || controller.signal.aborted) return "paused";
     job.attempts = Number(job.attempts || 0) + 1;
-    if (job.attempts >= 2) {
-      if (kind === "character") state.pendingCharacterRefreshes.delete(key);
-      else state.pendingMemoryRefreshes.delete(key);
-    }
     return "retry";
   } finally {
     if (state.maintenanceController === controller) state.maintenanceController = null;
+    if (!state.maintenanceController) state.maintenanceKind = "";
     updateMaintenanceTiming(job, kind === "character" ? "characterMs" : "memoryMs", startedAt);
   }
 
   if (response && response.ok) {
-    if (kind === "character") state.pendingCharacterRefreshes.delete(key);
-    else state.pendingMemoryRefreshes.delete(key);
+    if (kind === "memory") {
+      const payload = await response.json().catch(() => null);
+      if (payload && payload.morePending) {
+        const current = state.pendingMemoryRefreshes.get(key);
+        if (current === job) {
+          job.attempts = 0;
+          job.mode = "all";
+        }
+        return "more";
+      }
+      if (state.pendingMemoryRefreshes.get(key) === job) {
+        state.pendingMemoryRefreshes.delete(key);
+      }
+    } else {
+      state.pendingCharacterRefreshes.delete(key);
+    }
     return "done";
   }
   job.attempts = Number(job.attempts || 0) + 1;
-  if (job.attempts >= 2 || (response && response.status >= 400 && response.status < 500)) {
+  const status = Number(response && response.status || 0);
+  const permanentClientError = status >= 400 && status < 500 && status !== 408 && status !== 425 && status !== 429;
+  if (permanentClientError) {
     if (kind === "character") state.pendingCharacterRefreshes.delete(key);
     else state.pendingMemoryRefreshes.delete(key);
   }
   return "retry";
+}
+
+function latestMapEntry(map) {
+  let latest = null;
+  for (const entry of map.entries()) latest = entry;
+  return latest;
+}
+
+function pickNextMaintenanceEntry(characterJobs, memoryJobs) {
+  const memoryEntry = memoryJobs.entries().next().value;
+  if (memoryEntry) return { kind: "memory", entry: memoryEntry };
+  const characterEntry = latestMapEntry(characterJobs);
+  return characterEntry ? { kind: "character", entry: characterEntry } : null;
 }
 
 async function drainBackgroundMaintenance(generation) {
@@ -3005,12 +3036,17 @@ async function drainBackgroundMaintenance(generation) {
   let retryNeeded = false;
   try {
     while (!state.maintenancePaused && generation === state.maintenanceGeneration) {
-      const characterEntry = state.pendingCharacterRefreshes.entries().next().value;
-      const memoryEntry = state.pendingMemoryRefreshes.entries().next().value;
-      const entry = characterEntry || memoryEntry;
-      if (!entry) break;
-      const kind = characterEntry ? "character" : "memory";
-      const result = await runBackgroundMaintenanceJob(kind, entry[0], entry[1], generation);
+      const picked = pickNextMaintenanceEntry(
+        state.pendingCharacterRefreshes,
+        state.pendingMemoryRefreshes
+      );
+      if (!picked) break;
+      const result = await runBackgroundMaintenanceJob(
+        picked.kind,
+        picked.entry[0],
+        picked.entry[1],
+        generation
+      );
       if (result === "paused") break;
       if (result === "retry") {
         retryNeeded = true;
@@ -3638,7 +3674,7 @@ async function main() {
       }
     }
   } finally {
-    pauseBackgroundMaintenance();
+    pauseBackgroundMaintenance({ abortRunning: true });
     rl.close();
   }
   console.log("종료했습니다.");
@@ -3671,4 +3707,5 @@ module.exports = {
   isCtrlGShortcut,
   buildContinueInstruction,
   continuationDelta,
+  pickNextMaintenanceEntry,
 };

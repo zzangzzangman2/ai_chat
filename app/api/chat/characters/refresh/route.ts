@@ -21,7 +21,7 @@ import { refreshRelationshipGraphIfDue } from "@/lib/relationship_graph_refresh"
 import {
   buildEpistemicPromptFirewall,
   omitWorldOnlyRelationshipsFromPrompt,
-  sanitizeSharedEpistemicText,
+  sanitizeRecentAssistantEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
 import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
 import {
@@ -331,7 +331,7 @@ export async function POST(req: Request) {
       if (!isAssistantRole(message.role)) return message;
       return {
         ...message,
-        content: sanitizeSharedEpistemicText(
+        content: sanitizeRecentAssistantEpistemicText(
           message.content,
           epistemicFirewall
         ).text,
