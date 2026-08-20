@@ -24,6 +24,7 @@ import {
   sanitizeRecentAssistantEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
 import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
+import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import {
   inferCriticalCoreMemoryType,
   isCoreMemoryCandidate,
@@ -370,15 +371,24 @@ export async function POST(req: Request) {
     const trustedLegalStatusNarrationTexts = decryptedAll
       .filter((message) => isAssistantRole(message.role))
       .map((message) => String(message.content || ""));
+    const vitalStatusIdentities = legalStatusIdentities.map((identity) => ({
+      name: identity.name,
+      aliases: identity.aliases,
+    }));
     all = all.map((message) => {
       if (!isAssistantRole(message.role)) return message;
+      const legalStatus = removeUnsupportedLegalStatusClaims({
+        text: message.content,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+        identities: legalStatusIdentities,
+      });
       return {
         ...message,
-        content: removeUnsupportedLegalStatusClaims({
-          text: message.content,
+        content: removeUnsupportedVitalStatusClaims({
+          text: legalStatus.text,
           trustedUserTexts: trustedLegalStatusUserTexts,
-          trustedNarrationTexts: trustedLegalStatusNarrationTexts,
-          identities: legalStatusIdentities,
+          identities: vitalStatusIdentities,
         }).text,
       };
     });
@@ -512,6 +522,7 @@ export async function POST(req: Request) {
       "Every registered character is an isolated memory owner. Never copy a relationship, title, promise, emotion, or dialogue style from another character.",
       "A title used by one character never becomes a title that another character may use.",
       "If the persona corrects or denies a relationship/title, that correction overrides the assistant response and must remain negated.",
+      "A hypothetical, threatened, conditional, feared, or possible death is not an actual death. Never save it as a completed death or post-death event unless the source explicitly confirms the completed death.",
       identityCanon.block,
       (() => {
         const currentGraph = loadRelationshipGraph(chatId);

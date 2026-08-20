@@ -21,6 +21,7 @@ import {
   sanitizeRecentAssistantEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
 import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consistency_guard";
+import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import {
   applyStructuredCharacterGraph,
   extractStructuredCharacterGraph,
@@ -1088,15 +1089,24 @@ export async function POST(req: Request) {
     const trustedLegalStatusNarrationTexts = decryptedAll
       .filter((message) => message.role === "assistant" || message.role === "model")
       .map((message) => String(message.content || ""));
+    const vitalStatusIdentities = legalStatusIdentities.map((identity) => ({
+      name: identity.name,
+      aliases: identity.aliases || [],
+    }));
     all = all.map((message) => {
       if (message.role !== "assistant" && message.role !== "model") return message;
+      const legalStatus = removeUnsupportedLegalStatusClaims({
+        text: message.content,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+        identities: legalStatusIdentities,
+      });
       return {
         ...message,
-        content: removeUnsupportedLegalStatusClaims({
-          text: message.content,
+        content: removeUnsupportedVitalStatusClaims({
+          text: legalStatus.text,
           trustedUserTexts: trustedLegalStatusUserTexts,
-          trustedNarrationTexts: trustedLegalStatusNarrationTexts,
-          identities: legalStatusIdentities,
+          identities: vitalStatusIdentities,
         }).text,
       };
     });
@@ -1698,6 +1708,30 @@ export async function POST(req: Request) {
           facts: canonicalFacts,
         });
       }
+    }
+
+    const vitalStatusChecked = removeUnsupportedVitalStatusClaims({
+      text: sectionRaw,
+      trustedUserTexts: trustedLegalStatusUserTexts,
+      identities: vitalStatusIdentities,
+    });
+    if (vitalStatusChecked.removed > 0) {
+      sectionRaw = vitalStatusChecked.text;
+      norm = normalizeSection(sectionRaw);
+      q = analyzeGeneratedLongMemoryBody(norm.body);
+      ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
+      relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
+      identityDrift = analyzeIdentityCanonDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        canon: identityCanon.canon,
+      });
+      canonicalFactDrift = analyzeCanonicalFactDrift({
+        sourceText: cleanedText,
+        summary: norm.body,
+        persona: authoritativePersona,
+        facts: canonicalFacts,
+      });
     }
 
     let forcedBadOutputSaved = false;

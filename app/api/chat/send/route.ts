@@ -38,6 +38,7 @@ import {
   removeUnsupportedLegalStatusClaims,
   type LegalStatusIdentity,
 } from "@/lib/legal_status_consistency_guard";
+import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import { createGuardedTextStream } from "@/lib/guarded_text_stream";
 import {
   deriveCurrentScenePresence,
@@ -2352,6 +2353,20 @@ ${body}`.trim();
         return role === "assistant" || role === "model";
       })
       .map((message) => String(message?.content || ""));
+    const vitalStatusIdentities = legalStatusIdentities.map((identity) => ({
+      name: identity.name,
+      aliases: identity.aliases || [],
+    }));
+    const establishedDeceasedNames = continuityLedger.states
+      .filter((state) => state.kind === "deceased")
+      .map((state) => state.name);
+    const sanitizeVitalStatus = (text: unknown) =>
+      removeUnsupportedVitalStatusClaims({
+        text,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        identities: vitalStatusIdentities,
+        establishedDeceasedNames,
+      });
     const groundedEpistemicFactIds = buildGroundedEpistemicFactIds(
       epistemicFirewall,
       [...trustedLegalStatusUserTexts, ...trustedLegalStatusNarrationTexts]
@@ -2369,11 +2384,13 @@ ${body}`.trim();
         trustedNarrationTexts: trustedLegalStatusNarrationTexts,
         identities: legalStatusIdentities,
       });
+      const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+      if (vitalStatus.removed > 0) return vitalStatus.text;
       // The guards may remove unsupported local passages, but a false-positive
       // match must never erase an otherwise completed provider response. Keep
       // the single-call draft only when the combined filters would return no
       // visible text at all; partial redactions remain fully enforced.
-      return String(legalStatus.text || "").trim() ? legalStatus.text : original;
+      return String(vitalStatus.text || "").trim() ? vitalStatus.text : original;
     };
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
@@ -2447,7 +2464,8 @@ ${body}`.trim();
       trustedNarrationTexts: trustedLegalStatusNarrationTexts,
       identities: legalStatusIdentities,
     });
-    const historySummaryForPrompt = historyLegalStatusView.text;
+    const historyVitalStatusView = sanitizeVitalStatus(historyLegalStatusView.text);
+    const historySummaryForPrompt = historyVitalStatusView.text;
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -3127,6 +3145,13 @@ const systemRaw = (cacheFriendlyLayout
       `- 경찰·수사관이 경계하거나 출입을 막는 장면에서도 근거 없는 법적 신분을 새로 만들지 않는다. 필요하면 '사건 관계자', '방문자', '신원 확인 대상'처럼 관찰 가능한 중립 표현을 쓴다.`,
       `- 이번 응답에서 법적 지위를 한 단계라도 올리기 전, 누가 언제 어떤 절차를 집행했는지 근거 문장을 확인한다. 근거가 없으면 승격하지 않는다.`,
     ].join("\n");
+    const vitalStatusPriorityBlock = [
+      `# [LIFE/DEATH CANON HARD GUARD — APPLIES TO EVERY CHAT]`,
+      `- 죽음·사망·자살·살해는 인물의 등장 가능성을 영구 변경하는 최상위 정사다. 최신 사용자 지문이나 이미 검증된 연속성 장부에 실제 완료 사건으로 확정된 경우에만 발생한 사실로 쓴다.`,
+      `- '죽을지도 모른다', '자살할 수 있다', '죽이면', '죽이겠다', '아빠 없는 게 싫지?' 같은 가정·가능성·협박·조건문·공포·회상은 실제 사망이 아니다. 절대로 '죽었다', '목숨을 잃었다', '죽음 이후'로 승격하거나 요약하지 않는다.`,
+      `- 최근 원문에서 그 인물이 말하거나 행동하거나 다른 방에 살아 있는 장면이 확인되면 생존 상태다. 충돌하는 과거 AI 지문이나 요약의 사망 단정은 오기이므로 반복하지 않는다.`,
+      `- 응답을 내기 직전에 새 사망 주장마다 누가, 언제, 어떤 완료 사건으로 죽었는지 근거를 확인한다. 명시적 근거가 없으면 그 문장을 삭제하고 생존한 현재 상황을 유지한다.`,
+    ].join("\n");
     const system = [
       systemWithIdentityCanon,
       sanitizePromptCached(spatialCanon.block),
@@ -3137,6 +3162,7 @@ const systemRaw = (cacheFriendlyLayout
       scenePresencePriorityBlock,
       epistemicPriorityBlock,
       legalStatusPriorityBlock,
+      vitalStatusPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -3185,6 +3211,8 @@ const systemRaw = (cacheFriendlyLayout
 	            : "",
 	          continuityPriorityBlock ? `` : "",
 	          continuityPriorityBlock,
+	          ``,
+	          vitalStatusPriorityBlock,
 	          currentOocPriorityBlock ? `` : "",
 	          currentOocPriorityBlock
 	            ? sanitizePromptCached(currentOocPriorityBlock)
@@ -3243,6 +3271,7 @@ const systemRaw = (cacheFriendlyLayout
 
     let epistemicTailRedactions = 0;
     let legalStatusTailRedactions = 0;
+    let vitalStatusTailRedactions = 0;
     const promptHistorySource = continueMode
       ? all
       : selectMessagesBeforeCurrentUser(all, userMsg.id);
@@ -3277,7 +3306,9 @@ const systemRaw = (cacheFriendlyLayout
         identities: legalStatusIdentities,
       });
       legalStatusTailRedactions += legalStatus.removed;
-      return { ...message, content: legalStatus.text };
+      const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+      vitalStatusTailRedactions += vitalStatus.removed;
+      return { ...message, content: vitalStatus.text };
     });
     const contextRaw = formatStoryTurnsForMode(
       epistemicTail,
@@ -3290,7 +3321,9 @@ const systemRaw = (cacheFriendlyLayout
       historyEpistemicView.redactedSegments ||
       epistemicTailRedactions ||
       historyLegalStatusView.removed ||
-      legalStatusTailRedactions
+      legalStatusTailRedactions ||
+      historyVitalStatusView.removed ||
+      vitalStatusTailRedactions
     ) {
       dbg({
         tag: "send.epistemic-firewall",
@@ -3301,6 +3334,8 @@ const systemRaw = (cacheFriendlyLayout
         summaryRedactions: historyEpistemicView.redactedSegments,
         recentAssistantRedactions: epistemicTailRedactions,
         legalStatusSummaryRedactions: historyLegalStatusView.removed,
+        vitalStatusSummaryRedactions: historyVitalStatusView.removed,
+        vitalStatusTailRedactions,
         recentLegalStatusRedactions: legalStatusTailRedactions,
       });
     }
@@ -3761,6 +3796,7 @@ let cancelStreamWork: (() => void) | null = null;
         };
         let streamEpistemicRedactions = 0;
         let streamLegalStatusRedactions = 0;
+        let streamVitalStatusRedactions = 0;
         let streamScenePresenceRedactions = 0;
         const guardedTextStream = createGuardedTextStream((text) => {
           const epistemic = sanitizeGeneratedFacts(text);
@@ -3770,13 +3806,15 @@ let cancelStreamWork: (() => void) | null = null;
             trustedNarrationTexts: trustedLegalStatusNarrationTexts,
             identities: legalStatusIdentities,
           });
+          const vitalStatus = sanitizeVitalStatus(legalStatus.text);
           const scenePresence = removeScenePresenceContradictionPassages({
-            text: legalStatus.text,
+            text: vitalStatus.text,
             currentUserText: userText,
             presentCharacters: currentScenePresence,
           });
           streamEpistemicRedactions += epistemic.redactedSegments;
           streamLegalStatusRedactions += legalStatus.removed;
+          streamVitalStatusRedactions += vitalStatus.removed;
           streamScenePresenceRedactions += scenePresence.removed;
           return scenePresence.text;
         });
@@ -4270,6 +4308,7 @@ if (!TRANSPORT_STREAMING) {
           if (
             streamEpistemicRedactions ||
             streamLegalStatusRedactions ||
+            streamVitalStatusRedactions ||
             streamScenePresenceRedactions
           ) {
             dbg({
@@ -4278,6 +4317,7 @@ if (!TRANSPORT_STREAMING) {
               reqId,
               epistemicRedactions: streamEpistemicRedactions,
               legalStatusRedactions: streamLegalStatusRedactions,
+              vitalStatusRedactions: streamVitalStatusRedactions,
               scenePresenceRedactions: streamScenePresenceRedactions,
             });
           }
@@ -5507,8 +5547,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       trustedNarrationTexts: trustedLegalStatusNarrationTexts,
       identities: legalStatusIdentities,
     });
+    const vitalStatusOutputChecked = sanitizeVitalStatus(legalStatusOutputChecked.text);
     const scenePresenceOutputChecked = removeScenePresenceContradictionPassages({
-      text: legalStatusOutputChecked.text,
+      text: vitalStatusOutputChecked.text,
       currentUserText: userText,
       presentCharacters: currentScenePresence,
     });
@@ -5516,6 +5557,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     if (
       epistemicOutputChecked.redactedSegments ||
       legalStatusOutputChecked.removed ||
+      vitalStatusOutputChecked.removed ||
       scenePresenceOutputChecked.removed
     ) {
       dbg({
@@ -5526,6 +5568,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         legalStatusRedactions: legalStatusOutputChecked.removed,
         legalStatuses: legalStatusOutputChecked.statuses,
         legalCharacters: legalStatusOutputChecked.characterNames,
+        vitalStatusRedactions: vitalStatusOutputChecked.removed,
+        vitalStatusSubjects: vitalStatusOutputChecked.subjects,
         scenePresenceRedactions: scenePresenceOutputChecked.removed,
         scenePresenceCharacters: scenePresenceOutputChecked.characterNames,
       });
