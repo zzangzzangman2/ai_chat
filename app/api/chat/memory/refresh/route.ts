@@ -1661,6 +1661,45 @@ export async function POST(req: Request) {
       deterministicFallbackUsed = true;
     }
 
+    // The deterministic fallback intentionally preserves stored narration, but
+    // a purely assistant-authored body-build adjective is not a durable fact.
+    // Remove only those exact rejected descriptors instead of letting one word
+    // permanently block this and every later summary window.
+    if (
+      !canonicalFactDrift.ok &&
+      canonicalFactDrift.conflicts.length > 0 &&
+      canonicalFactDrift.conflicts.every((conflict) =>
+        conflict.startsWith("AI 지문에서만 나온 신체 묘사:")
+      )
+    ) {
+      let sanitizedSection = String(sectionRaw || "");
+      for (const conflict of canonicalFactDrift.conflicts) {
+        const descriptor = conflict
+          .slice("AI 지문에서만 나온 신체 묘사:".length)
+          .trim();
+        if (descriptor) sanitizedSection = sanitizedSection.split(descriptor).join("");
+      }
+      sanitizedSection = sanitizedSection.replace(/[ \t]{2,}/g, " ");
+      if (sanitizedSection !== sectionRaw) {
+        sectionRaw = sanitizedSection;
+        norm = normalizeSection(sectionRaw);
+        q = analyzeGeneratedLongMemoryBody(norm.body);
+        ndrift = analyzeNameDrift(norm.body, sourceNameSet, [personaName]);
+        relationshipDrift = analyzeRelationshipCorrectionDrift(cleanedText, norm.body);
+        identityDrift = analyzeIdentityCanonDrift({
+          sourceText: cleanedText,
+          summary: norm.body,
+          canon: identityCanon.canon,
+        });
+        canonicalFactDrift = analyzeCanonicalFactDrift({
+          sourceText: cleanedText,
+          summary: norm.body,
+          persona: authoritativePersona,
+          facts: canonicalFacts,
+        });
+      }
+    }
+
     let forcedBadOutputSaved = false;
     let sectionRawForStore = String(sectionRaw || "");
 
@@ -1677,7 +1716,9 @@ export async function POST(req: Request) {
             : "relationship_correction_conflict",
         windowStartTurn,
         windowEndTurn,
+        summarizedEndTurn,
         boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn,
         relationshipDrift,
         identityDrift,
         canonicalFactDrift,
@@ -1693,7 +1734,9 @@ export async function POST(req: Request) {
           reason: "bad_output",
           windowStartTurn,
           windowEndTurn,
+          summarizedEndTurn,
           boundaryEndTurn,
+          morePending: summarizedEndTurn < boundaryEndTurn,
           quality: q,
           nameDrift: ndrift,
           relationshipDrift,
@@ -1827,6 +1870,9 @@ export async function POST(req: Request) {
         chatId,
         windowStartTurn,
         windowEndTurn,
+        summarizedEndTurn,
+        boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn,
         prevSectionCount,
         nextSectionCount,
         prevChars: strlenSummary(recentSummary),
@@ -1838,6 +1884,9 @@ export async function POST(req: Request) {
         reason: "archive_shrink_blocked",
         windowStartTurn,
         windowEndTurn,
+        summarizedEndTurn,
+        boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn,
         prevSectionCount,
         nextSectionCount,
       });

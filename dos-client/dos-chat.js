@@ -2985,6 +2985,10 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   if (response && response.ok) {
     if (kind === "memory") {
       const payload = await response.json().catch(() => null);
+      if (payload && payload.skipped && payload.morePending) {
+        job.attempts = Number(job.attempts || 0) + 1;
+        return "retry";
+      }
       if (payload && payload.morePending) {
         const current = state.pendingMemoryRefreshes.get(key);
         if (current === job) {
