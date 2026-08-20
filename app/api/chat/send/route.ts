@@ -31,6 +31,7 @@ import {
   buildGroundedEpistemicFactIds,
   buildEpistemicPromptFirewall,
   sanitizeGeneratedEpistemicText,
+  sanitizeRecentAssistantEpistemicText,
   sanitizeSharedEpistemicText,
 } from "@/lib/epistemic_prompt_firewall";
 import {
@@ -3201,7 +3202,7 @@ const systemRaw = (cacheFriendlyLayout
     const epistemicTail = promptHistoryTail.map((message) => {
       const role = String(message?.role || "");
       if (role !== "assistant" && role !== "model") return message;
-      const sanitized = sanitizeSharedEpistemicText(
+      const sanitized = sanitizeRecentAssistantEpistemicText(
         String(message?.content || ""),
         epistemicFirewall
       );

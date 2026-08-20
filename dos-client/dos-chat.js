@@ -246,6 +246,10 @@ function requestPromptShortcut(action) {
   try { state.promptController.abort(); } catch {}
 }
 
+function isCtrlGShortcut(str, key) {
+  return Boolean((key && key.ctrl && key.name === "g") || str === "\x07");
+}
+
 // Ctrl+C 처리:
 // - 진행 중인 요청이 있으면 → abort
 // - 입력 대기 중이면 → 이전 화면으로 이동
@@ -274,6 +278,7 @@ function installPromptShortcuts(rl) {
   const onKeypress = (str, key) => {
     const isCtrlZ = (key && key.ctrl && key.name === "z") || str === "\x1a";
     const isCtrlC = key && key.ctrl && key.name === "c";
+    const isCtrlG = isCtrlGShortcut(str, key);
     if (state.activeController && (isCtrlZ || isCtrlC)) {
       abortActiveRequest();
       return;
@@ -283,6 +288,8 @@ function installPromptShortcuts(rl) {
       requestPromptShortcut("delete");
     } else if (isCtrlC) {
       requestPromptShortcut("back");
+    } else if (isCtrlG) {
+      requestPromptShortcut("continue");
     } else if ((key && key.name === "f2") || str === "\x1bOQ" || str === "\x1b[12~") {
       requestPromptShortcut("settings");
     }
@@ -3319,6 +3326,110 @@ const elapsed = Math.round((Date.now() - started) / 1000);
   }
 }
 
+function buildContinueInstruction(baseText) {
+  const tail = String(baseText || "").trim().slice(-900);
+  return [
+    "직전 답변의 마지막 문장 다음부터 그대로 이어서 작성해줘.",
+    "이미 작성한 문장/표현은 반복하지 말고, 이어지는 본문만 출력해.",
+    "메타/INFO/STATUS/코드블록은 출력하지 마.",
+    "",
+    "[직전 출력 끝부분]",
+    tail,
+  ].join("\n");
+}
+
+function continuationDelta(baseText, mergedText) {
+  const base = String(baseText || "").trimEnd();
+  const merged = String(mergedText || "").trim();
+  if (!merged) return "";
+  if (base && merged.startsWith(base)) return merged.slice(base.length).trimStart();
+  return merged;
+}
+
+async function continueLatestAssistant() {
+  if (!state.chatId) {
+    throw new Error("열린 채팅이 없습니다. /open 또는 /new로 채팅을 먼저 여세요.");
+  }
+
+  const latest = dbGet(
+    `SELECT id, role, content
+       FROM messages
+      WHERE chatId=?
+      ORDER BY createdAt DESC, id DESC
+      LIMIT 1`,
+    [state.chatId]
+  );
+  const role = String(latest && latest.role || "").toLowerCase();
+  if (!latest || (role !== "assistant" && role !== "model")) {
+    throw new Error("직전 메시지가 AI 답변이 아니라 이어서 생성할 수 없습니다.");
+  }
+
+  const assistantMessageId = String(latest.id || "").trim();
+  const baseText = decryptIfPossible(String(latest.content || "")).trim();
+  if (!assistantMessageId || !baseText) {
+    throw new Error("이어쓰기할 AI 답변을 찾지 못했습니다.");
+  }
+
+  pauseBackgroundMaintenance();
+  const st = await loadSettings().catch(() => null);
+  const runtime = st
+    ? {
+        model: st.model,
+        maxOutputTokens: st.maxOutputTokens,
+        maxReasoningTokens: st.maxReasoningTokens,
+        keepUserTurns: st.memoryFrom,
+        perTurnChars: st.summaryLength,
+      }
+    : undefined;
+
+  console.log("");
+  hr("이어서 생성");
+  const started = Date.now();
+  let status = startResponseStatus(started);
+  try {
+    const json = await apiJson("/api/chat/send", {
+      method: "POST",
+      body: JSON.stringify({
+        chatId: state.chatId,
+        userText: buildContinueInstruction(baseText),
+        personaOverride: st
+          ? {
+              personaName: String(st.personaName || "").trim(),
+              personaAge: Number(st.personaAge || 0),
+              personaGender: String(st.personaGender || "").trim(),
+              personaInfo: String(st.personaInfo || "").trim(),
+            }
+          : undefined,
+        runtime,
+        regenerate: true,
+        replaceAssistantId: assistantMessageId,
+        continueFromAssistantId: assistantMessageId,
+        includeSuggestions: false,
+        stream: false,
+      }),
+    });
+
+    status?.stop(true);
+    status = null;
+    const mergedText = String(json && json.assistant && json.assistant.content || "");
+    const addedText = continuationDelta(baseText, mergedText);
+    if (addedText) printWrapped(textOnly(addedText));
+    else console.log("추가로 생성된 내용이 없습니다.");
+    console.log(`\n[이어쓰기 완료: ${Math.round((Date.now() - started) / 1000)}초]`);
+
+    queueBackgroundMaintenance({
+      chatId: state.chatId,
+      assistantMessageId,
+      memoryRefresh: json && json.memoryRefresh,
+      runtime,
+      timing: null,
+    });
+  } finally {
+    status?.stop(true);
+    resumeBackgroundMaintenance();
+  }
+}
+
 function help() {
   hr("ARCA DOS CHAT — 명령어");
   console.log("");
@@ -3328,6 +3439,7 @@ function help() {
   console.log("  /presets      작품 목록");
   console.log("  /new          작품으로 새 채팅 시작");
   console.log("  /history      대화 보기");
+  console.log("  /continue     직전 AI 답변 이어서 생성 (Ctrl+G)");
   console.log("  /delete       최근 user+assistant 한 쌍 삭제");
   console.log("");
   console.log(`${ANSI.bold}${ANSI.title}■ 설정${ANSI.reset}`);
@@ -3351,7 +3463,8 @@ function help() {
   console.log("  /exit         종료");
   console.log("");
   console.log(`${ANSI.gray}각 명령어를 인자 없이 그냥 입력하면 사용법/현재 상태를 보여줍니다.${ANSI.reset}`);
-  console.log(`${ANSI.gray}줄임말: /cs /o /p /n /hi /set /md /out /rs /per /mem /ref /ch /ac /bf /cls /q${ANSI.reset}`);
+  console.log(`${ANSI.gray}줄임말: /cs /o /p /n /hi /g /set /md /out /rs /per /mem /ref /ch /ac /bf /cls /q${ANSI.reset}`);
+  console.log(`${ANSI.gray}Ctrl+G : 직전 AI 답변 이어서 생성${ANSI.reset}`);
   console.log(`${ANSI.gray}Ctrl+Z : 방금 user+assistant 한 쌍 삭제${ANSI.reset}`);
   console.log(`${ANSI.gray}Ctrl+C : 진행 중이면 취소, 입력 대기 중이면 이전 화면${ANSI.reset}`);
   console.log(`${ANSI.gray}F2     : 통합 설정 패널 열기${ANSI.reset}`);
@@ -3368,6 +3481,7 @@ async function handleCommand(line, rl) {
   else if (cmd === "/presets" || cmd === "/p") printPresets(listPresets(30));
   else if (cmd === "/new" || cmd === "/n") await createChat(arg);
   else if (cmd === "/history" || cmd === "/hi" || cmd === "/hist") await showHistory(Number(arg) || 20);
+  else if (cmd === "/continue" || cmd === "/cont" || cmd === "/g") await continueLatestAssistant();
   else if (cmd === "/panel" || cmd === "/ui" || cmd === "/config") await openSettingsPanel(rl);
   else if (cmd === "/settings" || cmd === "/set" || cmd === "/s") await showSettings();
   else if (cmd === "/model" || cmd === "/md") await chooseModelSetting(arg, rl);
@@ -3467,8 +3581,14 @@ async function main() {
           await openSettingsPanel(rl);
           continue;
         }
-        if (err && err.name === "AbortError") continue;
-        throw err;
+        if (err && err.name === "AbortError" && action === "continue") {
+          process.stdout.write("\n");
+          lineRaw = "/continue";
+        } else if (err && err.name === "AbortError") {
+          continue;
+        } else {
+          throw err;
+        }
       } finally {
         state.promptController = null;
       }
@@ -3548,4 +3668,7 @@ module.exports = {
   clearEchoedPromptRegion,
   promptPersonaFields,
   createInactivityWatchdog,
+  isCtrlGShortcut,
+  buildContinueInstruction,
+  continuationDelta,
 };

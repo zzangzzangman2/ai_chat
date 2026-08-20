@@ -299,6 +299,21 @@ export function sanitizeCharacterEpistemicText(
 }
 
 /**
+ * Recent assistant turns are already divided into individual messages by the
+ * caller. Removing a whole message when one sentence contains a protected
+ * conclusion erases the model's immediate scene continuity, so use the
+ * sentence-level output sanitizer for this prompt view. Summary blocks keep
+ * using sanitizeSharedEpistemicText because their headings can carry context
+ * across adjacent sentences.
+ */
+export function sanitizeRecentAssistantEpistemicText(
+  value: unknown,
+  firewall: EpistemicPromptFirewall
+): EpistemicSanitizeResult {
+  return sanitizeGeneratedEpistemicText(value, firewall);
+}
+
+/**
  * Final-response backstop. Unlike shared-memory sanitization, this removes only
  * the individual generated sentences that assert a world-only confidential
  * fact so the rest of the scene and its observable details remain intact.

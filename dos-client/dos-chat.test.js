@@ -6,6 +6,9 @@ const {
   clearEchoedPromptRegion,
   clearPreviousTerminalRows,
   createInactivityWatchdog,
+  isCtrlGShortcut,
+  buildContinueInstruction,
+  continuationDelta,
   displayWidth,
   promptPersonaFields,
   terminalRowsForLine,
@@ -32,6 +35,23 @@ test("response watchdog forwards a manual parent abort without reporting a timeo
   assert.equal(watchdog.signal.aborted, true);
   assert.equal(watchdog.didTimeout(), false);
   watchdog.stop();
+});
+
+test("Ctrl+G is recognized as the continue shortcut", () => {
+  assert.equal(isCtrlGShortcut("\x07", undefined), true);
+  assert.equal(isCtrlGShortcut("", { ctrl: true, name: "g" }), true);
+  assert.equal(isCtrlGShortcut("g", { ctrl: false, name: "g" }), false);
+});
+
+test("continue instruction includes the latest answer tail", () => {
+  const instruction = buildContinueInstruction("앞부분-" + "가".repeat(950));
+  assert.match(instruction, /직전 답변의 마지막 문장 다음부터/u);
+  assert.equal(instruction.endsWith("가".repeat(900)), true);
+});
+
+test("continuationDelta prints only newly appended content", () => {
+  assert.equal(continuationDelta("기존 답변", "기존 답변\n새 문장"), "새 문장");
+  assert.equal(continuationDelta("기존 답변", "완전히 교체된 답변"), "완전히 교체된 답변");
 });
 
 test("terminalRowsForLine counts a short input as one terminal row", () => {
