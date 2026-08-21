@@ -59,7 +59,10 @@ import {
 } from "@/lib/canonical_character_facts";
 import { buildSpatialCanon } from "@/lib/spatial_canon";
 import { resolveActiveCharacterFocus } from "@/lib/active_character_focus";
-import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
+import {
+  normalizeNovelParagraphMarkers,
+  repairUnbalancedNovelBodyMarkers,
+} from "@/lib/novel_output_balance";
 import {
   buildPreviousStatusPanelSnapshot,
   mergeStatusPanelContinuity,
@@ -3030,6 +3033,7 @@ const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
       registeredNames: continuityIdentities.map((identity) => String(identity?.name || "")),
       chatId: cid,
       userTurnCount,
+      focusedConversation: activeCharacterFocus.locked,
     });
 
 // (2026-07) 캐시 친화 배치: Vertex implicit cache는 "앞에서부터 바이트 동일한 프리픽스"만
@@ -3193,6 +3197,7 @@ const systemRaw = (cacheFriendlyLayout
           `- 최신 사용자 입력의 직접 대상은 ${activeCharacterFocus.names.join(", ")}이다. 이 판정은 최신 사용자 발화와 그 이전 사용자 호명만으로 정했으며, 과거 어시스턴트 서술보다 우선한다.`,
           `- 최신 입력의 '너/넌/널/네가/너한테' 같은 2인칭은 위 인물을 가리킨다. 다른 등록 인물로 바꾸지 않는다.`,
           `- 다른 인물이 장면에 함께 있거나 반응할 수는 있지만, 위 인물의 나이·직업·관계·기억·행동을 다른 인물에게 옮기거나 서로 합치지 않는다.`,
+          `- 사용자가 위 인물에게 직접 질문했다면 먼저 그 질문에 구체적으로 답한다. 새 인물·초인종·전화·외부 사건으로 질문을 회피하거나 장면 초점을 빼앗지 않는다.`,
           `- 직전 어시스턴트 응답이나 장기요약이 다른 화자를 잘못 세웠다면 그 오기를 이어 쓰지 말고 위 대상으로 복구한다.`,
         ].join("\n")
       : "";
@@ -4381,14 +4386,24 @@ if (!TRANSPORT_STREAMING) {
           // The model can stop at its soft body budget after opening a dialogue
           // quote/narration marker. Repair locally before persistence; this never
           // spends another model call or rewrites completed prose.
+          const streamNovelMarkers = normalizeNovelParagraphMarkers(assistantText);
+          if (streamNovelMarkers.changed) {
+            assistantText = streamNovelMarkers.text;
+            debugReasons.push("format:NORMALIZE_NOVEL_PARAGRAPHS");
+          }
           const streamStatusContinuity = mergeStatusPanelContinuity({
             currentText: assistantText,
             previousPanel: previousStatusPanelSnapshot,
             maxAffinityEntries: 5,
+            appendWhenMissing: statusRequired === "YES",
           });
           if (streamStatusContinuity.changed) {
             assistantText = streamStatusContinuity.text;
-            debugReasons.push("status:RESTORE_PREVIOUS_FIELDS");
+            debugReasons.push(
+              streamStatusContinuity.appended
+                ? "status:APPEND_MISSING_PREVIOUS_PANEL"
+                : "status:RESTORE_PREVIOUS_FIELDS"
+            );
           }
           const streamMarkerBalance = repairUnbalancedNovelBodyMarkers(assistantText);
           if (streamMarkerBalance.repaired) {
@@ -5651,14 +5666,24 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     if (!assistantText.trim()) {
       assistantText = recoverAfterOverfilter(factGuardRecoverySource).trim();
     }
+    const novelMarkers = normalizeNovelParagraphMarkers(assistantText);
+    if (novelMarkers.changed) {
+      assistantText = novelMarkers.text;
+      debugReasons.push("format:NORMALIZE_NOVEL_PARAGRAPHS");
+    }
     const statusContinuity = mergeStatusPanelContinuity({
       currentText: assistantText,
       previousPanel: previousStatusPanelSnapshot,
       maxAffinityEntries: 5,
+      appendWhenMissing: statusRequired === "YES",
     });
     if (statusContinuity.changed) {
       assistantText = statusContinuity.text;
-      debugReasons.push("status:RESTORE_PREVIOUS_FIELDS");
+      debugReasons.push(
+        statusContinuity.appended
+          ? "status:APPEND_MISSING_PREVIOUS_PANEL"
+          : "status:RESTORE_PREVIOUS_FIELDS"
+      );
     }
     const markerBalance = repairUnbalancedNovelBodyMarkers(assistantText);
     if (markerBalance.repaired) {

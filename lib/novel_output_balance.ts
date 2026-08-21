@@ -13,6 +13,52 @@ function trailingFenceStart(text: string) {
   return Number(markers[markers.length - 2].index || text.length);
 }
 
+function isNovelImageParagraph(value: string) {
+  const lines = String(value || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return false;
+  return lines.every(
+    (line) =>
+      /^!*https?:\/\/\S+$/i.test(line) ||
+      /^!\[[^\]]*\]\([^)]+\)$/.test(line) ||
+      /^\{\{img:/i.test(line)
+  );
+}
+
+// Streaming responses are shown append-only while tokens arrive, so the strict
+// novel formatter cannot safely rewrite them mid-stream. Normalize only the
+// completed body and leave the trailing STATUS/INFO fence byte-for-byte intact.
+export function normalizeNovelParagraphMarkers(value: unknown) {
+  const text = String(value || "").replace(/\r\n/g, "\n");
+  if (!text.trim()) return { text, changed: false };
+
+  const splitAt = trailingFenceStart(text);
+  const body = text.slice(0, splitAt);
+  const tail = text.slice(splitAt);
+  const normalizedBody = body
+    .split(/(\n{2,})/)
+    .map((part) => {
+      if (!part.trim() || /^\n{2,}$/.test(part)) return part;
+      const leading = part.match(/^\s*/)?.[0] || "";
+      const trailing = part.match(/\s*$/)?.[0] || "";
+      const trimmed = part.trim();
+      if (
+        trimmed.startsWith("*") ||
+        /^(?:[^"“\n]{1,50}\|\s*)?["“]/u.test(trimmed) ||
+        trimmed.startsWith("```") ||
+        isNovelImageParagraph(trimmed)
+      ) {
+        return part;
+      }
+      return `${leading}*${trimmed}*${trailing}`;
+    })
+    .join("");
+  const normalized = normalizedBody + tail;
+  return { text: normalized, changed: normalized !== text };
+}
+
 export function repairUnbalancedNovelBodyMarkers(value: unknown): NovelOutputBalanceResult {
   const text = String(value || "");
   const splitAt = trailingFenceStart(text);

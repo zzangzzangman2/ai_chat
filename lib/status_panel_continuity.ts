@@ -106,18 +106,27 @@ export function mergeStatusPanelContinuity(params: {
   currentText: unknown;
   previousPanel: unknown;
   maxAffinityEntries?: number;
+  appendWhenMissing?: boolean;
 }) {
   const currentText = String(params.currentText || "");
   const current = trailingPanel(currentText);
   const previous = trailingPanel(params.previousPanel);
-  if (!current || !previous) return { text: currentText, changed: false, panel: current?.fence || "" };
+  if (!previous) return { text: currentText, changed: false, panel: current?.fence || "", appended: false };
+  if (!current) {
+    if (!params.appendWhenMissing) {
+      return { text: currentText, changed: false, panel: "", appended: false };
+    }
+    const body = currentText.trimEnd();
+    const text = `${body}${body ? "\n\n" : ""}${previous.fence}`;
+    return { text, changed: text !== currentText, panel: previous.fence, appended: true };
+  }
   const mergedFence = mergePanelFences(
     current.fence,
     previous.fence,
     Math.max(1, Math.min(20, Math.floor(params.maxAffinityEntries ?? 5)))
   );
   const text = `${current.before}${current.before ? "\n\n" : ""}${mergedFence}`;
-  return { text, changed: text !== currentText.trimEnd(), panel: mergedFence };
+  return { text, changed: text !== currentText.trimEnd(), panel: mergedFence, appended: false };
 }
 
 export function buildPreviousStatusPanelSnapshot(messages: StatusPanelMessage[], maxPanels = 20) {

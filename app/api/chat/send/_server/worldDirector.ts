@@ -10,6 +10,7 @@ type WorldDirectorInput = {
   registeredNames?: string[];
   chatId?: string;
   userTurnCount?: number;
+  focusedConversation?: boolean;
 };
 
 export type WorldActivityAssessment = {
@@ -22,6 +23,7 @@ export type WorldActivityAssessment = {
   scheduled: boolean;
   sceneLocked: boolean;
   explicitRequest: boolean;
+  focusedConversation: boolean;
   shouldActivate: boolean;
 };
 
@@ -157,12 +159,14 @@ export function assessWorldActivity(input: WorldDirectorInput): WorldActivityAss
     .trim();
   const sceneLocked = SCENE_LOCK_RE.test(`${authorConstraintText}\n${currentUserText}`);
   const explicitRequest = EXPLICIT_WORLD_REQUEST_RE.test(currentUserText);
+  const focusedConversation = Boolean(input.focusedConversation);
   const scheduled = scheduledDirectorTurn(
     String(input.chatId || "chat"),
     Math.max(0, Math.floor(input.userTurnCount || 0))
   );
   const stagnant = assistantTurns.length >= 4 && stagnationScore >= 3;
-  const shouldActivate = !sceneLocked && (explicitRequest || (scheduled && stagnant));
+  const shouldActivate =
+    !sceneLocked && (explicitRequest || (!focusedConversation && scheduled && stagnant));
 
   return {
     assistantTurnsReviewed: assistantTurns.length,
@@ -174,6 +178,7 @@ export function assessWorldActivity(input: WorldDirectorInput): WorldActivityAss
     scheduled,
     sceneLocked,
     explicitRequest,
+    focusedConversation,
     shouldActivate,
   };
 }
