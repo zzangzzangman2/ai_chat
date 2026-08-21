@@ -26,7 +26,11 @@ import {
   syncIdentityCanonRelations,
   type RelationshipGraphData,
 } from "@/lib/relationship_graph";
-import { formatAddressDirectionGuard } from "@/lib/relationship_direction";
+import {
+  formatAddressDirectionGuard,
+  sanitizeAddressDirectionOutput,
+  selectCanonicalAddressDirections,
+} from "@/lib/relationship_direction";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
 import {
   buildGroundedEpistemicFactIds,
@@ -2173,6 +2177,24 @@ ${body}`.trim();
         error: String((error as { message?: unknown })?.message || error),
       });
     }
+    const canonicalAddressDirections = selectCanonicalAddressDirections(
+      relationshipGraph.relations.map((relation) => ({
+        id: relation.id,
+        speakerKey: relation.addressSpeakerKey,
+        speakerName: relation.addressSpeakerName,
+        targetKey: relation.addressTargetKey,
+        targetName: relation.addressTargetName,
+        term: relation.addressTerm,
+        sourceRole: relation.sourceRole,
+        isManual: relation.isManual,
+        lastSeenTurn: relation.lastSeenTurn,
+      }))
+    );
+    const sanitizeAddressDirections = (text: unknown) =>
+      sanitizeAddressDirectionOutput({
+        text,
+        directions: canonicalAddressDirections,
+      });
     const focusedCanonNames = new Set(
       [
         personaNameFinal,
@@ -2413,12 +2435,17 @@ ${body}`.trim();
         identities: legalStatusIdentities,
       });
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
-      if (vitalStatus.removed > 0) return vitalStatus.text;
+      const addressDirection = sanitizeAddressDirections(vitalStatus.text);
+      if (vitalStatus.removed > 0 || addressDirection.replaced > 0) {
+        return addressDirection.text;
+      }
       // The guards may remove unsupported local passages, but a false-positive
       // match must never erase an otherwise completed provider response. Keep
       // the single-call draft only when the combined filters would return no
       // visible text at all; partial redactions remain fully enforced.
-      return String(vitalStatus.text || "").trim() ? vitalStatus.text : original;
+      return String(addressDirection.text || "").trim()
+        ? addressDirection.text
+        : original;
     };
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
@@ -2499,7 +2526,8 @@ ${body}`.trim();
       identities: legalStatusIdentities,
     });
     const historyVitalStatusView = sanitizeVitalStatus(historyLegalStatusView.text);
-    const historySummaryForPrompt = historyVitalStatusView.text;
+    const historyAddressDirectionView = sanitizeAddressDirections(historyVitalStatusView.text);
+    const historySummaryForPrompt = historyAddressDirectionView.text;
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -2573,6 +2601,7 @@ ${body}`.trim();
       epistemicWorldOnlyFactCount: epistemicFirewall.worldOnlyRelationIds.size,
       epistemicSummaryRedactions: historyEpistemicView.redactedSegments,
       legalStatusSummaryRedactions: historyLegalStatusView.removed,
+      addressDirectionSummaryReplacements: historyAddressDirectionView.replaced,
     });
     const memoryBlock = [
       fullLongMemoryText
@@ -3206,17 +3235,7 @@ const systemRaw = (cacheFriendlyLayout
         ].join("\n")
       : "";
     const addressDirectionPriorityBlock = formatAddressDirectionGuard(
-      relationshipGraph.relations.map((relation) => ({
-        id: relation.id,
-        speakerKey: relation.addressSpeakerKey,
-        speakerName: relation.addressSpeakerName,
-        targetKey: relation.addressTargetKey,
-        targetName: relation.addressTargetName,
-        term: relation.addressTerm,
-        sourceRole: relation.sourceRole,
-        isManual: relation.isManual,
-        lastSeenTurn: relation.lastSeenTurn,
-      }))
+      canonicalAddressDirections
     );
     const statusContinuityPriorityBlock = previousStatusPanelSnapshot
       ? [
@@ -3352,6 +3371,7 @@ const systemRaw = (cacheFriendlyLayout
     let epistemicTailRedactions = 0;
     let legalStatusTailRedactions = 0;
     let vitalStatusTailRedactions = 0;
+    let addressDirectionTailReplacements = 0;
     const promptHistorySource = continueMode
       ? all
       : selectMessagesBeforeCurrentUser(all, userMsg.id);
@@ -3388,7 +3408,9 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusTailRedactions += legalStatus.removed;
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
       vitalStatusTailRedactions += vitalStatus.removed;
-      return { ...message, content: vitalStatus.text };
+      const addressDirection = sanitizeAddressDirections(vitalStatus.text);
+      addressDirectionTailReplacements += addressDirection.replaced;
+      return { ...message, content: addressDirection.text };
     });
     const contextRaw = formatStoryTurnsForMode(
       epistemicTail,
@@ -3403,7 +3425,9 @@ const systemRaw = (cacheFriendlyLayout
       historyLegalStatusView.removed ||
       legalStatusTailRedactions ||
       historyVitalStatusView.removed ||
-      vitalStatusTailRedactions
+      vitalStatusTailRedactions ||
+      historyAddressDirectionView.replaced ||
+      addressDirectionTailReplacements
     ) {
       dbg({
         tag: "send.epistemic-firewall",
@@ -3417,6 +3441,8 @@ const systemRaw = (cacheFriendlyLayout
         vitalStatusSummaryRedactions: historyVitalStatusView.removed,
         vitalStatusTailRedactions,
         recentLegalStatusRedactions: legalStatusTailRedactions,
+        addressDirectionSummaryReplacements: historyAddressDirectionView.replaced,
+        addressDirectionTailReplacements,
       });
     }
     // 사용자 입력을 모드에 맞춰 전달한다.
@@ -3879,6 +3905,7 @@ let cancelStreamWork: (() => void) | null = null;
         let streamLegalStatusRedactions = 0;
         let streamVitalStatusRedactions = 0;
         let streamScenePresenceRedactions = 0;
+        let streamAddressDirectionReplacements = 0;
         const guardedTextStream = createGuardedTextStream((text) => {
           const epistemic = sanitizeGeneratedFacts(text);
           const legalStatus = removeUnsupportedLegalStatusClaims({
@@ -3893,11 +3920,13 @@ let cancelStreamWork: (() => void) | null = null;
             currentUserText: userText,
             presentCharacters: currentScenePresence,
           });
+          const addressDirection = sanitizeAddressDirections(scenePresence.text);
           streamEpistemicRedactions += epistemic.redactedSegments;
           streamLegalStatusRedactions += legalStatus.removed;
           streamVitalStatusRedactions += vitalStatus.removed;
           streamScenePresenceRedactions += scenePresence.removed;
-          return scenePresence.text;
+          streamAddressDirectionReplacements += addressDirection.replaced;
+          return addressDirection.text;
         });
         const safeEnqueue = (obj: any) => {
           if (obj?.type !== "delta" || typeof obj?.text !== "string") {
@@ -4390,7 +4419,8 @@ if (!TRANSPORT_STREAMING) {
             streamEpistemicRedactions ||
             streamLegalStatusRedactions ||
             streamVitalStatusRedactions ||
-            streamScenePresenceRedactions
+            streamScenePresenceRedactions ||
+            streamAddressDirectionReplacements
           ) {
             dbg({
               tag: "send.stream.output-fact-guard",
@@ -4400,6 +4430,7 @@ if (!TRANSPORT_STREAMING) {
               legalStatusRedactions: streamLegalStatusRedactions,
               vitalStatusRedactions: streamVitalStatusRedactions,
               scenePresenceRedactions: streamScenePresenceRedactions,
+              addressDirectionReplacements: streamAddressDirectionReplacements,
             });
           }
 
@@ -5662,12 +5693,16 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       currentUserText: userText,
       presentCharacters: currentScenePresence,
     });
-    assistantText = scenePresenceOutputChecked.text;
+    const addressDirectionOutputChecked = sanitizeAddressDirections(
+      scenePresenceOutputChecked.text
+    );
+    assistantText = addressDirectionOutputChecked.text;
     if (
       epistemicOutputChecked.redactedSegments ||
       legalStatusOutputChecked.removed ||
       vitalStatusOutputChecked.removed ||
-      scenePresenceOutputChecked.removed
+      scenePresenceOutputChecked.removed ||
+      addressDirectionOutputChecked.replaced
     ) {
       dbg({
         tag: "send.output-fact-guard",
@@ -5681,6 +5716,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         vitalStatusSubjects: vitalStatusOutputChecked.subjects,
         scenePresenceRedactions: scenePresenceOutputChecked.removed,
         scenePresenceCharacters: scenePresenceOutputChecked.characterNames,
+        addressDirectionReplacements: addressDirectionOutputChecked.replaced,
+        addressDirectionTerms: addressDirectionOutputChecked.terms,
+        reversedAddressSpeakers: addressDirectionOutputChecked.reversedSpeakers,
       });
     }
     if (!assistantText.trim()) {
