@@ -17,6 +17,7 @@ import {
   type CanonicalFactObservation,
   type ResolvedCanonicalFact,
 } from "@/lib/canonical_character_facts";
+import { stripFencedBlocks } from "@/lib/relationship_memory";
 
 export const STRUCTURED_RELATION_TYPES = [
   "아버지",
@@ -476,7 +477,12 @@ export async function extractStructuredCharacterGraph(params: {
   windowStartTurn: number;
   windowEndTurn: number;
 }): Promise<StructuredCharacterGraph> {
-  const raw = String(params.rawWindowText || "").trim();
+  // STATUS/INFO panels list many characters and profile fields without showing
+  // who actually spoke. They are UI metadata, never evidence for a new identity
+  // fact or relationship observation.
+  const raw = stripFencedBlocks(String(params.rawWindowText || ""))
+    .replace(/```[\s\S]*$/g, " ")
+    .trim();
   if (!raw || raw.length < 40) {
     return { ok: true, characters: [], relationships: [], facts: [] };
   }

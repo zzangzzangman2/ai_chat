@@ -2,6 +2,7 @@ export type CanonicalFactCandidate = {
   sourceRole: "user" | "assistant";
   value: string;
   turnNo: number;
+  evidence?: string;
 };
 
 function normalizedValue(value: unknown) {
@@ -29,8 +30,11 @@ export function resolveCanonicalFactCandidate<T extends CanonicalFactCandidate>(
     .map((items) => ({
       items,
       distinctTurns: new Set(items.map((item) => Math.max(0, Math.trunc(Number(item.turnNo) || 0)))).size,
+      distinctEvidence: new Set(
+        items.map((item) => normalizedValue(item.evidence)).filter(Boolean)
+      ).size,
     }))
-    .filter((group) => group.distinctTurns >= 2)
+    .filter((group) => group.distinctTurns >= 2 && group.distinctEvidence >= 2)
     .sort(
       (a, b) =>
         b.distinctTurns - a.distinctTurns ||
