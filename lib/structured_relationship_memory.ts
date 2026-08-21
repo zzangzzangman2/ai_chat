@@ -18,6 +18,7 @@ import {
   type ResolvedCanonicalFact,
 } from "@/lib/canonical_character_facts";
 import { stripFencedBlocks } from "@/lib/relationship_memory";
+import { addressDirectionsConflict } from "@/lib/relationship_direction";
 
 export const STRUCTURED_RELATION_TYPES = [
   "아버지",
@@ -206,6 +207,12 @@ export type StructuredRelationship = {
   relation: string;
   details: string;
   evidence: string;
+  sourceRole: "user" | "assistant";
+  addressSpeakerId: string;
+  addressSpeakerName: string;
+  addressTargetId: string;
+  addressTargetName: string;
+  addressTerm: string;
   knownByNames: string[];
   knowledgeEvidence: string;
 };
@@ -340,6 +347,10 @@ const STRUCTURED_GRAPH_SCHEMA = {
           "relation",
           "details",
           "evidence",
+          "source_role",
+          "address_speaker_id",
+          "address_target_id",
+          "address_term",
           "known_by_ids",
           "knowledge_evidence",
         ],
@@ -349,6 +360,13 @@ const STRUCTURED_GRAPH_SCHEMA = {
           relation: { type: "string" },
           details: { type: "string" },
           evidence: { type: "string" },
+          source_role: {
+            type: "string",
+            enum: ["user", "assistant"],
+          },
+          address_speaker_id: { type: "string" },
+          address_target_id: { type: "string" },
+          address_term: { type: "string" },
           known_by_ids: {
             type: "array",
             items: { type: "string" },
@@ -542,7 +560,12 @@ export async function extractStructuredCharacterGraph(params: {
     "",
     "중요 규칙:",
     "- relationships는 이름이 아니라 characters의 id로 연결한다.",
-    "- 관계 방향은 'target_id가 source_id에게 relation에 해당한다'는 뜻이다. 예: source=아이, target=김철수, relation=아버지.",
+    "- 관계 방향은 'target_id가 source_id에게 relation에 해당한다'는 뜻이다. 저장 표기는 source → relation → target이다. 예: source=아이, target=김철수, relation=아버지.",
+    "- 호칭 방향은 관계 방향과 별도로 address_speaker_id → address_target_id → address_term에 반드시 기록한다. 예: A가 B를 '선배님'이라고 부르면 speaker=A, target=B, term=선배님이다.",
+    "- 호칭이 없는 관계는 address_speaker_id, address_target_id, address_term을 모두 빈 문자열로 쓴다. 하나만 채우거나 대명사를 id로 쓰지 않는다.",
+    "- 한국어 직접 호명 '장인어른, 반말하세요'는 그 말을 한 인물이 상대를 '장인어른'이라고 부른 것이다. 상대가 발화자를 그렇게 부른 뜻이 아니며 실제 혈연·혼인 관계로 자동 승격하지 않는다.",
+    "- details에 호칭을 설명할 때도 반드시 'A가 B를 X라고 부른다'처럼 발화자와 수신자 실명을 모두 써서 address_* 필드와 같은 방향으로 작성한다.",
+    "- relationship의 source_role은 evidence가 속한 원문 태그가 [사용자]면 user, [어시스턴트]면 assistant로 정확히 쓴다.",
     "- 형/누나/오빠/언니/선배/후배/대표님/주인님 같은 호칭은 동일 인물 통합과 가족·서열·직장 관계 판단에 활용한다.",
     "- 관계는 고정 설정이 아니다. 최신 대화에서 관계가 발전하거나 깨졌다면 초기 직업·초면 관계보다 최신 상태를 우선한다.",
     "- known_by_ids는 관계의 양 끝 인물 목록이 아니다. 각 인물이 그 관계의 구체적 사실을 안다는 원문 근거가 있을 때만 넣는다.",
@@ -741,6 +764,29 @@ export async function extractStructuredCharacterGraph(params: {
     const target = resolveKnownCharacter(item?.target_id);
     const relation = cleanText(item?.relation, 40);
     const evidence = exactEvidence(raw, item?.evidence);
+    const sourceRole = evidence ? evidenceSourceRole(raw, evidence) : "";
+    const declaredSourceRole = cleanText(item?.source_role, 20);
+    const proposedAddressSpeaker = resolveKnownCharacter(item?.address_speaker_id);
+    const proposedAddressTarget = resolveKnownCharacter(item?.address_target_id);
+    const proposedAddressTerm = cleanText(item?.address_term, 40).replace(
+      /^["'“”]+|["'“”]+$/g,
+      ""
+    );
+    const hasAddressData = Boolean(
+      cleanText(item?.address_speaker_id, 120) ||
+      cleanText(item?.address_target_id, 120) ||
+      proposedAddressTerm
+    );
+    const addressIsValid =
+      !hasAddressData ||
+      Boolean(
+        proposedAddressSpeaker &&
+        proposedAddressTarget &&
+        proposedAddressSpeaker.mainName !== proposedAddressTarget.mainName &&
+        proposedAddressTerm &&
+        [source?.id, target?.id].includes(proposedAddressSpeaker.id) &&
+        [source?.id, target?.id].includes(proposedAddressTarget.id)
+      );
     const knowledgeEvidence = exactEvidence(raw, item?.knowledge_evidence);
     const knownByNames: string[] = [];
     if (knowledgeEvidence && Array.isArray(item?.known_by_ids)) {
@@ -758,7 +804,10 @@ export async function extractStructuredCharacterGraph(params: {
       !target ||
       source.mainName === target.mainName ||
       (!RELATION_TYPE_SET.has(relation) && !isValidDescriptiveRelationship(relation)) ||
-      !evidence
+      !evidence ||
+      !sourceRole ||
+      declaredSourceRole !== sourceRole ||
+      !addressIsValid
     ) {
       rejectedRelationshipCount += 1;
       continue;
@@ -778,6 +827,12 @@ export async function extractStructuredCharacterGraph(params: {
       relation,
       details: cleanText(item?.details, 500),
       evidence,
+      sourceRole: sourceRole as "user" | "assistant",
+      addressSpeakerId: hasAddressData ? proposedAddressSpeaker?.id || "" : "",
+      addressSpeakerName: hasAddressData ? proposedAddressSpeaker?.mainName || "" : "",
+      addressTargetId: hasAddressData ? proposedAddressTarget?.id || "" : "",
+      addressTargetName: hasAddressData ? proposedAddressTarget?.mainName || "" : "",
+      addressTerm: hasAddressData ? proposedAddressTerm : "",
       knownByNames,
       knowledgeEvidence,
     });
@@ -1066,7 +1121,9 @@ export function applyStructuredCharacterGraph(params: {
   applyCharacters();
 
   const findExistingRelation = db.prepare(
-    `SELECT id, firstSeenTurn, knownBy, knowledgeEvidence
+    `SELECT id, firstSeenTurn, knownBy, knowledgeEvidence, evidence, sourceRole,
+            addressSpeakerKey, addressSpeakerName, addressTargetKey,
+            addressTargetName, addressTerm
      FROM chat_character_relations
      WHERE chatId=? AND subjectKey=? AND relation=? AND objectKey=?
      ORDER BY CASE WHEN slotKey LIKE 'structured:%' THEN 1 ELSE 0 END, updatedAt DESC
@@ -1075,6 +1132,8 @@ export function applyStructuredCharacterGraph(params: {
   const updateRelation = db.prepare(
     `UPDATE chat_character_relations
      SET subjectName=?, objectName=?, objectRole=?, knownBy=?, knowledgeEvidence=?,
+         evidence=?, sourceRole=?, addressSpeakerKey=?, addressSpeakerName=?,
+         addressTargetKey=?, addressTargetName=?, addressTerm=?,
           sourceOrder=MAX(sourceOrder, ?),
          lastSeenTurn=MAX(lastSeenTurn, ?),
          updatedAt=?
@@ -1083,9 +1142,11 @@ export function applyStructuredCharacterGraph(params: {
   const insertRelation = db.prepare(
     `INSERT INTO chat_character_relations
        (id, chatId, subjectKey, subjectName, relation, slotKey, objectKey,
-         objectName, objectRole, knownBy, knowledgeEvidence, sourceOrder,
+         objectName, objectRole, knownBy, knowledgeEvidence, evidence, sourceRole,
+         addressSpeakerKey, addressSpeakerName, addressTargetKey,
+         addressTargetName, addressTerm, sourceOrder,
          firstSeenTurn, lastSeenTurn, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(chatId, subjectKey, relation, slotKey) DO UPDATE SET
        subjectName=excluded.subjectName,
        objectKey=excluded.objectKey,
@@ -1099,9 +1160,29 @@ export function applyStructuredCharacterGraph(params: {
          WHEN excluded.knowledgeEvidence <> '' THEN excluded.knowledgeEvidence
          ELSE chat_character_relations.knowledgeEvidence
        END,
+       evidence=CASE WHEN excluded.evidence <> '' THEN excluded.evidence ELSE chat_character_relations.evidence END,
+       sourceRole=CASE
+         WHEN chat_character_relations.sourceRole='user' AND excluded.sourceRole='assistant'
+           THEN chat_character_relations.sourceRole
+         ELSE excluded.sourceRole
+       END,
+       addressSpeakerKey=CASE WHEN excluded.addressTerm <> '' THEN excluded.addressSpeakerKey ELSE chat_character_relations.addressSpeakerKey END,
+       addressSpeakerName=CASE WHEN excluded.addressTerm <> '' THEN excluded.addressSpeakerName ELSE chat_character_relations.addressSpeakerName END,
+       addressTargetKey=CASE WHEN excluded.addressTerm <> '' THEN excluded.addressTargetKey ELSE chat_character_relations.addressTargetKey END,
+       addressTargetName=CASE WHEN excluded.addressTerm <> '' THEN excluded.addressTargetName ELSE chat_character_relations.addressTargetName END,
+       addressTerm=CASE WHEN excluded.addressTerm <> '' THEN excluded.addressTerm ELSE chat_character_relations.addressTerm END,
        sourceOrder=MAX(chat_character_relations.sourceOrder, excluded.sourceOrder),
        lastSeenTurn=MAX(chat_character_relations.lastSeenTurn, excluded.lastSeenTurn),
        updatedAt=excluded.updatedAt`
+  );
+  const findAddressDirections = db.prepare(
+    `SELECT id, slotKey, sourceRole, addressSpeakerKey, addressSpeakerName,
+            addressTargetKey, addressTargetName, addressTerm, lastSeenTurn
+     FROM chat_character_relations
+     WHERE chatId=? AND LOWER(addressTerm)=LOWER(?) AND TRIM(addressTerm) <> ''`
+  );
+  const deleteRelationById = db.prepare(
+    `DELETE FROM chat_character_relations WHERE chatId=? AND id=?`
   );
   let relationshipsUpserted = 0;
   const applyRelationships = db.transaction(() => {
@@ -1119,6 +1200,60 @@ export function applyStructuredCharacterGraph(params: {
       const subjectKey = stableNameKey(subjectName, personaName);
       const objectKey = stableNameKey(objectName, personaName);
       if (!subjectKey || !objectKey || subjectKey === objectKey) continue;
+      const sourceRole = relationship.sourceRole === "user" ? "user" : "assistant";
+      const addressTerm = cleanText(relationship.addressTerm, 40);
+      const addressSpeakerName = addressTerm
+        ? cleanText(relationship.addressSpeakerName, 80)
+        : "";
+      const addressTargetName = addressTerm
+        ? cleanText(relationship.addressTargetName, 80)
+        : "";
+      const addressSpeakerKey = addressSpeakerName
+        ? stableNameKey(addressSpeakerName, personaName)
+        : "";
+      const addressTargetKey = addressTargetName
+        ? stableNameKey(addressTargetName, personaName)
+        : "";
+      if (
+        addressTerm &&
+        (!addressSpeakerKey || !addressTargetKey || addressSpeakerKey === addressTargetKey)
+      ) {
+        continue;
+      }
+      if (addressTerm) {
+        const incomingDirection = {
+          speakerKey: addressSpeakerKey,
+          speakerName: addressSpeakerName,
+          targetKey: addressTargetKey,
+          targetName: addressTargetName,
+          term: addressTerm,
+          sourceRole,
+          lastSeenTurn: turnNo,
+        };
+        const conflicts = (findAddressDirections.all(chatId, addressTerm) as any[]).filter(
+          (row) =>
+            addressDirectionsConflict(incomingDirection, {
+              id: String(row?.id || ""),
+              speakerKey: String(row?.addressSpeakerKey || ""),
+              speakerName: String(row?.addressSpeakerName || ""),
+              targetKey: String(row?.addressTargetKey || ""),
+              targetName: String(row?.addressTargetName || ""),
+              term: String(row?.addressTerm || ""),
+              sourceRole: String(row?.sourceRole || ""),
+              isManual: String(row?.slotKey || "").startsWith("manual:"),
+              lastSeenTurn: Number(row?.lastSeenTurn || 0),
+            })
+        );
+        if (
+          conflicts.some((row) => String(row?.slotKey || "").startsWith("manual:")) ||
+          (sourceRole !== "user" && conflicts.length > 0)
+        ) {
+          continue;
+        }
+        for (const conflict of conflicts) {
+          deleteRelationById.run(chatId, String(conflict?.id || ""));
+        }
+      }
       const details =
         cleanText(relationship.details, 500) ||
         `${subjectName}에게 ${objectName}은(는) ${relation}`;
@@ -1132,6 +1267,13 @@ export function applyStructuredCharacterGraph(params: {
         firstSeenTurn?: number;
         knownBy?: string;
         knowledgeEvidence?: string;
+        evidence?: string;
+        sourceRole?: string;
+        addressSpeakerKey?: string;
+        addressSpeakerName?: string;
+        addressTargetKey?: string;
+        addressTargetName?: string;
+        addressTerm?: string;
       } | undefined;
       const knownByNames = [
         ...new Set([
@@ -1143,6 +1285,16 @@ export function applyStructuredCharacterGraph(params: {
       const knowledgeEvidence =
         cleanText(relationship.knowledgeEvidence, 500) ||
         cleanText(existingRelation?.knowledgeEvidence, 500);
+      if (existingRelation?.sourceRole === "user" && sourceRole === "assistant") {
+        continue;
+      }
+      const storedEvidence = cleanText(relationship.evidence, 500) || cleanText(existingRelation?.evidence, 500);
+      const storedSourceRole = sourceRole || cleanText(existingRelation?.sourceRole, 20);
+      const storedAddressTerm = addressTerm || cleanText(existingRelation?.addressTerm, 40);
+      const storedAddressSpeakerKey = addressTerm ? addressSpeakerKey : cleanText(existingRelation?.addressSpeakerKey, 120);
+      const storedAddressSpeakerName = addressTerm ? addressSpeakerName : cleanText(existingRelation?.addressSpeakerName, 80);
+      const storedAddressTargetKey = addressTerm ? addressTargetKey : cleanText(existingRelation?.addressTargetKey, 120);
+      const storedAddressTargetName = addressTerm ? addressTargetName : cleanText(existingRelation?.addressTargetName, 80);
       if (existingRelation?.id) {
         updateRelation.run(
           subjectName,
@@ -1150,6 +1302,13 @@ export function applyStructuredCharacterGraph(params: {
           details,
           knownBy,
           knowledgeEvidence,
+          storedEvidence,
+          storedSourceRole,
+          storedAddressSpeakerKey,
+          storedAddressSpeakerName,
+          storedAddressTargetKey,
+          storedAddressTargetName,
+          storedAddressTerm,
           turnNo,
           turnNo,
           now,
@@ -1169,6 +1328,13 @@ export function applyStructuredCharacterGraph(params: {
           details,
           knownBy,
           knowledgeEvidence,
+          storedEvidence,
+          storedSourceRole,
+          storedAddressSpeakerKey,
+          storedAddressSpeakerName,
+          storedAddressTargetKey,
+          storedAddressTargetName,
+          storedAddressTerm,
           turnNo,
           turnNo,
           turnNo,

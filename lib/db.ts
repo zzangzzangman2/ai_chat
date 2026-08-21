@@ -705,6 +705,13 @@ if (!hasColumn("chat_settings", "narrationColor")) {
       objectRole TEXT NOT NULL DEFAULT '',
       knownBy TEXT NOT NULL DEFAULT '[]',
       knowledgeEvidence TEXT NOT NULL DEFAULT '',
+      evidence TEXT NOT NULL DEFAULT '',
+      sourceRole TEXT NOT NULL DEFAULT '',
+      addressSpeakerKey TEXT NOT NULL DEFAULT '',
+      addressSpeakerName TEXT NOT NULL DEFAULT '',
+      addressTargetKey TEXT NOT NULL DEFAULT '',
+      addressTargetName TEXT NOT NULL DEFAULT '',
+      addressTerm TEXT NOT NULL DEFAULT '',
       sourceOrder INTEGER NOT NULL DEFAULT 0,
       firstSeenTurn INTEGER NOT NULL DEFAULT 0,
       lastSeenTurn INTEGER NOT NULL DEFAULT 0,
@@ -722,6 +729,19 @@ if (!hasColumn("chat_settings", "narrationColor")) {
     db.exec(
       `ALTER TABLE chat_character_relations ADD COLUMN knowledgeEvidence TEXT NOT NULL DEFAULT ''`
     );
+  }
+  for (const column of [
+    "evidence",
+    "sourceRole",
+    "addressSpeakerKey",
+    "addressSpeakerName",
+    "addressTargetKey",
+    "addressTargetName",
+    "addressTerm",
+  ]) {
+    if (!hasColumn("chat_character_relations", column)) {
+      db.exec(`ALTER TABLE chat_character_relations ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+    }
   }
 
   // 4-1-2) 등록 인물이 주인공에게 느끼는 지속 호감도

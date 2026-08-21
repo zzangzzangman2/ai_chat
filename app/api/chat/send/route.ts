@@ -26,6 +26,7 @@ import {
   syncIdentityCanonRelations,
   type RelationshipGraphData,
 } from "@/lib/relationship_graph";
+import { formatAddressDirectionGuard } from "@/lib/relationship_direction";
 import { buildDynamicCharacterContext } from "@/lib/dynamic_character_context";
 import {
   buildGroundedEpistemicFactIds,
@@ -2595,6 +2596,9 @@ ${body}`.trim();
       `# (4) 관계/호칭 연속성(중요)`,
       `- 직전 대화와 장기기억에서 굳어진 관계/호칭/말투를 유지한다.`,
       `- 캐릭터별 관계와 호칭은 서로 독립이다. 한 캐릭터가 쓰는 호칭을 다른 캐릭터에게 복사하지 않는다.`,
+      `- 호칭은 반드시 '말한 사람 → 들은 사람 → 호칭' 방향으로 해석한다. A가 B를 '선배님'이라고 부르면 B가 A를 '선배님'이라고 부르는 뜻이 아니다.`,
+      `- 사용자가 '장인어른, 반말하세요'처럼 호칭 뒤에 직접 말을 이으면 사용자가 상대를 그 호칭으로 부른 것이다. 상대가 사용자를 그 호칭으로 부르게 뒤집지 않는다.`,
+      `- 강요·농담·위장으로 사용한 가족 호칭은 실제 혈연·혼인 관계를 새로 만든 증거가 아니다.`,
       `- 장기기억이나 캐릭터 기록의 ## 이름 경계를 절대 넘지 않는다. 각 항목은 해당 이름의 인물에게만 적용한다.`,
       `- 같은 인물을 한 답변 안에서 서로 다른 호칭으로 섞지 않는다. (예: "오빠/선배/야" 혼용 금지)`,
       `- '아빠/엄마/딸/아들'은 반드시 누구의 가족인지 대상 인물과 세대를 함께 확인한다. 대상이 다른 가족 호칭을 같은 인물로 합치지 않는다.`,
@@ -3201,6 +3205,19 @@ const systemRaw = (cacheFriendlyLayout
           `- 직전 어시스턴트 응답이나 장기요약이 다른 화자를 잘못 세웠다면 그 오기를 이어 쓰지 말고 위 대상으로 복구한다.`,
         ].join("\n")
       : "";
+    const addressDirectionPriorityBlock = formatAddressDirectionGuard(
+      relationshipGraph.relations.map((relation) => ({
+        id: relation.id,
+        speakerKey: relation.addressSpeakerKey,
+        speakerName: relation.addressSpeakerName,
+        targetKey: relation.addressTargetKey,
+        targetName: relation.addressTargetName,
+        term: relation.addressTerm,
+        sourceRole: relation.sourceRole,
+        isManual: relation.isManual,
+        lastSeenTurn: relation.lastSeenTurn,
+      }))
+    );
     const statusContinuityPriorityBlock = previousStatusPanelSnapshot
       ? [
           `# [STATUS PANEL CONTINUITY — APPLIES TO EVERY CHAT]`,
@@ -3222,6 +3239,7 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusPriorityBlock,
       vitalStatusPriorityBlock,
       activeInterlocutorPriorityBlock,
+      addressDirectionPriorityBlock,
       statusContinuityPriorityBlock,
       currentOocPriorityBlock,
     ]
@@ -3251,6 +3269,8 @@ const systemRaw = (cacheFriendlyLayout
 	          sanitizePromptCached(noteBlock),
 	          ``,
 	          sanitizePromptCached(relationshipConsistencyBlock),
+	          addressDirectionPriorityBlock ? `` : "",
+	          addressDirectionPriorityBlock ? sanitizePromptCached(addressDirectionPriorityBlock) : "",
 	          ``,
 	          sanitizePromptCached(formatGuide),
 	          recentExpressionAvoidanceBlock ? `` : "",

@@ -18,6 +18,10 @@ import {
   inferRelationshipKnownByNames,
   parseRelationshipKnownBy,
 } from "@/lib/character_knowledge";
+import {
+  formatAddressDirectionGuard,
+  selectCanonicalAddressDirections,
+} from "@/lib/relationship_direction";
 
 export type RelationshipGraphRelation = {
   id: string;
@@ -32,6 +36,13 @@ export type RelationshipGraphRelation = {
   objectRole: string;
   knownByNames: string[];
   knowledgeEvidence: string;
+  evidence: string;
+  sourceRole: string;
+  addressSpeakerKey: string;
+  addressSpeakerName: string;
+  addressTargetKey: string;
+  addressTargetName: string;
+  addressTerm: string;
   firstSeenTurn: number;
   lastSeenTurn: number;
   updatedAt: number;
@@ -430,9 +441,9 @@ export function setManualRelationship(params: {
     db.prepare(
       `INSERT INTO chat_character_relations
          (id, chatId, subjectKey, subjectName, relation, slotKey, objectKey,
-          objectName, objectRole, sourceOrder, firstSeenTurn, lastSeenTurn,
-          createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          objectName, objectRole, evidence, sourceRole, sourceOrder,
+          firstSeenTurn, lastSeenTurn, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       randomUUID(),
       chatId,
@@ -443,6 +454,8 @@ export function setManualRelationship(params: {
       objectKey,
       objectName,
       details || "사용자가 직접 지정한 현재 관계",
+      "사용자가 관계도 UI에서 직접 지정함",
+      "user",
       turnNo,
       turnNo,
       turnNo,
@@ -667,7 +680,10 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
       .prepare(
         `SELECT r.id, r.subjectKey, r.subjectName, r.relation, r.slotKey,
                 r.objectKey, r.objectName, r.objectRole, r.knownBy,
-                r.knowledgeEvidence, r.firstSeenTurn,
+                r.knowledgeEvidence, r.evidence, r.sourceRole,
+                r.addressSpeakerKey, r.addressSpeakerName,
+                r.addressTargetKey, r.addressTargetName, r.addressTerm,
+                r.firstSeenTurn,
                 r.lastSeenTurn, r.updatedAt,
                 COALESCE(sr.id, '') AS subjectRosterId,
                 COALESCE(orr.id, '') AS objectRosterId
@@ -691,6 +707,13 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     objectRole: String(row?.objectRole || ""),
     knownByNames: parseRelationshipKnownBy(row?.knownBy),
     knowledgeEvidence: String(row?.knowledgeEvidence || ""),
+    evidence: String(row?.evidence || ""),
+    sourceRole: String(row?.sourceRole || ""),
+    addressSpeakerKey: String(row?.addressSpeakerKey || ""),
+    addressSpeakerName: String(row?.addressSpeakerName || ""),
+    addressTargetKey: String(row?.addressTargetKey || ""),
+    addressTargetName: String(row?.addressTargetName || ""),
+    addressTerm: String(row?.addressTerm || ""),
     firstSeenTurn: Number(row?.firstSeenTurn || 0),
     lastSeenTurn: Number(row?.lastSeenTurn || 0),
     updatedAt: Number(row?.updatedAt || 0),
@@ -774,7 +797,28 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     relations.find((row) => row.subjectKey === "persona")?.subjectName ||
     settingsPersonaName;
   const normalizedPersona = cleanText(personaName, 80).toLocaleLowerCase("ko-KR");
-  const normalizedRelations = selectCurrentStoredRelationships(relations.map((row) => {
+  const canonicalAddressRelationIds = new Set(
+    selectCanonicalAddressDirections(
+      relations.map((relation) => ({
+        id: relation.id,
+        speakerKey: relation.addressSpeakerKey,
+        speakerName: relation.addressSpeakerName,
+        targetKey: relation.addressTargetKey,
+        targetName: relation.addressTargetName,
+        term: relation.addressTerm,
+        sourceRole: relation.sourceRole,
+        isManual: relation.isManual,
+        lastSeenTurn: relation.lastSeenTurn,
+      }))
+    )
+      .map((direction) => String(direction.id || ""))
+      .filter(Boolean)
+  );
+  const directionFilteredRelations = relations.filter(
+    (relation) =>
+      !relation.addressTerm || canonicalAddressRelationIds.has(relation.id)
+  );
+  const normalizedRelations = selectCurrentStoredRelationships(directionFilteredRelations.map((row) => {
     const subjectIsPersona =
       Boolean(normalizedPersona) &&
       cleanText(row.subjectName, 80).toLocaleLowerCase("ko-KR") === normalizedPersona;
@@ -878,6 +922,13 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         objectRole: detailParts.join("; "),
         knownByNames: [],
         knowledgeEvidence: "",
+        evidence: "",
+        sourceRole: "",
+        addressSpeakerKey: "",
+        addressSpeakerName: "",
+        addressTargetKey: "",
+        addressTargetName: "",
+        addressTerm: "",
         firstSeenTurn: 0,
         lastSeenTurn: Math.max(0, Number(affinity?.lastTurnNo || 0)),
         updatedAt: Math.max(Number(node.updatedAt || 0), Number(affinity?.updatedAt || 0)),
@@ -941,5 +992,19 @@ export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
       }; 호감도: ${affinity.score}/100 (${affinity.label})`
     );
   }
+  const addressDirectionGuard = formatAddressDirectionGuard(
+    graph.relations.map((relation) => ({
+      id: relation.id,
+      speakerKey: relation.addressSpeakerKey,
+      speakerName: relation.addressSpeakerName,
+      targetKey: relation.addressTargetKey,
+      targetName: relation.addressTargetName,
+      term: relation.addressTerm,
+      sourceRole: relation.sourceRole,
+      isManual: relation.isManual,
+      lastSeenTurn: relation.lastSeenTurn,
+    }))
+  );
+  if (addressDirectionGuard) lines.push(addressDirectionGuard);
   return lines.length > 1 ? lines.join("\n") : "";
 }
