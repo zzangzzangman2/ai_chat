@@ -43,7 +43,18 @@ export function mergeStreamFinalContent(args: {
 
   const buffered = String(args.buffered || "");
   const fromServer = String(args.fromServer || "");
-  let content = mergeAppendOnly(buffered, fromServer);
+  const bufferedParts = splitForMeta(buffered);
+  const serverParts = splitForMeta(fromServer);
+  const comparableBody = (value: string) => String(value || "").trimEnd().replace(/["*]+$/g, "").trimEnd();
+  const serverHasAuthoritativeFinal = Boolean(
+    serverParts.meta.trim() &&
+      bufferedParts.meta.trim() &&
+      comparableBody(serverParts.body) === comparableBody(bufferedParts.body)
+  );
+  // Server-side deterministic repairs can insert a missing quote/star immediately
+  // before the final status fence or restore omitted status fields. Appending that
+  // corrected suffix to the streamed draft duplicates/corrupts the status panel.
+  let content = serverHasAuthoritativeFinal ? fromServer : mergeAppendOnly(buffered, fromServer);
   let source: StreamMergeSource =
     content === buffered ? "buffered" : content === fromServer ? "server" : "merged";
 

@@ -60,6 +60,10 @@ import {
 import { buildSpatialCanon } from "@/lib/spatial_canon";
 import { resolveActiveCharacterFocus } from "@/lib/active_character_focus";
 import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
+import {
+  buildPreviousStatusPanelSnapshot,
+  mergeStatusPanelContinuity,
+} from "@/lib/status_panel_continuity";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -2910,6 +2914,7 @@ const statusTemplateOpenFenceLenGuess = (() => {
   // (Some presets keep an *open* ```STATUS template without a closing fence, so metaLabelHint may come from elsewhere.)
   if (!allowedMetaLabels.includes("STATUS")) allowedMetaLabels.push("STATUS");
   if (!allowedMetaLabels.includes("INFO")) allowedMetaLabels.push("INFO");
+const previousStatusPanelSnapshot = buildPreviousStatusPanelSnapshot(all, 20);
 const _compactMetaFenceTemplateHint = (raw: string) => {
 	const s = String(raw || "").trim();
 	if (!s) return "";
@@ -3191,6 +3196,15 @@ const systemRaw = (cacheFriendlyLayout
           `- 직전 어시스턴트 응답이나 장기요약이 다른 화자를 잘못 세웠다면 그 오기를 이어 쓰지 말고 위 대상으로 복구한다.`,
         ].join("\n")
       : "";
+    const statusContinuityPriorityBlock = previousStatusPanelSnapshot
+      ? [
+          `# [STATUS PANEL CONTINUITY — APPLIES TO EVERY CHAT]`,
+          `- 아래 블록은 직전 상태들을 누적한 기준 상태다. 이번 답변의 상태창은 이 블록의 라벨·항목·줄 순서를 유지한다.`,
+          `- 현재 장면에서 명시적으로 변한 값만 갱신하고, 변하지 않았거나 이번 본문에 언급되지 않은 항목을 임의 삭제·초기화하지 않는다.`,
+          `- 호감도/친밀도 목록은 기존 인물과 수치를 유지한다. 현재 사건으로 실제 변화한 인물만 수정하고, 제작자 최대 인원 제한 안에서 누락시키지 않는다.`,
+          previousStatusPanelSnapshot,
+        ].join("\n")
+      : "";
     const system = [
       systemWithIdentityCanon,
       sanitizePromptCached(spatialCanon.block),
@@ -3203,6 +3217,7 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusPriorityBlock,
       vitalStatusPriorityBlock,
       activeInterlocutorPriorityBlock,
+      statusContinuityPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -4366,6 +4381,15 @@ if (!TRANSPORT_STREAMING) {
           // The model can stop at its soft body budget after opening a dialogue
           // quote/narration marker. Repair locally before persistence; this never
           // spends another model call or rewrites completed prose.
+          const streamStatusContinuity = mergeStatusPanelContinuity({
+            currentText: assistantText,
+            previousPanel: previousStatusPanelSnapshot,
+            maxAffinityEntries: 5,
+          });
+          if (streamStatusContinuity.changed) {
+            assistantText = streamStatusContinuity.text;
+            debugReasons.push("status:RESTORE_PREVIOUS_FIELDS");
+          }
           const streamMarkerBalance = repairUnbalancedNovelBodyMarkers(assistantText);
           if (streamMarkerBalance.repaired) {
             assistantText = streamMarkerBalance.text;
@@ -5626,6 +5650,15 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     }
     if (!assistantText.trim()) {
       assistantText = recoverAfterOverfilter(factGuardRecoverySource).trim();
+    }
+    const statusContinuity = mergeStatusPanelContinuity({
+      currentText: assistantText,
+      previousPanel: previousStatusPanelSnapshot,
+      maxAffinityEntries: 5,
+    });
+    if (statusContinuity.changed) {
+      assistantText = statusContinuity.text;
+      debugReasons.push("status:RESTORE_PREVIOUS_FIELDS");
     }
     const markerBalance = repairUnbalancedNovelBodyMarkers(assistantText);
     if (markerBalance.repaired) {
