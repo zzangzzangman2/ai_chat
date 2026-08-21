@@ -5,6 +5,7 @@ import { generateText } from "@/lib/ai";
 import {
   analyzeRelationshipCorrectionDrift,
   buildRelationshipCorrectionGuidance,
+  stripFencedBlocks,
 } from "@/lib/relationship_memory";
 import {
   analyzeIdentityCanonDrift,
@@ -35,6 +36,7 @@ import {
   selectConservativeMemoryRows,
 } from "@/lib/character_memory_quality";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
+import { resolveActiveCharacterFocus } from "@/lib/active_character_focus";
 
 type MsgRow = {
   id: string;
@@ -255,11 +257,18 @@ function hasQuotedSpeechNearName(text: unknown, names: string[]) {
     .some((line) => textHasCharacterName(line, names) && (quoteRe.test(line) || speechVerbRe.test(line)));
 }
 
+function characterMemoryStoryText(text: unknown) {
+  return stripFencedBlocks(String(text || ""))
+    .replace(/```[\s\S]*$/g, " ")
+    .trim();
+}
+
 function isDirectPersonaCharacterConversation(row: any, userText: unknown, assistantText: unknown) {
   if (!cleanText(userText, 3000)) return false;
   const names = characterNames(row);
   if (!names.length) return false;
-  return hasSpeakerLine(assistantText, names) || hasQuotedSpeechNearName(assistantText, names);
+  const storyText = characterMemoryStoryText(assistantText);
+  return hasSpeakerLine(storyText, names) || hasQuotedSpeechNearName(storyText, names);
 }
 
 function deterministicConversationItem(
@@ -273,12 +282,13 @@ function deterministicConversationItem(
   if (!id || !name || !isDirectPersonaCharacterConversation(row, userText, assistantText)) return null;
 
   const userSnippet = oneSentenceSummary(userText, personaName) || "대화를 건 일";
-  const evidenceBlock = String(assistantText || "")
+  const assistantStoryText = characterMemoryStoryText(assistantText);
+  const evidenceBlock = assistantStoryText
     .split(/\n\s*\n+/g)
     .map((block) => block.trim())
     .find((block) => textHasCharacterName(block, characterNames(row)));
   const evidence = cleanText(
-    (evidenceBlock || String(assistantText || ""))
+    (evidenceBlock || assistantStoryText)
       .replace(/https?:\/\/\S+/gi, "")
       .replace(/[*_`#>]/g, " ")
       .replace(/\s+/g, " "),
@@ -449,9 +459,29 @@ export async function POST(req: Request) {
     }
 
     const prevUser = userBeforeAssistant(all, assistantId);
+    const assistantStoryText = characterMemoryStoryText(assistant.content);
+    const prevUserIndex = prevUser
+      ? all.findIndex((message) => String(message.id || "") === String(prevUser.id || ""))
+      : -1;
+    const previousUserTexts: string[] = [];
+    for (let i = prevUserIndex - 1; i >= 0 && previousUserTexts.length < 12; i -= 1) {
+      if (String(all[i]?.role || "").toLowerCase() !== "user") continue;
+      previousUserTexts.push(String(all[i]?.content || ""));
+    }
+    const activeCharacterFocus = resolveActiveCharacterFocus({
+      identities: roster.map((row) => ({
+        id: String(row?.id || ""),
+        name: String(row?.name || ""),
+        aliases: decryptIfPossible(String(row?.aliases || "")),
+      })),
+      currentUserText: prevUser?.content || "",
+      previousUserTexts,
+      maxPreviousTurns: 12,
+    });
+    const lockedRosterIds = new Set(activeCharacterFocus.ids);
     const sceneText = [
       prevUser ? `[${personaName} 입력]\n${cleanText(prevUser.content, 3000)}` : "",
-      `[어시스턴트 응답]\n${cleanText(assistant.content, 7000)}`,
+      `[어시스턴트 응답]\n${cleanText(assistantStoryText, 7000)}`,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -543,8 +573,11 @@ export async function POST(req: Request) {
       "Write summaries in Korean casual banmal ending with forms like ~했어, ~하고 있어, ~보였어. Do not use formal endings like ~합니다, ~했습니다, ~습니다.",
       `The persona/user/player name is "${personaName}". Always refer to the persona as "${personaName}", never as 사용자, 주인공, or 플레이어.`,
       `Focus only on direct conversation between ${personaName} and the character, because this memory will be used later to remember their shared history.`,
+      activeCharacterFocus.locked
+        ? `This turn's user-addressed character target is ${activeCharacterFocus.names.join(", ")}. Do not assign this exchange to another registered character.`
+        : "",
       "Return JSON only.",
-    ].join("\n");
+    ].filter(Boolean).join("\n");
 
     const user = [
       "[Registered Characters]",
@@ -612,10 +645,11 @@ export async function POST(req: Request) {
     let deterministicFallbackCount = 0;
     if (prevUser) {
       for (const row of roster) {
+        if (lockedRosterIds.size && !lockedRosterIds.has(String(row?.id || ""))) continue;
         const fallback = deterministicConversationItem(
           row,
           prevUser.content,
-          assistant.content,
+          assistantStoryText,
           personaName
         );
         if (!fallback) continue;
@@ -669,7 +703,8 @@ export async function POST(req: Request) {
         const row = rosterById.get(id);
         if (!row) continue;
         if (item?.present !== true) continue;
-        if (!prevUser || !isDirectPersonaCharacterConversation(row, prevUser.content, assistant.content)) continue;
+        if (lockedRosterIds.size && !lockedRosterIds.has(id)) continue;
+        if (!prevUser || !isDirectPersonaCharacterConversation(row, prevUser.content, assistantStoryText)) continue;
 
         const evidence = cleanText(replaceGenericPersonaRefs(item?.evidence, personaName), 500);
         const name = String(row?.name || "").trim();
@@ -784,6 +819,8 @@ export async function POST(req: Request) {
       saved,
       items: savedItems,
       deterministicFallbackCount,
+      activeCharacterFocus: activeCharacterFocus.names,
+      activeCharacterFocusReason: activeCharacterFocus.reason,
       generationError: generationError || undefined,
     });
   } catch (e: any) {

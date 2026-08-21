@@ -46,6 +46,7 @@ import MemoryPanel from "@/app/components/MemoryPanel";
 import RelationshipGraphPanel from "@/app/components/RelationshipGraphPanel";
 import { CHAT_MODEL_IDS, type ChatModelId, coerceChatModelId } from "@/lib/models";
 import { mergeStreamFinalContent } from "@/app/components/chat/ChatArea/streamMerge";
+import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
 
 const LOCAL_POINTS_DISABLED = true;
 
@@ -4767,6 +4768,7 @@ async function send(overrideText?: unknown) {
 	                      pickedSource = "merged";
 	                    }
 	                  }
+	                  picked = repairUnbalancedNovelBodyMarkers(picked).text;
 
 		                  const _targetChars =
 		                    typeof doneUsage?.outputTargetChars === "number" && Number.isFinite(doneUsage.outputTargetChars)
@@ -5226,11 +5228,12 @@ async function send(overrideText?: unknown) {
 	                  const buffered = stripEndMarkerClient(String(streamTargetRef.current || ""));
 	                  const fromServer = stripEndMarkerClient(String(realAssistant.content || ""));
 
-                    const picked = mergeStreamFinalContent({
+                    let picked = mergeStreamFinalContent({
                       buffered,
                       fromServer,
                       metaLabels: (obj as any)?.usage?.metaFenceLabels,
                     }).content;
+                    picked = repairUnbalancedNovelBodyMarkers(picked).text;
 // (fidelity) Do not reorder or truncate assistant output on the client.
                   // (fidelity) No client-side truncation.
 setMessages((prev) =>

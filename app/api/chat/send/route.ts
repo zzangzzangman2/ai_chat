@@ -58,6 +58,8 @@ import {
   loadCanonicalCharacterFacts,
 } from "@/lib/canonical_character_facts";
 import { buildSpatialCanon } from "@/lib/spatial_canon";
+import { resolveActiveCharacterFocus } from "@/lib/active_character_focus";
+import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -1886,10 +1888,7 @@ ${body}`.trim();
       }
     }
     const characterFocusText = userText;
-    const recentCharacterFocusText = tail
-      .slice(-4)
-      .map((m: any) => String(m?.content || ""))
-      .join("\n");
+    let recentCharacterFocusText = "";
 
     // (2026-08-15) 사용자 호명 창 — 자동 퇴장/자동 포커스 두 경로가 공유한다.
     //
@@ -1929,13 +1928,14 @@ ${body}`.trim();
     // direction so a large cast cannot bloat those unrelated prompt blocks.
     const continuityLedgerIdentities = (db
       .prepare(
-        `SELECT name, aliases, role, profile, relationshipNote,
+        `SELECT id, name, aliases, role, profile, relationshipNote,
                 emotionNote, status
          FROM chat_character_roster
          WHERE chatId=? AND enabled != 0
          ORDER BY updatedAt DESC, name ASC`
       )
       .all(cid) as any[]).map((row) => ({
+        id: String(row?.id || ""),
         name: String(row?.name || ""),
         aliases: decryptIfPossible(String(row?.aliases || "")),
         role: decryptIfPossible(String(row?.role || "")),
@@ -1956,6 +1956,26 @@ ${body}`.trim();
           .includes(personaKey);
       })
       .slice(0, 40);
+    const previousUserTextsForFocus: string[] = [];
+    for (let i = all.length - 1; i >= 0 && previousUserTextsForFocus.length < 12; i -= 1) {
+      const message: any = all[i];
+      if (String(message?.role || "").toLowerCase() !== "user") continue;
+      if (String(message?.id || "") === String(userMsg.id || "")) continue;
+      previousUserTextsForFocus.push(String(message?.content || ""));
+    }
+    const activeCharacterFocus = resolveActiveCharacterFocus({
+      identities: continuityIdentities.map((identity) => ({
+        id: identity.id,
+        name: identity.name,
+        aliases: identity.aliases,
+      })),
+      currentUserText: userText,
+      previousUserTexts: previousUserTextsForFocus,
+      maxPreviousTurns: 12,
+    });
+    // Assistant narration is intentionally excluded here. A hallucinated speaker
+    // must not become the next turn's interlocutor merely because the model named it.
+    recentCharacterFocusText = activeCharacterFocus.anchorText;
     const continuityLedger = buildContinuityLedgerBlock({
       historySummary,
       identities: continuityLedgerIdentities,
@@ -2134,7 +2154,7 @@ ${body}`.trim();
         // stickyOverusedNames와 같은 텍스트를 쓰도록 통일했다. 3턴은 "이름 없이 같은 상대를
         // 이어가는 중에 다른 인물을 한 번 호명하는" 패턴에서 진행 중인 상대를 탈락시켰다.
         // 자세한 경위는 recentUserMentionText 정의부 주석 참고.
-        userMentionText: recentUserMentionText,
+        userMentionText: activeCharacterFocus.anchorText || characterFocusText,
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
         graph: relationshipGraph,
       });
@@ -2408,16 +2428,22 @@ ${body}`.trim();
         })),
       maxMessages: 14,
     });
-    // (변경 2026-08) 장기기억 "전체 주입" 모드.
+    // 장기기억 전문은 저장/검색 가능 상태로 유지하되, 매 턴 전부 넣지는 않는다.
     // - 기존: 검색으로 최근 15턴(3200자) + 관련 과거 6섹션(2400자)만 주입 → 나머지 아카이브는 버려짐.
     //   키워드 substring 매칭이라 다른 표현으로 물으면 회수 실패, 검색 실패 시 폴백도 '최신 2섹션'이라
     //   초반 기억이 구조적으로 소환되지 않았다.
-    // - 변경: 정규화된 누적 요약(historySummary) 전문을 그대로 넣는다.
-    //   실측 200턴 = 약 9천 토큰(컨텍스트의 0.9%, 턴당 +15원)이라 비용/지연 영향이 미미하다.
+    // - 기본(auto): 현재 장면 + 검색된 관련 과거만 넣어 오래된 오기와 현재 대상을 섞지 않는다.
+    // - 사용자가 전체 회고를 명시적으로 요청하면 그 턴에는 전문을 넣는다.
     // - 상한(AI_FULL_LONG_MEMORY_MAX_CHARS, 기본 64000자 ≈ 4만 토큰) 초과 시에만
     //   섹션 단위로 오래된 구간부터 탈락시킨다. (문장 중간 절단 방지)
-    // - 롤백: AI_FULL_LONG_MEMORY=0 이면 기존 검색/선별 경로로 되돌아간다.
-    const fullLongMemoryEnabled = String(process.env.AI_FULL_LONG_MEMORY || "1").trim() !== "0";
+    // - AI_FULL_LONG_MEMORY=1/0으로 전문/검색 모드를 명시 고정할 수 있다.
+    const fullLongMemoryMode = String(process.env.AI_FULL_LONG_MEMORY ?? "auto").trim().toLowerCase();
+    const broadHistoryRequested = /(?:처음부터|지금까지|전\s*과정|일대기|전체\s*(?:대화|기억|내용|요약)|모든\s*(?:일|기억|대화|사건)|전부)/u.test(
+      userText
+    );
+    const fullLongMemoryEnabled =
+      ["1", "true", "on"].includes(fullLongMemoryMode) ||
+      (fullLongMemoryMode === "auto" && broadHistoryRequested);
     const fullLongMemoryMaxChars = (() => {
       const raw = Number(process.env.AI_FULL_LONG_MEMORY_MAX_CHARS ?? 64000);
       if (!Number.isFinite(raw) || raw <= 0) return 64000;
@@ -2516,6 +2542,8 @@ ${body}`.trim();
       stickyRetiredChars: strlen(overusedCharacterBlock),
       // (2026-08) 전체 주입 모드 진단
       fullLongMemory: fullLongMemoryEnabled,
+      fullLongMemoryMode,
+      broadHistoryRequested,
       fullLongMemoryChars: strlen(fullLongMemoryText),
       fullLongMemoryTruncated: fullLongMemoryEnabled
         ? strlen(String(historySummary || "").trim()) > strlen(fullLongMemoryText)
@@ -2523,6 +2551,8 @@ ${body}`.trim();
       alwaysInjectRoster,
       identityCanonChars: strlen(identityCanonBlock),
       canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
+      activeCharacterFocus: activeCharacterFocus.names,
+      activeCharacterFocusReason: activeCharacterFocus.reason,
       spatialCanonChars: strlen(spatialCanon.block),
       spatialResidenceCount: spatialCanon.residences.length,
       spatialRelativeAnchorCount: spatialCanon.relativeAnchors.length,
@@ -3152,6 +3182,15 @@ const systemRaw = (cacheFriendlyLayout
       `- 최근 원문에서 그 인물이 말하거나 행동하거나 다른 방에 살아 있는 장면이 확인되면 생존 상태다. 충돌하는 과거 AI 지문이나 요약의 사망 단정은 오기이므로 반복하지 않는다.`,
       `- 응답을 내기 직전에 새 사망 주장마다 누가, 언제, 어떤 완료 사건으로 죽었는지 근거를 확인한다. 명시적 근거가 없으면 그 문장을 삭제하고 생존한 현재 상황을 유지한다.`,
     ].join("\n");
+    const activeInterlocutorPriorityBlock = activeCharacterFocus.locked
+      ? [
+          `# [CURRENT INTERLOCUTOR HARD GUARD — APPLIES TO EVERY CHAT]`,
+          `- 최신 사용자 입력의 직접 대상은 ${activeCharacterFocus.names.join(", ")}이다. 이 판정은 최신 사용자 발화와 그 이전 사용자 호명만으로 정했으며, 과거 어시스턴트 서술보다 우선한다.`,
+          `- 최신 입력의 '너/넌/널/네가/너한테' 같은 2인칭은 위 인물을 가리킨다. 다른 등록 인물로 바꾸지 않는다.`,
+          `- 다른 인물이 장면에 함께 있거나 반응할 수는 있지만, 위 인물의 나이·직업·관계·기억·행동을 다른 인물에게 옮기거나 서로 합치지 않는다.`,
+          `- 직전 어시스턴트 응답이나 장기요약이 다른 화자를 잘못 세웠다면 그 오기를 이어 쓰지 말고 위 대상으로 복구한다.`,
+        ].join("\n")
+      : "";
     const system = [
       systemWithIdentityCanon,
       sanitizePromptCached(spatialCanon.block),
@@ -3163,6 +3202,7 @@ const systemRaw = (cacheFriendlyLayout
       epistemicPriorityBlock,
       legalStatusPriorityBlock,
       vitalStatusPriorityBlock,
+      activeInterlocutorPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -3411,6 +3451,7 @@ const systemRaw = (cacheFriendlyLayout
       `- 장면 비트는 서로 다른 내용이어야 한다: 관찰 가능한 반응, 표정/몸짓, 주변 상황 변화, NPC의 판단 변화, 다음 선택지를 압박하는 대사.`,
       `- 목표 문단 수: ${oneShotParagraphHint}문단. 한 문단 요약, 짧은 즉답, 조기 종료 금지.`,
       `- 메타/상태창이 필요하면 본문을 더 늘리는 것보다 완성된 fenced 코드블록이 우선이다. 메타를 시작했다면 항목 일부만 쓰고 닫지 말고, 짧더라도 의미 있는 전체 상태창을 완성한다.`,
+      `- 분량 한계에 가까워지면 새 문장을 시작하지 말고, 열린 대사 따옴표(")와 지문 별표(*)를 먼저 닫은 뒤 메타/상태창으로 넘어간다.`,
       `- 주인공의 다음 행동/대사는 대신 쓰지 말고, NPC 반응과 현재 장면만 충분히 전개한다.`,
     ].join("\n");
 
@@ -4320,6 +4361,15 @@ if (!TRANSPORT_STREAMING) {
               vitalStatusRedactions: streamVitalStatusRedactions,
               scenePresenceRedactions: streamScenePresenceRedactions,
             });
+          }
+
+          // The model can stop at its soft body budget after opening a dialogue
+          // quote/narration marker. Repair locally before persistence; this never
+          // spends another model call or rewrites completed prose.
+          const streamMarkerBalance = repairUnbalancedNovelBodyMarkers(assistantText);
+          if (streamMarkerBalance.repaired) {
+            assistantText = streamMarkerBalance.text;
+            debugReasons.push(`format:CLOSE_BODY_MARKERS:${streamMarkerBalance.added}`);
           }
 
 // messages 저장
@@ -5576,6 +5626,11 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     }
     if (!assistantText.trim()) {
       assistantText = recoverAfterOverfilter(factGuardRecoverySource).trim();
+    }
+    const markerBalance = repairUnbalancedNovelBodyMarkers(assistantText);
+    if (markerBalance.repaired) {
+      assistantText = markerBalance.text;
+      debugReasons.push(`format:CLOSE_BODY_MARKERS:${markerBalance.added}`);
     }
 
 	    let assistantMsg: any = {

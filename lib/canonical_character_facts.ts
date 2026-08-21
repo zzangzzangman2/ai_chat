@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "crypto";
 
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { db } from "@/lib/db";
+import { resolveCanonicalFactCandidate } from "@/lib/canonical_fact_resolution";
 
 export const CANONICAL_FACT_KEYS = [
   "age",
@@ -281,14 +282,11 @@ export function loadCanonicalCharacterFacts(chatIdRaw: string) {
 
   const resolved: ResolvedCanonicalFact[] = [];
   for (const facts of groups.values()) {
-    const userFacts = facts.filter((fact) => fact.sourceRole === "user");
-    if (userFacts.length) {
-      resolved.push(userFacts[userFacts.length - 1]);
-      continue;
-    }
-    // Assistant narration may establish a missing NPC fact, but a later assistant
-    // paraphrase is never allowed to silently rewrite that established identity.
-    resolved.push(facts[0]);
+    // User-authored facts are authoritative. Assistant-only identity claims are
+    // promoted only after the same value is independently repeated in two turns,
+    // preventing a single mistaken speaker switch from becoming permanent canon.
+    const fact = resolveCanonicalFactCandidate(facts);
+    if (fact) resolved.push(fact);
   }
   return resolved.sort(
     (a, b) =>
