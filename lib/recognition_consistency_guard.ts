@@ -812,6 +812,33 @@ export function removeScenePresenceContradictionPassages(args: {
     });
     if (!contradiction) break;
 
+    if (
+      contradiction.kind === "unauthorized_exit" ||
+      contradiction.kind === "unauthorized_reentry"
+    ) {
+      // Once a draft changes the cast without user authority, every later
+      // action/speaker can depend on that invalid substitution. Discard the
+      // contaminated story suffix rather than leaving orphaned dialogue from
+      // the wrong character. Preserve fenced status metadata independently.
+      const before = text.slice(0, contradiction.index);
+      const paragraphBoundary = before.lastIndexOf("\n\n");
+      const lineBoundary = before.lastIndexOf("\n");
+      const cutAt = Math.max(
+        0,
+        paragraphBoundary >= 0 ? paragraphBoundary + 2 : lineBoundary + 1
+      );
+      const preservedFences = [
+        ...text.slice(cutAt).matchAll(/```[^\n]*\n[\s\S]*?```/g),
+      ].map((match) => match[0].trim());
+      text = [text.slice(0, cutAt).trim(), ...preservedFences]
+        .filter(Boolean)
+        .join("\n\n");
+      removed += 1;
+      characters.add(contradiction.characterName);
+      kinds.add(contradiction.kind);
+      break;
+    }
+
     const filtered = removeRecognitionContradictionAtIndex({
       text,
       index: contradiction.index,

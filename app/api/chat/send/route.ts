@@ -5739,7 +5739,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       });
     }
     if (!assistantText.trim()) {
-      assistantText = recoverAfterOverfilter(factGuardRecoverySource).trim();
+      assistantText = scenePresenceOutputChecked.removed
+        ? "*현재 장면에 남아 있던 인물들은 자리를 떠나지 않은 채, 서로를 바라보며 반응을 이어갔다.*"
+        : recoverAfterOverfilter(factGuardRecoverySource).trim();
     }
     const novelMarkers = normalizeNovelParagraphMarkers(assistantText);
     if (novelMarkers.changed) {
