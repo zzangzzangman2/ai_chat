@@ -4223,14 +4223,18 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
             text: raw,
             usage: combinedUsage,
           });
+          let postGenerationTextChanged = recognitionChecked.text !== raw;
           raw = recognitionChecked.text;
           combinedUsage = recognitionChecked.usage;
+          const beforeTemporalCheck = raw;
           const temporalChecked = await enforceTemporalConsistency({
             text: raw,
             usage: combinedUsage,
           });
+          postGenerationTextChanged ||= temporalChecked.text !== beforeTemporalCheck;
           raw = temporalChecked.text;
           combinedUsage = temporalChecked.usage;
+          const beforeScenePresenceCheck = raw;
           const scenePresenceChecked = await enforceScenePresenceConsistency({
             text: raw,
             usage: combinedUsage,
@@ -4238,6 +4242,7 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
             // sentence gate below handles the backstop without a wasted LLM call.
             allowRepair: usedBufferedTransport,
           });
+          postGenerationTextChanged ||= scenePresenceChecked.text !== beforeScenePresenceCheck;
           raw = scenePresenceChecked.text;
           combinedUsage = scenePresenceChecked.usage;
 
@@ -4438,7 +4443,7 @@ if (!TRANSPORT_STREAMING) {
           const guardedTail = guardedTextStream.finish();
           if (guardedTail) enqueueWire({ type: "delta", text: guardedTail });
           assistantText = guardedTextStream.output();
-          if (shortContinue.replaced) {
+          if (shortContinue.replaced || postGenerationTextChanged) {
             const epistemic = sanitizeGeneratedFacts(factGuardRecoverySource);
             const legalStatus = removeUnsupportedLegalStatusClaims({
               text: epistemic.text,
@@ -4513,7 +4518,12 @@ if (!TRANSPORT_STREAMING) {
             assistantText = streamMarkerBalance.text;
             debugReasons.push(`format:CLOSE_BODY_MARKERS:${streamMarkerBalance.added}`);
           }
-          if (shortContinue.replaced || streamStatusContinuity.changed || streamMarkerBalance.repaired) {
+          if (
+            shortContinue.replaced ||
+            postGenerationTextChanged ||
+            streamStatusContinuity.changed ||
+            streamMarkerBalance.repaired
+          ) {
             enqueueWire({ type: "replace", text: assistantText });
           }
 

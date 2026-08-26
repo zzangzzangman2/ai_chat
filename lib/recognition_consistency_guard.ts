@@ -89,6 +89,9 @@ const EXIT_MODIFIER_CUE_PATTERN =
 const GENERIC_SCENE_SUBJECT_PATTERN =
   /(?:곁에\s*(?:있|엎드려|서|앉아)[^.!?。！？\n]{0,35})?(?:작은\s*)?(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명)(?:은|는|이|가)?/u;
 
+const RELATIONAL_GENERIC_SCENE_SUBJECT_PATTERN =
+  /(?:(?:곁|옆|반대편|바로\s*옆|주변)[^.!?。！？\n]{0,55}(?:다른|또\s*다른|나머지)?\s*(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명)|(?:다른|또\s*다른|나머지)\s*(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명))/u;
+
 const CURRENT_GROUP_REFERENCE_PATTERN =
   /(?:둘\s*다|둘이|두\s*(?:사람|명|아이|소녀|소년)|서로|얘들|너희들|다\s*같이|모두)/u;
 
@@ -502,13 +505,20 @@ export function findScenePresenceContradiction(args: {
     }
 
     // The model sometimes evades a name-bound guard by replacing a known
-    // person with "the small figure / the girl beside her" and immediately
-    // making that anonymous referent disappear. When the user explicitly
-    // addresses the current group, any such unnamed exit is still an
-    // unauthorized cast change and must be rejected.
+    // person with "the small figure / the other person beside her" and
+    // immediately making that anonymous referent disappear. The current scene
+    // roster itself is authoritative: a relational subject such as "the other
+    // figure beside her" cannot bypass the guard merely because the latest
+    // user sentence omitted an explicit "both of you" phrase.
+    const currentUserReferencesGroup = CURRENT_GROUP_REFERENCE_PATTERN.test(
+      String(args.currentUserText || "")
+    );
+    const relationalCurrentSubject =
+      args.presentCharacters.length >= 2 &&
+      RELATIONAL_GENERIC_SCENE_SUBJECT_PATTERN.test(passage);
     if (
       args.presentCharacters.length > 0 &&
-      CURRENT_GROUP_REFERENCE_PATTERN.test(String(args.currentUserText || "")) &&
+      (currentUserReferencesGroup || relationalCurrentSubject) &&
       GENERIC_SCENE_SUBJECT_PATTERN.test(passage)
     ) {
       const genericExit = EXIT_CUE_PATTERN.exec(passage);
@@ -843,11 +853,47 @@ export function removeScenePresenceContradictionPassages(args: {
       contradiction.kind === "unauthorized_exit" ||
       contradiction.kind === "unauthorized_reentry"
     ) {
+      const before = text.slice(0, contradiction.index);
+      const paragraphStartBreak = before.lastIndexOf("\n\n");
+      const paragraphStart = paragraphStartBreak >= 0 ? paragraphStartBreak + 2 : 0;
+      const after = text.slice(contradiction.index);
+      const paragraphEndBreak = after.indexOf("\n\n");
+      const paragraphEnd =
+        paragraphEndBreak >= 0 ? contradiction.index + paragraphEndBreak : text.length;
+      const localParagraph = text.slice(paragraphStart, paragraphEnd);
+      const implicatedFact = args.presentCharacters.find(
+        (fact) => fact.characterName === contradiction.characterName
+      );
+      const implicatedNames = implicatedFact
+        ? usableEntityNames([
+            implicatedFact.characterName,
+            ...(implicatedFact.characterAliases || []),
+          ])
+        : [];
+      const isRelationalAnonymousExit = Boolean(
+        contradiction.kind === "unauthorized_exit" &&
+          RELATIONAL_GENERIC_SCENE_SUBJECT_PATTERN.test(localParagraph) &&
+          !passageMentionsName(localParagraph, implicatedNames)
+      );
+
+      if (isRelationalAnonymousExit) {
+        // Anonymous-subject evasions are usually a self-contained opening
+        // flourish. Remove that contaminated paragraph (including "only X was
+        // left" consequences) while preserving later prose where the actual
+        // roster is still intact.
+        text = `${text.slice(0, paragraphStart).trimEnd()}\n\n${text
+          .slice(paragraphEnd)
+          .trimStart()}`.trim();
+        removed += 1;
+        characters.add(contradiction.characterName);
+        kinds.add(contradiction.kind);
+        continue;
+      }
+
       // Once a draft changes the cast without user authority, every later
       // action/speaker can depend on that invalid substitution. Discard the
       // contaminated story suffix rather than leaving orphaned dialogue from
       // the wrong character. Preserve fenced status metadata independently.
-      const before = text.slice(0, contradiction.index);
       const paragraphBoundary = before.lastIndexOf("\n\n");
       const lineBoundary = before.lastIndexOf("\n");
       const cutAt = Math.max(
