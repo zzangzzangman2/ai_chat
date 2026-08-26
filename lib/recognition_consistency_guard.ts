@@ -75,7 +75,7 @@ const ENTRY_CUE_PATTERN =
   /(?:새로\s*|다시\s*|뒤이어\s*|다음으로\s*)?(?:들어\s*왔|들어\s*온|들어섰|입장했|입장한|도착했|도착한|합류했|합류한|나타났|나타난|등장했|등장한|끌려\s*(?:들어\s*왔|들어\s*온|들어가|내려왔|내려온|왔|온|와)|데려왔|데려온|불려왔|불려온|호송(?:되어|돼)?\s*(?:들어|왔|온)|모습을\s*드러냈|모습을\s*드러낸)/u;
 
 const EXIT_CUE_PATTERN =
-  /(?:나갔|나간|떠났|떠난|퇴장했|퇴장한|사라졌|사라진|돌아갔|돌아간|자리를\s*떴|자리를\s*뜬|도망(?:쳤|친|갔|간|가버렸|가버린|쳐버렸|쳐버린)|방으로\s*(?:도망|달아)|끌려\s*(?:나갔|나간|나가|갔|간)|호송(?:되어|돼)?\s*나갔|밖으로\s*(?:나갔|나간|끌려갔|끌려간)|내보냈|내보낸|쫓아냈|쫓아낸)/u;
+  /(?:나갔|나간|떠났|떠난|퇴장했|퇴장한|사라졌|사라진|자취를\s*감췄|자취를\s*감춘|모습을\s*감췄|모습을\s*감춘|돌아갔|돌아간|자리를\s*떴|자리를\s*뜬|도망(?:쳤|친|갔|간|가버렸|가버린|쳐버렸|쳐버린)|방으로\s*(?:도망|달아)|끌려\s*(?:나갔|나간|나가|갔|간)|호송(?:되어|돼)?\s*나갔|밖으로\s*(?:나갔|나간|끌려갔|끌려간)|내보냈|내보낸|쫓아냈|쫓아낸)/u;
 
 const ACTIVE_CUE_PATTERN =
   /(?:무릎을\s*꿇고\s*있|앉아\s*있|서\s*있|누워\s*있|기대어\s*있|머물고\s*있|남아\s*있|붙잡혀\s*있|포박(?:되어|돼)\s*있|묶여\s*있|갇혀\s*있|바라봤|바라보며|말했|물었|대답했|외쳤|고개를\s*(?:들|끄덕|저))/u;
@@ -84,7 +84,13 @@ const ENTRY_MODIFIER_CUE_PATTERN =
   /(?:들어\s*온|입장한|도착한|합류한|나타난|등장한|끌려\s*(?:들어\s*온|내려온|온)|데려온|불려온|호송(?:되어|돼)?\s*온|모습을\s*드러낸)/u;
 
 const EXIT_MODIFIER_CUE_PATTERN =
-  /(?:나간|떠난|퇴장한|사라진|돌아간|자리를\s*뜬|도망(?:친|간|가버린|쳐버린)|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+  /(?:나간|떠난|퇴장한|사라진|자취를\s*감춘|모습을\s*감춘|돌아간|자리를\s*뜬|도망(?:친|간|가버린|쳐버린)|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+
+const GENERIC_SCENE_SUBJECT_PATTERN =
+  /(?:곁에\s*(?:있|엎드려|서|앉아)[^.!?。！？\n]{0,35})?(?:작은\s*)?(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명)(?:은|는|이|가)?/u;
+
+const CURRENT_GROUP_REFERENCE_PATTERN =
+  /(?:둘\s*다|둘이|두\s*(?:사람|명|아이|소녀|소년)|서로|얘들|너희들|다\s*같이|모두)/u;
 
 const USER_EXCLUSION_CUE_PATTERN =
   /(?:문\s*밖|바깥|밖으로)[^.!?。！？\n]{0,70}(?:내?쫓|쫒|보냈|보낸|밀어냈|끌어냈)|(?:내?쫓|쫒|내보내|보내)[^.!?。！？\n]{0,50}(?:문\s*밖|바깥|밖으로)|(?:못|다시는?)\s*들어오|들어오지\s*못|출입\s*금지|접근\s*금지/u;
@@ -492,6 +498,27 @@ export function findScenePresenceContradiction(args: {
             kind: "duplicate_introduction",
           };
         }
+      }
+    }
+
+    // The model sometimes evades a name-bound guard by replacing a known
+    // person with "the small figure / the girl beside her" and immediately
+    // making that anonymous referent disappear. When the user explicitly
+    // addresses the current group, any such unnamed exit is still an
+    // unauthorized cast change and must be rejected.
+    if (
+      args.presentCharacters.length > 0 &&
+      CURRENT_GROUP_REFERENCE_PATTERN.test(String(args.currentUserText || "")) &&
+      GENERIC_SCENE_SUBJECT_PATTERN.test(passage)
+    ) {
+      const genericExit = EXIT_CUE_PATTERN.exec(passage);
+      if (genericExit && !currentTurnAllowsExit(args.currentUserText, [])) {
+        return {
+          characterName: args.presentCharacters[0].characterName,
+          matchedText: genericExit[0],
+          index: Math.max(0, passageIndex) + genericExit.index,
+          kind: "unauthorized_exit",
+        };
       }
     }
 

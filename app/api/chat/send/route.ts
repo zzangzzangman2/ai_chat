@@ -3199,6 +3199,7 @@ const systemRaw = (cacheFriendlyLayout
       `- 사용자가 둘이/서로/얘들/다 같이처럼 현재 인물을 가리키면 직전 장면에 실제 남아 있는 인물을 그대로 이어 쓴다. 현장 밖 인물을 대신 끼워 넣지 않는다.`,
       `- 쫓겨났거나 출입을 금지당한 인물은 사용자가 그 인물의 복귀를 명시하기 전까지 현장 밖에 둔다. 감정이 격해졌다는 이유로 안으로 돌아오게 하지 않는다.`,
       `- 현재 인물이 충격, 공포, 수치심을 느껴도 사용자의 지시 없이 '견디지 못하고 도망쳤다', '방으로 사라졌다', '자리를 떴다'처럼 장면에서 제거하지 않는다. 현 위치에서 표정·대사·행동으로 반응시킨다.`,
+      `- 이름 검사를 피하려고 현재 인물을 '작은 형체', '곁의 소녀', '한 사람', '그녀/그' 같은 익명 표현으로 바꾼 뒤 자취를 감추거나 도망치게 하는 것도 동일한 임의 퇴장이다. 현재 인물의 이름과 위치를 명시적으로 유지한다.`,
       ...(currentScenePresence.length
         ? [
             `- 아래 인물은 최근 원문 장면에서 이미 입장했고, 명시적으로 퇴장하거나 장면이 전환되지 않아 지금도 같은 현장에 있다.`,
@@ -4165,10 +4166,11 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
 
           
 
-          // 2) auto-continue up to N times if MAX_TOKENS
-          // NOTE: gemini-3-pro-preview can be slow and is more likely to hit ALB/edge idle timeouts.
-          // Disable auto-continue for gemini-3-pro* (user wants single-shot output). If needed, raise the token budget instead.
-          const MAX_CONTINUES = 0; // forced OFF: no continuation calls (single LLM request only)
+          // 2) Emergency auto-continue once when the provider explicitly says
+          // MAX_TOKENS. Normal turns remain one-shot; only a provably truncated
+          // answer gets one append-only recovery call instead of being stored
+          // mid-sentence with a locally appended status panel.
+          const MAX_CONTINUES = 1;
           const generation = await runStreamMainGeneration({
             proDoneOnly: PRO_DONE_ONLY,
             runOneBuffered,

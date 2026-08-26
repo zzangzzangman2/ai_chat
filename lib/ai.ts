@@ -398,7 +398,16 @@ function dynamicThinkingHeadroomForGemini3(thinkingLevel: string, estimatedPromp
     768;
 
   const dyn = Math.max(floor, Math.round(pt * ratio));
-  return Math.min(2304, dyn);
+  // Gemini 3.1 Pro can spend 5k+ thought tokens on a ~30k-token Korean
+  // continuity prompt even at thinkingLevel=medium. A 2304 cap starves the
+  // visible answer and produces MAX_TOKENS after only a few sentences. This
+  // headroom does not force extra thinking; it only stops thoughts already
+  // being generated from consuming the answer budget.
+  const dynamicCapRaw = Number(process.env.GEMINI3_DYNAMIC_HEADROOM_CAP ?? 6144);
+  const dynamicCap = Number.isFinite(dynamicCapRaw)
+    ? Math.min(8192, Math.max(2304, Math.floor(dynamicCapRaw)))
+    : 6144;
+  return Math.min(dynamicCap, dyn);
 }
 
 function computeEffectiveMaxOutputTokens(
