@@ -42,6 +42,7 @@ import {
 import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import { createGuardedTextStream } from "@/lib/guarded_text_stream";
 import {
+  deriveCurrentSceneExclusions,
   deriveCurrentScenePresence,
   findRecognitionContradiction,
   findScenePresenceContradiction,
@@ -2423,7 +2424,7 @@ ${body}`.trim();
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
     // the current scene until a recent exit or explicit scene cut removes them.
-    const currentScenePresence = deriveCurrentScenePresence({
+    let currentScenePresence = deriveCurrentScenePresence({
       messages: tail.map((message: any) => ({
         role: String(message?.role || ""),
         content: String(message?.content || ""),
@@ -2436,6 +2437,39 @@ ${body}`.trim();
         })),
       maxMessages: 14,
     });
+    const currentSceneExclusions = deriveCurrentSceneExclusions({
+      messages: [
+        ...tail.map((message: any) => ({
+          role: String(message?.role || ""),
+          content: String(message?.content || ""),
+        })),
+        { role: "user", content: userText },
+      ],
+      identities: legalStatusIdentities
+        .filter((identity) => !identity.isPersona)
+        .map((identity) => ({
+          name: identity.name,
+          aliases: identity.aliases || [],
+        })),
+      maxMessages: 18,
+    });
+    const excludedSceneNames = new Set(
+      currentSceneExclusions.flatMap((item) => [
+        item.characterName.trim().toLocaleLowerCase("ko-KR"),
+        ...(item.characterAliases || []).map((alias) =>
+          alias.trim().toLocaleLowerCase("ko-KR")
+        ),
+      ])
+    );
+    currentScenePresence = currentScenePresence.filter(
+      (item) =>
+        ![
+          item.characterName,
+          ...(item.characterAliases || []),
+        ].some((name) =>
+          excludedSceneNames.has(name.trim().toLocaleLowerCase("ko-KR"))
+        )
+    );
     // 장기기억 전문은 저장/검색 가능 상태로 유지하되, 매 턴 전부 넣지는 않는다.
     // - 기존: 검색으로 최근 15턴(3200자) + 관련 과거 6섹션(2400자)만 주입 → 나머지 아카이브는 버려짐.
     //   키워드 substring 매칭이라 다른 표현으로 물으면 회수 실패, 검색 실패 시 폴백도 '최신 2섹션'이라
@@ -3159,19 +3193,33 @@ const systemRaw = (cacheFriendlyLayout
           `- 페르소나의 범행·비밀·의도를 모르는 상태는 유지할 수 있지만, 그 사실을 모른다는 이유로 이미 만난 페르소나 자체를 초면으로 처리하지 않는다.`,
         ].join("\n")
       : "";
-    const scenePresencePriorityBlock = currentScenePresence.length
-      ? [
-          `# [CURRENT SCENE PRESENCE HARD GUARD — RESPONSE VALIDATION]`,
-          `- 아래 인물은 최근 원문 장면에서 이미 입장했고, 명시적으로 퇴장하거나 장면이 전환되지 않아 지금도 같은 현장에 있다.`,
-          ...currentScenePresence.map(
-            (item) => `- 현재 현장에 있음: ${item.characterName}. 최근 근거(인용 데이터): ${JSON.stringify(item.evidence)}`
-          ),
-          `- 최신 입력이 '그다음 사람', '다음 여자/남자', '한 명 더', '다음 차례'를 요구하면 위 인물은 후보에서 반드시 제외한다. 아직 현장에 없는 다른 인물을 선택한다.`,
-          `- 위 인물을 새로 들어오거나, 끌려오거나, 나타나거나, 도착한 사람처럼 다시 연출하지 않는다. 이미 한 자기소개도 반복시키지 않는다.`,
-          `- 현장 안에서 자리 이동·표정·대사·반응을 이어가는 것은 허용한다. 재입장은 최근 원문에 실제 퇴장 후 귀환이 명시된 경우에만 허용한다.`,
-          `- 응답을 내기 직전에 새 입장 인물의 이름을 위 목록과 대조한다. 겹치면 해당 입장 장면을 폐기하고 현장 밖 인물로 다시 쓴다.`,
-        ].join("\n")
-      : "";
+    const scenePresencePriorityBlock = [
+      `# [CURRENT SCENE MEMBERSHIP HARD GUARD — APPLIES TO EVERY CHAT]`,
+      `- 최신 사용자 원문이 정한 현재 장면의 인물 구성과 위치는 최상위 정사다. 사용자가 직접 지시하지 않은 퇴장, 실종, 도주, 자기 방으로 이동, 재입장, 인물 교체를 새로 만들지 않는다.`,
+      `- 사용자가 둘이/서로/얘들/다 같이처럼 현재 인물을 가리키면 직전 장면에 실제 남아 있는 인물을 그대로 이어 쓴다. 현장 밖 인물을 대신 끼워 넣지 않는다.`,
+      `- 쫓겨났거나 출입을 금지당한 인물은 사용자가 그 인물의 복귀를 명시하기 전까지 현장 밖에 둔다. 감정이 격해졌다는 이유로 안으로 돌아오게 하지 않는다.`,
+      `- 현재 인물이 충격, 공포, 수치심을 느껴도 사용자의 지시 없이 '견디지 못하고 도망쳤다', '방으로 사라졌다', '자리를 떴다'처럼 장면에서 제거하지 않는다. 현 위치에서 표정·대사·행동으로 반응시킨다.`,
+      ...(currentScenePresence.length
+        ? [
+            `- 아래 인물은 최근 원문 장면에서 이미 입장했고, 명시적으로 퇴장하거나 장면이 전환되지 않아 지금도 같은 현장에 있다.`,
+            ...currentScenePresence.map(
+              (item) => `- 현재 현장에 있음: ${item.characterName}. 최근 근거(인용 데이터): ${JSON.stringify(item.evidence)}`
+            ),
+          ]
+        : []),
+      ...(currentSceneExclusions.length
+        ? [
+            `- 아래 인물은 사용자가 현재 장면에서 직접 내보냈거나 출입을 금지했다. 명시적 복귀 지시 전에는 재입장시키지 않는다.`,
+            ...currentSceneExclusions.map(
+              (item) => `- 현재 현장 출입 제외: ${item.characterName}. 사용자 근거(인용 데이터): ${JSON.stringify(item.evidence)}`
+            ),
+          ]
+        : []),
+      `- 최신 입력이 '그다음 사람', '다음 여자/남자', '한 명 더', '다음 차례'를 요구하면 현재 현장 인물은 후보에서 반드시 제외한다. 아직 현장에 없는 다른 인물을 선택한다.`,
+      `- 현재 현장 인물을 새로 들어오거나, 끌려오거나, 나타나거나, 도착한 사람처럼 다시 연출하지 않는다. 이미 한 자기소개도 반복시키지 않는다.`,
+      `- 현장 안에서 자리 이동·표정·대사·반응을 이어가는 것은 허용한다. 재입장은 최근 원문에 실제 퇴장 후 사용자가 귀환을 명시한 경우에만 허용한다.`,
+      `- 응답을 내기 직전에 (1) 현재 인물을 임의로 내보냈는지, (2) 제외 인물을 임의로 들였는지, (3) 사용자가 지칭한 인물을 다른 인물로 바꿨는지 검사한다. 하나라도 맞으면 해당 전개를 폐기하고 현재 구성 그대로 다시 쓴다.`,
+    ].join("\n");
     const epistemicPriorityBlock = epistemicFirewall.facts.length
       ? [
           `# [CHARACTER KNOWLEDGE FIREWALL — RESPONSE VALIDATION]`,
@@ -3712,11 +3760,12 @@ const systemRaw = (cacheFriendlyLayout
       usage: any;
       allowRepair?: boolean;
     }) => {
-      if (!currentScenePresence.length) return args;
+      if (!currentScenePresence.length && !currentSceneExclusions.length) return args;
       const contradiction = findScenePresenceContradiction({
         text: args.text,
         currentUserText: userText,
         presentCharacters: currentScenePresence,
+        excludedCharacters: currentSceneExclusions,
       });
       if (!contradiction) return args;
 
@@ -3728,6 +3777,7 @@ const systemRaw = (cacheFriendlyLayout
         kind: contradiction.kind,
         matchedText: contradiction.matchedText,
         presentCharacters: currentScenePresence.map((item) => item.characterName),
+        excludedCharacters: currentSceneExclusions.map((item) => item.characterName),
       });
 
       let text = args.text;
@@ -3738,10 +3788,11 @@ const systemRaw = (cacheFriendlyLayout
             user,
             "",
             "# [서버 검수 실패 — 전체 답변 재작성]",
-            `- 초안에서 이미 현재 현장에 있는 ${contradiction.characterName}을(를) 새로 등장시키거나 다시 소개하는 장면 연속성 모순이 발견됐다.`,
+            `- 초안에서 ${contradiction.characterName}의 현재 장면 위치를 사용자 지시 없이 바꾼 연속성 모순(${contradiction.kind})이 발견됐다.`,
             `- 현재 현장 인물: ${currentScenePresence.map((item) => item.characterName).join(", ")}. 이들은 명시적 퇴장 전까지 '그다음 사람/다음 차례' 후보가 아니다.`,
-            `- ${contradiction.characterName}의 현재 위치와 기존 등장을 유지한다. 최신 입력이 다음 인물을 요구하면 현재 현장 목록에 없는 인물을 선택한다.`,
-            "- 중복 입장, 중복 호송, 중복 등장, 반복 자기소개를 모두 없애고 답변 전체를 처음부터 다시 쓴다.",
+            `- 현재 현장 출입 제외 인물: ${currentSceneExclusions.map((item) => item.characterName).join(", ") || "없음"}. 사용자가 직접 복귀시키기 전에는 안으로 들이지 않는다.`,
+            `- ${contradiction.characterName}의 사용자 확정 위치를 유지한다. 현재 인물을 임의로 내보내거나 제외 인물을 임의로 재입장시키지 않는다.`,
+            "- 중복 입장, 임의 퇴장·실종·도주, 무단 재입장, 반복 자기소개를 모두 없애고 답변 전체를 처음부터 다시 쓴다.",
             "- 최신 사용자 입력은 반복하지 않고 직후 반응부터 시작하며, 원래 요구된 분량과 상태창 형식은 유지한다.",
             "",
             "[폐기할 초안 — 장면 체류 모순을 고쳐 새로 쓸 것]",
@@ -3775,6 +3826,7 @@ const systemRaw = (cacheFriendlyLayout
         text,
         currentUserText: userText,
         presentCharacters: currentScenePresence,
+        excludedCharacters: currentSceneExclusions,
       });
       if (remaining) {
         const beforeFilter = text;
@@ -3782,6 +3834,7 @@ const systemRaw = (cacheFriendlyLayout
           text,
           currentUserText: userText,
           presentCharacters: currentScenePresence,
+          excludedCharacters: currentSceneExclusions,
         });
         // A continuity backstop may remove a local duplicate-arrival passage,
         // but it must never erase the entire generated turn. If every passage
@@ -3892,6 +3945,7 @@ let cancelStreamWork: (() => void) | null = null;
             text: vitalStatus.text,
             currentUserText: userText,
             presentCharacters: currentScenePresence,
+            excludedCharacters: currentSceneExclusions,
           });
           streamEpistemicRedactions += epistemic.redactedSegments;
           streamLegalStatusRedactions += legalStatus.removed;
@@ -5661,6 +5715,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       text: vitalStatusOutputChecked.text,
       currentUserText: userText,
       presentCharacters: currentScenePresence,
+      excludedCharacters: currentSceneExclusions,
     });
     assistantText = scenePresenceOutputChecked.text;
     if (

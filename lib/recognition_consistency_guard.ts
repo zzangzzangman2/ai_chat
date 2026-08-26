@@ -34,7 +34,11 @@ export type ScenePresenceContradiction = {
   characterName: string;
   matchedText: string;
   index: number;
-  kind: "duplicate_entry" | "duplicate_introduction";
+  kind:
+    | "duplicate_entry"
+    | "duplicate_introduction"
+    | "unauthorized_exit"
+    | "unauthorized_reentry";
 };
 
 const FIRST_MEETING_PATTERNS = [
@@ -68,19 +72,25 @@ const SCENE_RESET_PATTERN =
   /(?:\[?\s*장면\s*전환\s*\]?|다음\s*날|며칠\s*후|몇\s*(?:분|시간|주|달|년)\s*후|장소를\s*(?:옮기|이동)|새로운\s*장소로\s*(?:이동|향))/u;
 
 const ENTRY_CUE_PATTERN =
-  /(?:새로\s*|다시\s*|뒤이어\s*|다음으로\s*)?(?:들어왔|들어온|들어섰|입장했|입장한|도착했|도착한|합류했|합류한|나타났|나타난|등장했|등장한|끌려\s*(?:들어왔|들어온|들어가|내려왔|내려온|왔|온|와)|데려왔|데려온|불려왔|불려온|호송(?:되어|돼)?\s*(?:들어|왔|온)|모습을\s*드러냈|모습을\s*드러낸)/u;
+  /(?:새로\s*|다시\s*|뒤이어\s*|다음으로\s*)?(?:들어\s*왔|들어\s*온|들어섰|입장했|입장한|도착했|도착한|합류했|합류한|나타났|나타난|등장했|등장한|끌려\s*(?:들어\s*왔|들어\s*온|들어가|내려왔|내려온|왔|온|와)|데려왔|데려온|불려왔|불려온|호송(?:되어|돼)?\s*(?:들어|왔|온)|모습을\s*드러냈|모습을\s*드러낸)/u;
 
 const EXIT_CUE_PATTERN =
-  /(?:나갔|나간|떠났|떠난|퇴장했|퇴장한|사라졌|사라진|돌아갔|돌아간|자리를\s*떴|자리를\s*뜬|끌려\s*(?:나갔|나간|나가|갔|간)|호송(?:되어|돼)?\s*나갔|밖으로\s*(?:나갔|나간|끌려갔|끌려간)|내보냈|내보낸|쫓아냈|쫓아낸)/u;
+  /(?:나갔|나간|떠났|떠난|퇴장했|퇴장한|사라졌|사라진|돌아갔|돌아간|자리를\s*떴|자리를\s*뜬|도망(?:쳤|친|갔|간|가버렸|가버린|쳐버렸|쳐버린)|방으로\s*(?:도망|달아)|끌려\s*(?:나갔|나간|나가|갔|간)|호송(?:되어|돼)?\s*나갔|밖으로\s*(?:나갔|나간|끌려갔|끌려간)|내보냈|내보낸|쫓아냈|쫓아낸)/u;
 
 const ACTIVE_CUE_PATTERN =
   /(?:무릎을\s*꿇고\s*있|앉아\s*있|서\s*있|누워\s*있|기대어\s*있|머물고\s*있|남아\s*있|붙잡혀\s*있|포박(?:되어|돼)\s*있|묶여\s*있|갇혀\s*있|바라봤|바라보며|말했|물었|대답했|외쳤|고개를\s*(?:들|끄덕|저))/u;
 
 const ENTRY_MODIFIER_CUE_PATTERN =
-  /(?:들어온|입장한|도착한|합류한|나타난|등장한|끌려\s*(?:들어온|내려온|온)|데려온|불려온|호송(?:되어|돼)?\s*온|모습을\s*드러낸)/u;
+  /(?:들어\s*온|입장한|도착한|합류한|나타난|등장한|끌려\s*(?:들어\s*온|내려온|온)|데려온|불려온|호송(?:되어|돼)?\s*온|모습을\s*드러낸)/u;
 
 const EXIT_MODIFIER_CUE_PATTERN =
-  /(?:나간|떠난|퇴장한|사라진|돌아간|자리를\s*뜬|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+  /(?:나간|떠난|퇴장한|사라진|돌아간|자리를\s*뜬|도망(?:친|간|가버린|쳐버린)|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+
+const USER_EXCLUSION_CUE_PATTERN =
+  /(?:문\s*밖|바깥|밖으로)[^.!?。！？\n]{0,70}(?:내?쫓|쫒|보냈|보낸|밀어냈|끌어냈)|(?:내?쫓|쫒|내보내|보내)[^.!?。！？\n]{0,50}(?:문\s*밖|바깥|밖으로)|(?:못|다시는?)\s*들어오|들어오지\s*못|출입\s*금지|접근\s*금지/u;
+
+const USER_RETURN_CUE_PATTERN =
+  /(?:다시\s*)?(?:들어와|들어오|돌아와|돌아오|불러와|데려와|합류해|복귀해|재입장)|(?:들여보내|들여보냈|입장시켜)/u;
 
 function compactEvidence(value: string) {
   return value.replace(/\s+/g, " ").trim().slice(0, 220);
@@ -254,10 +264,13 @@ export function deriveCurrentScenePresence(args: {
     : 14;
   const recent = (args.messages || []).slice(-maxMessages);
   const states = new Map<string, ScenePresenceFact>();
+  let latestUserText = "";
 
   recent.forEach((message, messageIndex) => {
     const story = stripFencedBlocks(message?.content || "");
     if (!story.trim()) return;
+    const isUserMessage = normalized(message?.role) === "user";
+    if (isUserMessage) latestUserText = story;
 
     for (const passage of splitStoryPassages(story)) {
       if (SCENE_RESET_PATTERN.test(passage)) states.clear();
@@ -271,7 +284,15 @@ export function deriveCurrentScenePresence(args: {
         // Exit wins when a compact sentence contains both movement directions;
         // a later passage in the same turn can still establish a true re-entry.
         if (findNamedExitCue(passage, names)) {
-          states.delete(normalized(identity.characterName));
+          // An assistant draft cannot erase a character from scene canon by
+          // inventing a flight/disappearance. It only confirms an exit when
+          // the immediately preceding user turn actually directed one.
+          if (
+            isUserMessage ||
+            currentTurnAllowsExit(latestUserText, names)
+          ) {
+            states.delete(normalized(identity.characterName));
+          }
           continue;
         }
 
@@ -289,6 +310,95 @@ export function deriveCurrentScenePresence(args: {
   });
 
   return [...states.values()];
+}
+
+/**
+ * Reconstructs user-authoritative exclusions from the recent raw scene.
+ * Assistant prose is deliberately unable to clear this state: a character the
+ * user expelled or banned stays outside until the user explicitly calls that
+ * same character back or starts a new scene.
+ */
+export function deriveCurrentSceneExclusions(args: {
+  messages: ScenePresenceMessage[];
+  identities: ScenePresenceIdentity[];
+  maxMessages?: number;
+}): ScenePresenceFact[] {
+  const identities = args.identities
+    .map((identity) => ({
+      characterName: String(identity.name || "").trim(),
+      characterAliases: usableEntityNames(identity.aliases || []),
+    }))
+    .filter((identity) => normalized(identity.characterName).length >= 2);
+  if (!identities.length) return [];
+
+  const requestedMax = Number(args.maxMessages || 18);
+  const maxMessages = Number.isFinite(requestedMax)
+    ? Math.max(2, Math.floor(requestedMax))
+    : 18;
+  const recent = (args.messages || []).slice(-maxMessages);
+  const states = new Map<string, ScenePresenceFact>();
+
+  recent.forEach((message, messageIndex) => {
+    const story = stripFencedBlocks(message?.content || "");
+    if (!story.trim()) return;
+
+    for (const passage of splitStoryPassages(story)) {
+      if (normalized(message?.role) !== "user") continue;
+      if (SCENE_RESET_PATTERN.test(passage)) states.clear();
+
+      for (const identity of identities) {
+        const names = usableEntityNames([
+          identity.characterName,
+          ...identity.characterAliases,
+        ]);
+        if (!passageMentionsName(passage, names)) continue;
+
+        if (
+          USER_RETURN_CUE_PATTERN.test(passage) &&
+          !USER_EXCLUSION_CUE_PATTERN.test(passage)
+        ) {
+          states.delete(normalized(identity.characterName));
+          continue;
+        }
+
+        if (
+          findNamedExitCue(passage, names) ||
+          USER_EXCLUSION_CUE_PATTERN.test(passage)
+        ) {
+          states.set(normalized(identity.characterName), {
+            characterName: identity.characterName,
+            characterAliases: identity.characterAliases,
+            evidence: compactEvidence(passage),
+            messageIndex,
+          });
+        }
+      }
+    }
+  });
+
+  return [...states.values()];
+}
+
+function currentTurnAllowsExit(value: unknown, names: string[]) {
+  const text = String(value || "");
+  if (!text.trim()) return false;
+  if (
+    /(?:나가|꺼져|떠나|사라져|도망가|방으로\s*가|돌아가|퇴장|내보내|쫓아내|쫒아내|밖으로\s*보내)/u.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  return passageMentionsName(text, names) && Boolean(findNamedExitCue(text, names));
+}
+
+function currentTurnAllowsReentry(value: unknown, names: string[]) {
+  const text = String(value || "");
+  if (!passageMentionsName(text, names)) return false;
+  return (
+    USER_RETURN_CUE_PATTERN.test(text) ||
+    currentTurnOverridesScenePresence(text, names)
+  );
 }
 
 function currentTurnOverridesScenePresence(value: unknown, names: string[]) {
@@ -323,9 +433,16 @@ export function findScenePresenceContradiction(args: {
   text: string;
   currentUserText?: string;
   presentCharacters: ScenePresenceFact[];
+  excludedCharacters?: ScenePresenceFact[];
 }): ScenePresenceContradiction | null {
   const story = stripFencedBlocks(args.text);
-  if (!story.trim() || !args.presentCharacters.length) return null;
+  const excludedCharacters = args.excludedCharacters || [];
+  if (
+    !story.trim() ||
+    (!args.presentCharacters.length && !excludedCharacters.length)
+  ) {
+    return null;
+  }
   let searchOffset = 0;
 
   for (const passage of splitStoryPassages(story)) {
@@ -350,6 +467,18 @@ export function findScenePresenceContradiction(args: {
         };
       }
 
+      if (!currentTurnAllowsExit(args.currentUserText, names)) {
+        const exit = findNamedExitCue(passage, names);
+        if (exit) {
+          return {
+            characterName: fact.characterName,
+            matchedText: exit[0],
+            index: Math.max(0, passageIndex) + exit.index,
+            kind: "unauthorized_exit",
+          };
+        }
+      }
+
       // A bare self-introduction is a second independent backstop. It catches
       // the next streamed paragraph even when the duplicate-arrival paragraph
       // immediately before it was already removed.
@@ -363,6 +492,26 @@ export function findScenePresenceContradiction(args: {
             kind: "duplicate_introduction",
           };
         }
+      }
+    }
+
+
+    for (const fact of excludedCharacters) {
+      const names = usableEntityNames([
+        fact.characterName,
+        ...(fact.characterAliases || []),
+      ]);
+      if (!passageMentionsName(passage, names)) continue;
+      if (currentTurnAllowsReentry(args.currentUserText, names)) continue;
+
+      const entry = findNamedEntryCue(passage, names);
+      if (entry) {
+        return {
+          characterName: fact.characterName,
+          matchedText: entry[0],
+          index: Math.max(0, passageIndex) + entry.index,
+          kind: "unauthorized_reentry",
+        };
       }
     }
   }
@@ -646,6 +795,7 @@ export function removeScenePresenceContradictionPassages(args: {
   text: string;
   currentUserText?: string;
   presentCharacters: ScenePresenceFact[];
+  excludedCharacters?: ScenePresenceFact[];
 }) {
   const originalText = String(args.text || "");
   let text = originalText;
@@ -658,6 +808,7 @@ export function removeScenePresenceContradictionPassages(args: {
       text,
       currentUserText: args.currentUserText,
       presentCharacters: args.presentCharacters,
+      excludedCharacters: args.excludedCharacters,
     });
     if (!contradiction) break;
 
