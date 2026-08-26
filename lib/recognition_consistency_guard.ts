@@ -920,11 +920,23 @@ export function removeScenePresenceContradictionPassages(args: {
         contradiction.kind === "unauthorized_exit" ||
         isRelationalAnonymousExit
       ) {
-        // An invented exit/incapacitation is a local continuity error, not a
-        // reason to discard every later paragraph the provider already wrote.
-        // Remove the offending paragraph, then loop so any dependent exit
-        // claims later in the draft are independently removed as well.
-        text = `${text.slice(0, paragraphStart).trimEnd()}\n\n${text
+        // Keep the one-shot provider output intact. A previous implementation
+        // deleted the offending paragraph (and, for named exits, sometimes the
+        // entire suffix), wasting already-generated tokens and turning a full
+        // answer into a few hundred characters. Replace only the contradictory
+        // local beat with a deterministic continuity-preserving beat; later
+        // prose and the status panel remain untouched.
+        const rosterNames = args.presentCharacters
+          .map((fact) => fact.characterName.trim())
+          .filter(Boolean);
+        const subject = isRelationalAnonymousExit
+          ? rosterNames.join(", ") || contradiction.characterName
+          : contradiction.characterName;
+        const replacement =
+          contradiction.kind === "unauthorized_incapacitation"
+            ? `*${subject} 역시 깨어 있는 채 현재 장면에 그대로 남아, 이어지는 상황에 반응했다.*`
+            : `*${subject} 역시 자리를 벗어나지 않고 현재 장면에 그대로 남아, 이어지는 상황에 반응했다.*`;
+        text = `${text.slice(0, paragraphStart).trimEnd()}\n\n${replacement}\n\n${text
           .slice(paragraphEnd)
           .trimStart()}`.trim();
         removed += 1;
