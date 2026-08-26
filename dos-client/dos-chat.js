@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const readlineCore = require("readline");
 const readline = require("readline/promises");
@@ -3470,6 +3471,93 @@ async function continueLatestAssistant() {
   }
 }
 
+async function exportNovelPdf(rl) {
+  if (!state.chatId) {
+    throw new Error("열린 채팅이 없습니다. /open 또는 /new로 채팅을 먼저 여세요.");
+  }
+
+  console.log("");
+  hr("소설로 만들기");
+  console.log("현재 채팅 전체를 읽어 한국식 웹소설로 재구성하고 PDF로 저장합니다.");
+  console.log("긴 채팅은 장마다 AI를 호출하므로 시간이 걸릴 수 있습니다.");
+  console.log(`${ANSI.yellow}진행 중 이 DOS 창을 닫거나 나가면 취소됩니다. 완료될 때까지 그대로 기다려 주세요.${ANSI.reset}`);
+  console.log("원본 채팅과 장기기억 DB는 변경되지 않습니다.");
+  const answer = String(await rl.question("계속할까요? [y/N] ")).trim().toLowerCase();
+  if (!["y", "yes", "예", "ㅇ"].includes(answer)) {
+    console.log("취소했습니다.");
+    return;
+  }
+
+  const res = await fetch(`${API_BASE}/api/chat/novel/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId: state.chatId }),
+    signal: state.activeController ? state.activeController.signal : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text;
+    try {
+      const json = JSON.parse(text);
+      message = String(json && (json.error || json.detail) || text);
+    } catch {}
+    throw new Error(message || `HTTP ${res.status}`);
+  }
+  if (!res.body) throw new Error("진행률 스트림을 열지 못했습니다.");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let completed = null;
+  let progressPrinted = false;
+  const printProgress = (percent, message) => {
+    const line = `소설 PDF: ${String(Math.max(0, Math.min(100, Number(percent) || 0))).padStart(3, " ")}% · ${String(message || "만드는 중")}`;
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r\x1b[2K${line}`);
+      progressPrinted = true;
+    } else {
+      console.log(line);
+    }
+  };
+  const acceptLine = (line) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    if (event && event.type === "progress") {
+      printProgress(event.percent, event.message);
+    } else if (event && event.type === "error") {
+      throw new Error(String(event.error || "소설 PDF 생성 실패"));
+    } else if (event && event.type === "done") {
+      completed = event;
+      printProgress(100, "다운로드 준비 완료");
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      pending += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = pending.split("\n");
+      pending = lines.pop() || "";
+      for (const line of lines) acceptLine(line);
+      if (done) break;
+    }
+    if (pending.trim()) acceptLine(pending);
+  } finally {
+    if (progressPrinted) process.stdout.write("\n");
+  }
+
+  if (!completed || !completed.pdfBase64) {
+    throw new Error("완성된 PDF 데이터가 없습니다.");
+  }
+  const downloadsDir = path.join(os.homedir(), "Downloads");
+  fs.mkdirSync(downloadsDir, { recursive: true });
+  const filename = path.basename(String(completed.filename || "소설.pdf"));
+  const outputPath = path.join(downloadsDir, filename);
+  fs.writeFileSync(outputPath, Buffer.from(String(completed.pdfBase64), "base64"));
+  console.log(`${ANSI.green}완료: ${outputPath}${ANSI.reset}`);
+  console.log(`${Number(completed.chapters || 0)}장 · ${Number(completed.sourceMessages || 0)}개 메시지 반영`);
+}
+
 function help() {
   hr("ARCA DOS CHAT — 명령어");
   console.log("");
@@ -3480,6 +3568,7 @@ function help() {
   console.log("  /new          작품으로 새 채팅 시작");
   console.log("  /history      대화 보기");
   console.log("  /continue     직전 AI 답변 이어서 생성 (Ctrl+G)");
+  console.log("  /novel        전체 채팅을 웹소설 PDF로 만들기 (로컬 전용)");
   console.log("  /delete       최근 user+assistant 한 쌍 삭제");
   console.log("");
   console.log(`${ANSI.bold}${ANSI.title}■ 설정${ANSI.reset}`);
@@ -3522,6 +3611,7 @@ async function handleCommand(line, rl) {
   else if (cmd === "/new" || cmd === "/n") await createChat(arg);
   else if (cmd === "/history" || cmd === "/hi" || cmd === "/hist") await showHistory(Number(arg) || 20);
   else if (cmd === "/continue" || cmd === "/cont" || cmd === "/g") await continueLatestAssistant();
+  else if (cmd === "/novel" || cmd === "/pdf") await exportNovelPdf(rl);
   else if (cmd === "/panel" || cmd === "/ui" || cmd === "/config") await openSettingsPanel(rl);
   else if (cmd === "/settings" || cmd === "/set" || cmd === "/s") await showSettings();
   else if (cmd === "/model" || cmd === "/md") await chooseModelSetting(arg, rl);

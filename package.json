@@ -9,6 +9,7 @@
     "lint": "eslint",
     "test:knowledge": "node --test lib/character_knowledge.test.js",
     "test:recognition": "node --test lib/recognition_consistency_guard.test.js",
+    "test:novel": "node --test lib/novel_export.test.js",
     "test:memory": "node --test app/api/chat/send/_server/formatGuide.test.js app/api/chat/send/_server/streamRunner.test.js lib/character_knowledge.test.js lib/epistemic_prompt_firewall.test.js lib/guarded_text_stream.test.js lib/legal_status_consistency_guard.test.js lib/recognition_consistency_guard.test.js lib/status_panel_continuity.test.js lib/turn_completion_guard.test.js"
   },
   "dependencies": {
@@ -17,6 +18,7 @@
     "jose": "^5.2.4",
     "lucide-react": "^0.469.0",
     "next": "16.1.1",
+    "pdfkit": "^0.20.1",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-markdown": "^9.0.1",
@@ -26,6 +28,7 @@
     "@tailwindcss/postcss": "^4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
+    "@types/pdfkit": "^0.17.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",

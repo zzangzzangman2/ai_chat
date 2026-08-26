@@ -685,6 +685,13 @@ export default function ChatArea(props: {
 
   // 설정 Drawer 내부 뷰(홈 -> 각 설정) 전환
   const [settingsView, setSettingsView] = useState<"home" | "persona" | "userNote" | "model" | "room" | "memory" | "relations">("home");
+  const [novelExportAvailable, setNovelExportAvailable] = useState(false);
+  const [novelExportState, setNovelExportState] = useState({
+    running: false,
+    percent: 0,
+    message: "",
+  });
+  const novelExportAbortRef = useRef<AbortController | null>(null);
 
   // Drawer 모드라도 "장기기억/관계도" 화면은 더 넓게 보이도록 도킹한다.
   // - 모바일(좁은 화면)에서는 기존처럼 drawer(overlay)로 유지
@@ -1639,6 +1646,36 @@ const loadOlder = useCallback(async () => {
     const presetName = String(selectedPreset?.name || "").trim();
     return presetName || "채팅";
   }, [chatTitle, selectedPreset]);
+
+  useEffect(() => {
+    const hostname = String(window.location.hostname || "").toLowerCase();
+    setNovelExportAvailable(hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1");
+  }, []);
+
+  // 소설 만들기는 현재 화면과 연결된 작업이다. 다른 채팅/작품으로 이동하거나
+  // 컴포넌트를 나가면 서버 호출도 즉시 중단한다.
+  useEffect(() => {
+    return () => {
+      novelExportAbortRef.current?.abort();
+    };
+  }, [chatId, presetId]);
+
+  useEffect(() => {
+    if (!novelExportState.running) return;
+    const warnBeforeLeave = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeave);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeave);
+  }, [novelExportState.running]);
+
+  useEffect(() => {
+    if (!novelExportState.running) return;
+    if (!effectiveSettingsOpen || settingsView !== "home") {
+      novelExportAbortRef.current?.abort();
+    }
+  }, [effectiveSettingsOpen, novelExportState.running, settingsView]);
 
 
 
@@ -4219,6 +4256,117 @@ return (
     }
   }
 
+  function cancelNovelExport() {
+    novelExportAbortRef.current?.abort();
+    setNovelExportState({ running: false, percent: 0, message: "취소됨" });
+    showToast("소설 만들기 취소", "PDF를 만들지 않았습니다.", "error", 2500);
+  }
+
+  async function startNovelExport() {
+    if (!chatId) {
+      showToast("채팅이 없습니다", "먼저 채팅을 생성해 주세요.", "error");
+      return;
+    }
+    if (novelExportState.running) return;
+    const confirmed = window.confirm(
+      [
+        "현재 채팅의 처음부터 끝까지 모두 읽어 한국식 웹소설 PDF로 재구성합니다.",
+        "",
+        "긴 채팅은 여러 장으로 나누어 장마다 AI를 호출하므로 시간이 걸릴 수 있습니다.",
+        "진행 중 설정 화면을 닫거나 다른 채팅으로 이동하거나 페이지를 나가면 작업이 취소됩니다.",
+        "완료될 때까지 이 화면에서 그대로 기다려 주세요.",
+        "",
+        "원본 채팅과 장기기억 DB는 변경되지 않습니다. 계속할까요?",
+      ].join("\n")
+    );
+    if (!confirmed) return;
+
+    const controller = new AbortController();
+    novelExportAbortRef.current = controller;
+    setNovelExportState({ running: true, percent: 1, message: "전체 대화 불러오는 중" });
+
+    try {
+      const res = await fetch("/api/chat/novel/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId, title: effectiveChatTitle }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const json = await safeJson(res);
+        throw new Error(json?.error || `소설 만들기 실패 (${res.status})`);
+      }
+      if (!res.body) throw new Error("진행률 스트림을 열지 못했습니다.");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      let completed: any = null;
+      const acceptLine = (line: string) => {
+        if (!line.trim()) return;
+        const event = JSON.parse(line);
+        if (event?.type === "progress") {
+          setNovelExportState({
+            running: true,
+            percent: Math.max(0, Math.min(99, Number(event.percent || 0))),
+            message: String(event.message || "소설 만드는 중"),
+          });
+        } else if (event?.type === "error") {
+          throw new Error(String(event.error || "소설 PDF 생성 실패"));
+        } else if (event?.type === "done") {
+          completed = event;
+          setNovelExportState({ running: true, percent: 100, message: "다운로드 준비 완료" });
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const lines = pending.split("\n");
+        pending = lines.pop() || "";
+        for (const line of lines) acceptLine(line);
+        if (done) break;
+      }
+      if (pending.trim()) acceptLine(pending);
+      if (!completed?.pdfBase64) throw new Error("완성된 PDF 데이터가 없습니다.");
+
+      const base64 = String(completed.pdfBase64);
+      const blobParts: BlobPart[] = [];
+      const sliceSize = 1024 * 1024;
+      for (let offset = 0; offset < base64.length; offset += sliceSize) {
+        const binary = window.atob(base64.slice(offset, offset + sliceSize));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        blobParts.push(bytes as unknown as BlobPart);
+      }
+      const url = URL.createObjectURL(new Blob(blobParts, { type: "application/pdf" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = String(completed.filename || "소설.pdf");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setNovelExportState({ running: false, percent: 100, message: "완료" });
+      showToast(
+        "소설 PDF 완성",
+        `${Number(completed.chapters || 0)}장 · ${Number(completed.sourceMessages || 0)}개 메시지 반영`,
+        "success",
+        4500
+      );
+    } catch (error: any) {
+      if (controller.signal.aborted || error?.name === "AbortError") {
+        setNovelExportState({ running: false, percent: 0, message: "취소됨" });
+      } else {
+        const message = String(error?.message || "소설 PDF 생성 실패");
+        setNovelExportState({ running: false, percent: 0, message: "실패" });
+        showToast("소설 만들기 실패", message, "error", 5000);
+      }
+    } finally {
+      if (novelExportAbortRef.current === controller) novelExportAbortRef.current = null;
+    }
+  }
+
   // (리팩터링) ChatArea.tsx의 거대한 스트리밍 pacer/프리버퍼 로직을 훅으로 분리.
   // - 기능 삭제 없이, 파일 의존도를 낮추고 컴파일/리뷰 난이도를 줄이기 위한 목적.
   const settingsRef = useRef(settings);
@@ -6231,6 +6379,91 @@ const insertNarrationMarkers = useCallback(() => {
                 </div>
               </div>
             </button>
+
+            {novelExportAvailable ? (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: 12,
+                  borderRadius: 14,
+                  border: `1px solid ${CHAT_THEME.borderStrong}`,
+                  background: CHAT_THEME.panel,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 900 }}>소설로 만들기</div>
+                    <div style={{ fontSize: 12, opacity: 0.65, marginTop: 3, lineHeight: 1.35 }}>
+                      전체 대화를 한국식 웹소설로 재구성해 PDF로 저장합니다.
+                    </div>
+                  </div>
+                  {novelExportState.running ? (
+                    <button
+                      type="button"
+                      onClick={cancelNovelExport}
+                      style={{
+                        flex: "0 0 auto",
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: "none",
+                        background: "rgba(239,68,68,0.16)",
+                        color: "#fca5a5",
+                        cursor: "pointer",
+                        fontWeight: 900,
+                      }}
+                    >
+                      취소
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={!chatId || busy}
+                      onClick={startNovelExport}
+                      style={{
+                        flex: "0 0 auto",
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: "none",
+                        background: !chatId || busy ? "rgba(255,255,255,0.08)" : CHAT_THEME.bg2,
+                        color: !chatId || busy ? "rgba(229,231,235,0.45)" : "#fff",
+                        cursor: !chatId || busy ? "not-allowed" : "pointer",
+                        fontWeight: 900,
+                      }}
+                    >
+                      PDF 만들기
+                    </button>
+                  )}
+                </div>
+                {novelExportState.running ? (
+                  <div style={{ marginTop: 12 }}>
+                    <div
+                      style={{
+                        height: 8,
+                        borderRadius: 999,
+                        overflow: "hidden",
+                        background: "rgba(255,255,255,0.09)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${novelExportState.percent}%`,
+                          height: "100%",
+                          borderRadius: 999,
+                          background: CHAT_THEME.accent,
+                          transition: "width 220ms ease",
+                        }}
+                      />
+                    </div>
+                    <div style={{ marginTop: 7, fontSize: 12, fontWeight: 800 }}>
+                      {novelExportState.percent}% · {novelExportState.message}
+                    </div>
+                    <div style={{ marginTop: 4, fontSize: 11, color: "#fca5a5", lineHeight: 1.35 }}>
+                      이 화면을 닫거나 다른 채팅으로 나가면 취소됩니다. 완료될 때까지 그대로 기다려 주세요.
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
 
             {!settings ? (
               <div style={{ fontSize: 12, opacity: 0.65, marginTop: 10 }}>
