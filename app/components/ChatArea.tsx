@@ -4703,6 +4703,16 @@ async function send(overrideText?: unknown) {
             continue;
           }
 
+          if (obj.type === "replace") {
+            const replacement = stripEndMarkerClient(String(obj.text || ""));
+            streamTargetRef.current = replacement;
+            streamShownRef.current = replacement;
+            setMessages((prev) =>
+              prev.map((m) => (m.id === tempAssistantId ? { ...m, content: replacement } : m))
+            );
+            continue;
+          }
+
           if (obj.type === "ping") {
             // keep-alive (Gemini 3 Pro can be silent for a while)
             streamLastPingAtRef.current = Date.now();
@@ -5205,6 +5215,16 @@ async function send(overrideText?: unknown) {
 
                 // 델타는 버퍼에만 누적하고, 화면 반영은 pacer가 담당
                 streamTargetRef.current = stripEndMarkerClient(streamTargetRef.current + d);
+                continue;
+              }
+
+              if (obj.type === "replace") {
+                const replacement = stripEndMarkerClient(String(obj.text || ""));
+                streamTargetRef.current = replacement;
+                streamShownRef.current = replacement;
+                setMessages((prev) =>
+                  prev.map((m) => (m.id === assistantMessageId ? { ...m, content: replacement } : m))
+                );
                 continue;
               }
 

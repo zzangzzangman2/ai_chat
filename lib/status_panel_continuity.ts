@@ -1,3 +1,5 @@
+import { splitTrailingPanels } from "./turn_completion_guard";
+
 export type StatusPanelMessage = { role?: string; content?: string };
 
 type TrailingPanel = {
@@ -8,24 +10,14 @@ type TrailingPanel = {
 };
 
 function trailingPanel(value: unknown): TrailingPanel | null {
-  const text = String(value || "").replace(/\r\n/g, "\n").trimEnd();
-  const markers = Array.from(text.matchAll(/^[ \t]*```[^\n]*$/gm));
-  if (markers.length < 2 || markers.length % 2 !== 0) return null;
-  const close = markers[markers.length - 1];
-  const closeEnd = Number(close.index || 0) + String(close[0] || "").length;
-  if (text.slice(closeEnd).trim()) return null;
-  const open = markers[markers.length - 2];
-  const openStart = Number(open.index || 0);
-  const openLine = String(open[0] || "").trim();
-  const label = openLine.slice(3).trim().split(/\s+/)[0] || "";
-  if (!label) return null;
-  const innerStart = openStart + String(open[0] || "").length;
-  const inner = text.slice(innerStart, Number(close.index || 0)).replace(/^\n/, "").replace(/\n$/, "");
+  const split = splitTrailingPanels(value);
+  const current = split.panels[0];
+  if (!current) return null;
   return {
-    before: text.slice(0, openStart).trimEnd(),
-    fence: text.slice(openStart, closeEnd).trim(),
-    label,
-    lines: inner.split("\n"),
+    before: split.body,
+    fence: current.fence,
+    label: current.label,
+    lines: current.lines,
   };
 }
 

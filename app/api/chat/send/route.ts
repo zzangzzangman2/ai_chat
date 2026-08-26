@@ -3534,7 +3534,7 @@ const systemRaw = (cacheFriendlyLayout
       "2~3";
     const oneShotLengthContract = [
       `[이번 턴 분량 계약]`,
-      `- 이 서버는 속도 유지를 위해 짧은 답변을 2차 호출로 보강하지 않는다. 첫 호출에서 직접 충분히 쓴다.`,
+      `- 첫 호출에서 직접 충분하고 완결된 본문을 쓴다. 서버의 예외 복구에 기대어 조기 종료하지 않는다.`,
       `- 서사 본문 목표: 약 ${targetChars}자. 메타/상태창이 필요하면 본문 뒤에 별도 코드블록으로 붙인다.`,
       `- 본문이 약 ${oneShotBodyFloorChars}자보다 짧은 상태에서는 종료하지 않는다. 글자수를 정확히 셀 수 없으면 최소 ${oneShotBeatCount}개 장면 비트를 채운다.`,
       `- 장면 비트는 서로 다른 내용이어야 한다: 관찰 가능한 반응, 표정/몸짓, 주변 상황 변화, NPC의 판단 변화, 다음 선택지를 압박하는 대사.`,
@@ -3542,6 +3542,7 @@ const systemRaw = (cacheFriendlyLayout
       `- 메타/상태창이 필요하면 본문을 더 늘리는 것보다 완성된 fenced 코드블록이 우선이다. 메타를 시작했다면 항목 일부만 쓰고 닫지 말고, 짧더라도 의미 있는 전체 상태창을 완성한다.`,
       `- 분량 한계에 가까워지면 새 문장을 시작하지 말고, 열린 대사 따옴표(")와 지문 별표(*)를 먼저 닫은 뒤 메타/상태창으로 넘어간다.`,
       `- 주인공의 다음 행동/대사는 대신 쓰지 말고, NPC 반응과 현재 장면만 충분히 전개한다.`,
+      `- 현재 입력이 둘 다·각자·모두·너네·너희처럼 복수 NPC에게 답변을 요구하면, 대상 전원의 관찰 가능한 반응과 대답을 본문에서 모두 끝낸 뒤에만 상태창으로 넘어간다. 한 명만 답하고 종료하지 않는다.`,
     ].join("\n");
 
     const latestInputNoEchoRule = `사용자의 최신 입력은 이미 화면에 표시되고 끝난 사건이다. 절대 다시 직접 인용하거나, "~라는 말/명령/요구"로 간접 인용·요약·재서술하지 마라. 입력을 내뱉는 목소리·태도·행위도 다시 묘사하지 말고, 그 직후의 NPC 반응·행동·장면 변화부터 시작하라.`;
@@ -4032,12 +4033,13 @@ let cancelStreamWork: (() => void) | null = null;
             let metaOverlapPromise: Promise<string> | null = null;
             let metaOverlapTriggeredAt = 0;
 
-          // ===== Generation (append-only) + optional auto-continue (max 2) =====
-          // Goal: if the model ends with MAX_TOKENS, automatically request a continuation
-          // (append-only) up to 2 times, preserving the user's reasoning/UI settings.
+          // ===== Generation + one bounded completion recovery =====
+          // The normal path stays one-shot. A deterministic post-check may replace
+          // the draft once when the turn is objectively incomplete.
 
           const mergeUsage = mergeStreamUsage;
-          const makeContinueUser = (combined: string) => makeContinueUserPrompt(context, combined);
+          const makeContinueUser = (combined: string, reasons: readonly string[] = []) =>
+            makeContinueUserPrompt(context, combined, reasons, userText);
 
           // (2026-07) gemini-3-pro 계열도 기본은 실시간 델타 스트리밍(generateTextStream).
           // 과거 DONE-ONLY(전체 버퍼링) 전환 사유였던 "본문 캡(bodyMaxChars) + 메타 펜스 직전 문장 잘림"은
@@ -4166,11 +4168,10 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
 
           
 
-          // 2) Emergency auto-continue once when the provider explicitly says
-          // MAX_TOKENS. Normal turns remain one-shot; only a provably truncated
-          // answer gets one append-only recovery call instead of being stored
-          // mid-sentence with a locally appended status panel.
-          const MAX_CONTINUES = 1;
+          // Recovery is decided once, below, by the deterministic completion
+          // guard. It covers MAX_TOKENS, short STOP, unbalanced prose markers,
+          // and incomplete plural responses without allowing chained calls.
+          const MAX_CONTINUES = 0;
           const generation = await runStreamMainGeneration({
             proDoneOnly: PRO_DONE_ONLY,
             runOneBuffered,
@@ -4209,9 +4210,14 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
             stripUrlsAndMediaMarkdown,
             streamDebug: STREAM_DEBUG,
             streamTag,
+            currentUserText: userText,
+            allowBoundedRecovery: generation.continuationCount === 0,
           });
           raw = shortContinue.raw;
           combinedUsage = shortContinue.combinedUsage;
+          if (shortContinue.replaced) {
+            debugReasons.push(`continue:COMPLETION_GUARD(${shortContinue.reasons.join("+")})`);
+          }
 
           const recognitionChecked = await enforceRecognitionConsistency({
             text: raw,
@@ -4432,6 +4438,27 @@ if (!TRANSPORT_STREAMING) {
           const guardedTail = guardedTextStream.finish();
           if (guardedTail) enqueueWire({ type: "delta", text: guardedTail });
           assistantText = guardedTextStream.output();
+          if (shortContinue.replaced) {
+            const epistemic = sanitizeGeneratedFacts(factGuardRecoverySource);
+            const legalStatus = removeUnsupportedLegalStatusClaims({
+              text: epistemic.text,
+              trustedUserTexts: trustedLegalStatusUserTexts,
+              trustedNarrationTexts: trustedLegalStatusNarrationTexts,
+              identities: legalStatusIdentities,
+            });
+            const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+            const scenePresence = removeScenePresenceContradictionPassages({
+              text: vitalStatus.text,
+              currentUserText: userText,
+              presentCharacters: currentScenePresence,
+              excludedCharacters: currentSceneExclusions,
+            });
+            streamEpistemicRedactions += epistemic.redactedSegments;
+            streamLegalStatusRedactions += legalStatus.removed;
+            streamVitalStatusRedactions += vitalStatus.removed;
+            streamScenePresenceRedactions += scenePresence.removed;
+            assistantText = scenePresence.text;
+          }
           if (!assistantText.trim()) {
             const recovered = recoverAfterOverfilter(factGuardRecoverySource).trim();
             if (recovered) {
@@ -4485,6 +4512,9 @@ if (!TRANSPORT_STREAMING) {
           if (streamMarkerBalance.repaired) {
             assistantText = streamMarkerBalance.text;
             debugReasons.push(`format:CLOSE_BODY_MARKERS:${streamMarkerBalance.added}`);
+          }
+          if (shortContinue.replaced || streamStatusContinuity.changed || streamMarkerBalance.repaired) {
+            enqueueWire({ type: "replace", text: assistantText });
           }
 
 // messages 저장
