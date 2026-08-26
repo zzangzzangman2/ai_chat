@@ -47,35 +47,69 @@ const passthroughParams = {
   streamTag: "test",
 };
 
-test("bounded recovery repairs short STOP while preserving one trailing panel", async () => {
+test("short or plural-incomplete STOP remains one-shot", async () => {
   let calls = 0;
-  let promptReasons = [];
   const fence = "```";
   const result = await runOptionalShortContinue({
     ...passthroughParams,
     raw: `*둘은 서로를 바라봤다.*\n\n"저는 혜진이요."${fence}상태\n날짜: 10:07\n${fence}`,
     currentUserText: "너네 학교에서 제일 예쁜 애가 누구야?",
     allowBoundedRecovery: true,
-    makeContinueUser: (body, reasons) => {
-      assert.doesNotMatch(body, /```/u);
-      promptReasons = reasons;
-      return "continue";
+    makeContinueUser: () => "continue",
+    generateText: async () => {
+      calls += 1;
+      return { text: "unexpected", usage: {} };
     },
+  });
+
+  assert.equal(calls, 0);
+  assert.equal(result.replaced, false);
+  assert.equal((result.raw.match(/```상태/gu) || []).length, 1);
+  assert.doesNotMatch(result.raw, /다른 아이도/u);
+});
+
+test("MAX_TOKENS recovery stays inside the original display budget", async () => {
+  let calls = 0;
+  const result = await runOptionalShortContinue({
+    ...passthroughParams,
+    oneShot: false,
+    raw: "가".repeat(900),
+    combinedUsage: { finishReason: "MAX_TOKENS", outputTokens: 300 },
+    currentUserText: "계속해",
+    promptMaxChars: 1200,
+    allowBoundedRecovery: true,
+    makeContinueUser: () => "continue",
     generateText: async () => {
       calls += 1;
       return {
-        text: `*다른 아이도 고개를 들었다.*\n\n"저도 혜진이라고 생각해요."\n\n${fence}상태\n잘못된 중복 상태\n${fence}`,
-        usage: { finishReason: "STOP", outputTokens: 80 },
+        text: "나".repeat(1000),
+        usage: { finishReason: "STOP", outputTokens: 400 },
       };
     },
   });
 
   assert.equal(calls, 1);
   assert.equal(result.replaced, true);
-  assert.deepEqual(promptReasons, ["SHORT_BODY", "PLURAL_RESPONSE_INCOMPLETE"]);
-  assert.match(result.raw, /다른 아이도 고개를 들었다/u);
-  assert.equal((result.raw.match(/```상태/gu) || []).length, 1);
-  assert.match(result.raw, /날짜: 10:07\n```$/u);
+  assert.ok(Array.from(result.raw).length <= 1200);
+});
+
+test("ONE_SHOT suppresses MAX_TOKENS recovery calls", async () => {
+  let calls = 0;
+  const result = await runOptionalShortContinue({
+    ...passthroughParams,
+    raw: "가".repeat(900),
+    combinedUsage: { finishReason: "MAX_TOKENS", outputTokens: 300 },
+    currentUserText: "계속해",
+    allowBoundedRecovery: true,
+    makeContinueUser: () => "continue",
+    generateText: async () => {
+      calls += 1;
+      return { text: "unexpected", usage: {} };
+    },
+  });
+
+  assert.equal(calls, 0);
+  assert.equal(result.replaced, false);
 });
 
 test("complete STOP remains one-shot", async () => {

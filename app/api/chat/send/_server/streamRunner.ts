@@ -228,7 +228,16 @@ export async function runOptionalShortContinue(
       process.env.CHAT_ENABLE_SHORT_CONTINUE === "1" &&
       !params.oneShot &&
       !params.disallowG3ProContinue;
-    const boundedRecovery = Boolean(params.allowBoundedRecovery && assessment.needsRecovery);
+    // A normal STOP is authoritative. Do not spend a second request merely
+    // because prose is shorter than the prompt target or a plural-response
+    // heuristic thinks another line would be useful. Recovery is reserved for
+    // objective provider failure: empty output or a MAX_TOKENS truncation.
+    const hardRecovery = assessment.reasons.some(
+      (reason) => reason === "EMPTY_BODY" || reason === "MAX_TOKENS"
+    );
+    const boundedRecovery = Boolean(
+      !params.oneShot && params.allowBoundedRecovery && hardRecovery
+    );
     if (
       (legacyShortContinue || boundedRecovery) &&
       (curLenNarr > 0 || boundedRecovery) &&
@@ -253,13 +262,12 @@ export async function runOptionalShortContinue(
         minNarrativeChars: 0,
       });
       let add = params.stripStandaloneSeparatorLines(stripAllFenceBlocks(addAssessment.body));
-      // Enforce the same max char headroom at append-time.
-      // A deterministic recovery must not be cut mid-sentence by the soft
-      // display budget. The provider call is already bounded; keep a separate
-      // absolute append ceiling for malformed/model-runaway output.
-      const remaining = boundedRecovery
-        ? 6000
-        : Math.max(0, Math.floor(params.promptMaxChars - strlenLocal(raw)));
+      // Recovery must never expand a turn beyond the same total display budget
+      // used by the first call.
+      const remaining = Math.max(
+        0,
+        Math.floor(params.promptMaxChars - strlenLocal(raw) - 1)
+      );
       if (remaining > 0 && add) {
         if (strlenLocal(add) > remaining) {
           add = Array.from(add).slice(0, remaining).join("");
