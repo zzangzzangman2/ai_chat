@@ -5,7 +5,6 @@ import type { NovelChapter } from "@/lib/novel_export";
 
 export type NovelPdfInput = {
   title: string;
-  subtitle?: string;
   author?: string;
   chapters: NovelChapter[];
   generatedAt?: Date;
@@ -54,14 +53,16 @@ function addChapterBody(doc: PDFKit.PDFDocument, bodyRaw: string) {
   const body = normalizePdfText(bodyRaw);
   const paragraphs = body.split(/\n\s*\n/g).map((part) => part.trim()).filter(Boolean);
   for (const paragraph of paragraphs) {
-    const isDialogue = /^["“‘']/u.test(paragraph);
     doc
       .font("NovelRegular")
       .fontSize(10.4)
       .fillColor("#242424")
       .text(paragraph, {
         align: "left",
-        indent: isDialogue ? 0 : 12,
+        // 한국 웹소설은 지문과 대사를 같은 왼쪽 선에서 시작한다.
+        // 지문에만 첫 줄 들여쓰기를 주면 줄바꿈 위치가 달라져 읽는
+        // 리듬이 깨지므로 모든 본문 문단에 동일한 여백을 적용한다.
+        indent: 0,
         lineGap: 4.4,
         paragraphGap: 9,
         wordSpacing: 0,
@@ -103,14 +104,6 @@ export async function buildNovelPdf(input: NovelPdfInput) {
     .font("NovelBold")
     .fontSize(25)
     .text(title, 46, 170, { width: doc.page.width - 92, align: "center", lineGap: 7 });
-  if (input.subtitle) {
-    doc
-      .moveDown(1.2)
-      .font("NovelRegular")
-      .fontSize(10)
-      .fillColor("#6e665c")
-      .text(normalizePdfText(input.subtitle), { align: "center" });
-  }
   doc
     .font("NovelRegular")
     .fontSize(8.5)
@@ -141,13 +134,8 @@ export async function buildNovelPdf(input: NovelPdfInput) {
       .fontSize(17)
       .fillColor("#24211d")
       .text(normalizePdfText(chapter.title), { align: "center", lineGap: 5 });
-    doc
-      .moveDown(0.7)
-      .font("NovelRegular")
-      .fontSize(7.5)
-      .fillColor("#8a8177")
-      .text(`원문 ${chapter.startTurn}-${chapter.endTurn}턴`, { align: "center" });
-    doc.moveDown(1.8);
+    // 독자가 볼 필요가 없는 원문 턴 범위는 싣지 않는다.
+    doc.moveDown(1.45);
     addChapterBody(doc, chapter.body);
   }
 
@@ -158,11 +146,6 @@ export async function buildNovelPdf(input: NovelPdfInput) {
     // PDFKit은 여백 아래에 text()를 그리면 새 페이지를 만들 수 있다.
     // 머리말/쪽번호를 그리는 동안만 하단 여백 제한을 해제한다.
     doc.page.margins.bottom = 0;
-    doc
-      .font("NovelRegular")
-      .fontSize(7)
-      .fillColor("#92897f")
-      .text(title, 44, 22, { width: doc.page.width - 88, align: "center", lineBreak: false });
     doc
       .font("NovelRegular")
       .fontSize(7.5)

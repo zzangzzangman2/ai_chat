@@ -4273,6 +4273,7 @@ return (
         "현재 채팅의 처음부터 끝까지 모두 읽어 한국식 웹소설 PDF로 재구성합니다.",
         "",
         "긴 채팅은 여러 장으로 나누어 장마다 AI를 호출하므로 시간이 걸릴 수 있습니다.",
+        "작품 제목은 채팅방 제목을 복사하지 않고 원고 내용에 맞춰 새로 정합니다.",
         "진행 중 설정 화면을 닫거나 다른 채팅으로 이동하거나 페이지를 나가면 작업이 취소됩니다.",
         "완료될 때까지 이 화면에서 그대로 기다려 주세요.",
         "",
@@ -4289,7 +4290,7 @@ return (
       const res = await fetch("/api/chat/novel/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId, title: effectiveChatTitle }),
+        body: JSON.stringify({ chatId }),
         signal: controller.signal,
       });
       if (!res.ok) {

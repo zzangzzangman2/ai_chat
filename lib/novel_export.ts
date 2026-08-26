@@ -18,6 +18,7 @@ export type NovelChapter = {
   body: string;
   startTurn: number;
   endTurn: number;
+  novelTitle?: string;
 };
 
 function plain(value: unknown) {
@@ -138,12 +139,25 @@ export function parseGeneratedNovelChapter(
 ): NovelChapter {
   const text = stripGeneratedDecorations(value);
   const lines = text.split(/\r?\n/);
-  const firstNonBlank = lines.findIndex((line) => line.trim());
+  let firstNonBlank = lines.findIndex((line) => line.trim());
+  let novelTitle = "";
+  if (source.index === 1 && firstNonBlank >= 0) {
+    const firstLine = lines[firstNonBlank].replace(/^#{1,6}\s*/, "").trim();
+    const titleMatch = firstLine.match(/^(?:작품\s*)?제목\s*[:：]\s*(.+)$/u);
+    if (titleMatch?.[1]) {
+      novelTitle = titleMatch[1].trim().slice(0, 60);
+      lines.splice(firstNonBlank, 1);
+      firstNonBlank = lines.findIndex((line) => line.trim());
+    }
+  }
   let title = `제 ${source.index}화`;
   if (firstNonBlank >= 0) {
     const candidate = lines[firstNonBlank]
       .replace(/^#{1,6}\s*/, "")
-      .replace(/^제\s*\d+\s*화\s*[:：\-]?\s*/u, "")
+      .replace(/^(?:화|장)\s*제목\s*[:：]\s*/u, "")
+      // 모델이 "제 8화 8장. 공범"처럼 번호를 겹쳐 쓰더라도
+      // 이 함수에서 붙이는 표준 회차 번호만 한 번 남긴다.
+      .replace(/^(?:(?:제\s*)?\d+\s*(?:화|장)(?:\s*[.：:\-])?\s*)+/u, "")
       .trim();
     if (candidate && candidate.length <= 60) {
       title = `제 ${source.index}화 ${candidate}`.trim();
@@ -157,7 +171,20 @@ export function parseGeneratedNovelChapter(
     body,
     startTurn: source.startTurn,
     endTurn: source.endTurn,
+    ...(novelTitle ? { novelTitle } : {}),
   };
+}
+
+export function chooseGeneratedNovelTitle(chapters: NovelChapter[]) {
+  const explicit = chapters
+    .map((chapter) => String(chapter?.novelTitle || "").trim())
+    .find(Boolean);
+  if (explicit) return explicit.slice(0, 60);
+
+  const firstChapterTitle = String(chapters?.[0]?.title || "")
+    .replace(/^(?:(?:제\s*)?\d+\s*(?:화|장)(?:\s*[.：:\-])?\s*)+/u, "")
+    .trim();
+  return firstChapterTitle.slice(0, 60) || "이름 없는 이야기";
 }
 
 export function safeNovelFilename(value: unknown) {
@@ -170,7 +197,7 @@ export function safeNovelFilename(value: unknown) {
   return `${base}-웹소설.pdf`;
 }
 
-export const NOVEL_STYLE_PROFILE_VERSION = "KR-WEB-2026.08";
+export const NOVEL_STYLE_PROFILE_VERSION = "KR-WEB-2026.08.2";
 
 export function buildNovelSystemPrompt() {
   return [
@@ -186,6 +213,12 @@ export function buildNovelSystemPrompt() {
     "- 첫 문단부터 원문에 실제로 있는 행동·대사·결정·문제를 잡는다. 날씨, 풍경, 잠에서 깨어남, 장황한 과거 설명으로 예열하지 않는다.",
     "- 모바일 스크롤에 맞춰 한 문장은 대체로 한두 호흡, 한 문단은 1-3문장으로 쓴다. 대사와 초점 전환에는 빈 줄을 둔다.",
     "- 단문만 기계적으로 늘어놓거나 문장 성분을 잘라 낸 파편문을 남발하지 않는다. 짧더라도 주어·행동·결과가 선명해야 한다.",
+    "[문장 종결과 호흡]",
+    "- 서술은 자연스러운 한국어 과거 시제 다체를 기본으로 하되, '~했다/~였다/~었다/~됐다'처럼 같은 길이와 같은 종결 리듬이 세 문장 연속 이어지지 않게 퇴고한다.",
+    "- 다체를 피하려고 '~했고.', '~하는데.', '~이기에.', '~뿐.', 명사형 단독 종결 같은 불완전한 파편문을 억지로 만들지 않는다.",
+    "- 같은 주어로 짧은 행동을 나열할 때는 행동과 결과 또는 감각과 반응을 한 문장으로 자연스럽게 묶는다. 반대로 중요한 결정·충격·반전은 짧은 완결문으로 끊어 힘을 준다.",
+    "- 단문·중문·조금 긴 문장을 장면 속도에 맞춰 섞는다. 모든 문장을 비슷한 글자 수와 '주어+목적어+과거형 서술어' 구조로 찍어내지 않는다.",
+    "- 대사, 질문, 반문, 현재 시제는 인물과 장면상 자연스러울 때만 쓴다. 종결어미를 다양하게 보이려는 목적으로 시제나 시점을 임의로 바꾸지 않는다.",
     "- 장면은 행동 → 상대의 구체적 반응 → 달라진 상황의 인과로 전진시킨다. 같은 감정과 사실을 지문·대사·독백으로 세 번 설명하지 않는다.",
     "- 대사는 2020년대 한국인이 실제로 주고받을 법한 구어체로 쓰되, 시대·나이·직업·관계에 맞춘다. 모두가 같은 말투로 설명충처럼 말하지 않는다.",
     "- 배경 설명과 회상은 지금 벌어진 선택을 이해하는 데 필요한 순간에만 짧게 끼워 넣는다. 설정집처럼 한꺼번에 풀지 않는다.",
@@ -204,7 +237,9 @@ export function buildNovelSystemPrompt() {
     "- 직전 입력을 되풀이한 답변과 같은 사건의 중복 서술은 한 번의 선명한 장면으로 합친다.",
     "- 메타 설명, 작성 후기, 다음 화 예고를 쓰지 않는다.",
     "- 미성년자 관련 성적·착취 장면은 구체적으로 재현하지 않고 위협, 사건 결과와 후유증을 중심으로 비노골적으로 처리한다.",
-    "- 출력은 한국어 소설 제목과 본문만 쓴다. 대사는 큰따옴표, 문단은 빈 줄로 구분한다.",
+    "- 출력에는 채팅방 제목, 원문 범위, 메시지 수, 작성일 같은 편집·생성 메타데이터를 넣지 않는다.",
+    "- 채팅방 제목을 작품 제목으로 복사하지 않는다. 첫 장에서 원문의 핵심 인물·갈등·분위기를 바탕으로 짧은 작품 제목을 새로 짓는다.",
+    "- 출력은 작품 제목(첫 장만), 이 장의 제목과 본문만 쓴다. 대사는 큰따옴표, 지문과 대사는 모두 들여쓰기 없이 같은 왼쪽 선에서 시작하고, 모든 문단은 빈 줄 하나로 구분한다.",
   ].join("\n");
 }
 
@@ -216,7 +251,12 @@ export function buildNovelChapterPrompt(args: {
 }) {
   return [
     `전체 ${args.chunkCount}장 중 ${args.chunkIndex}장 원고를 작성한다.`,
-    "첫 줄에는 이 장의 구체적이고 짧은 제목만 쓰고, 빈 줄 뒤부터 소설 본문을 쓴다.",
+    args.chunkIndex === 1
+      ? "첫 줄은 '작품 제목: 새로 지은 제목', 둘째 줄은 '화 제목: 이 장의 구체적이고 짧은 제목' 형식으로 쓰고, 빈 줄 뒤부터 소설 본문을 쓴다. 채팅방 제목은 참고하거나 복사하지 않는다."
+      : "첫 줄에는 이 장의 구체적이고 짧은 제목만 쓰고, 빈 줄 뒤부터 소설 본문을 쓴다.",
+    "본문에는 장 제목을 다시 쓰거나 원문 턴 범위·채팅방 제목·메시지 수 같은 생성 정보를 넣지 않는다.",
+    "지문과 대사는 모두 들여쓰기 없이 같은 왼쪽 선에서 시작하고, 문단 사이는 빈 줄 하나로 통일한다.",
+    "출력 전 원고만 조용히 다시 읽고, 동일한 과거형 종결 3연속·동일 문장 골격 3연속·짧은 단문 5연속이 있으면 사건을 바꾸지 않는 범위에서 문장 결합과 길이 조절로 고친다. 검수 과정은 출력하지 않는다.",
     "원문 사건을 빠뜨리지 않는 것이 우선이다. 자료가 충분하면 약 5,000-8,000자로 장면화하고, 자료가 적으면 반복이나 수사를 보태지 말고 짧고 단단하게 끝낸다.",
     "이번 원문의 마지막 사건까지만 쓴다. 다음 사건을 미리 만들지 않는다.",
     args.previousTail

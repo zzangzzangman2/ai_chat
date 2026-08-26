@@ -6,6 +6,7 @@ import {
   buildNovelSourceChunks,
   buildNovelChapterPrompt,
   buildNovelSystemPrompt,
+  chooseGeneratedNovelTitle,
   parseGeneratedNovelChapter,
   safeNovelFilename,
   type NovelChapter,
@@ -21,9 +22,6 @@ const activeExports = new Set<string>();
 
 type NovelChatRow = {
   id: string;
-  title?: string | null;
-  presetId?: string | null;
-  presetName?: string | null;
 };
 
 type NovelMessageRow = {
@@ -58,7 +56,6 @@ export async function POST(req: Request) {
 
   const body = await req.json().catch(() => ({}));
   const chatId = String(body?.chatId || "").trim();
-  const requestedTitle = String(body?.title || "").trim();
   if (!chatId) return Response.json({ error: "chatId가 필요합니다." }, { status: 400 });
   if (activeExports.has(chatId)) {
     return Response.json({ error: "이 채팅의 소설 PDF를 이미 만들고 있습니다." }, { status: 409 });
@@ -66,9 +63,8 @@ export async function POST(req: Request) {
 
   const chat = db
     .prepare(
-      `SELECT c.id, c.title, c.presetId, p.name AS presetName
+      `SELECT c.id
          FROM chats c
-         LEFT JOIN presets p ON p.id=c.presetId
         WHERE c.id=? AND c.userEmail=?`
     )
     .get(chatId, user.email) as NovelChatRow | undefined;
@@ -88,7 +84,6 @@ export async function POST(req: Request) {
     return Response.json({ error: "소설로 만들 대화가 없습니다." }, { status: 400 });
   }
 
-  const title = requestedTitle || String(chat.title || chat.presetName || "소설").trim() || "소설";
   const encoder = new TextEncoder();
   const jobAbort = new AbortController();
   const abortFromRequest = () => jobAbort.abort("novel-export-client-left");
@@ -165,9 +160,9 @@ export async function POST(req: Request) {
           }
 
           send({ type: "progress", percent: 94, current: chunks.length, total: chunks.length, message: "PDF 편집 중" });
+          const title = chooseGeneratedNovelTitle(chapters);
           const pdf = await buildNovelPdf({
             title,
-            subtitle: `전체 채팅 ${messages.length}개 메시지를 바탕으로 재구성`,
             author: String(user.nickname || user.name || "로컬 사용자"),
             chapters,
           });

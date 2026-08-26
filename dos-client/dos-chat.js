@@ -3480,6 +3480,7 @@ async function exportNovelPdf(rl) {
   hr("소설로 만들기");
   console.log("현재 채팅 전체를 읽어 한국식 웹소설로 재구성하고 PDF로 저장합니다.");
   console.log("긴 채팅은 장마다 AI를 호출하므로 시간이 걸릴 수 있습니다.");
+  console.log("작품 제목은 채팅방 제목을 복사하지 않고 원고 내용에 맞춰 새로 정합니다.");
   console.log(`${ANSI.yellow}진행 중 이 DOS 창을 닫거나 나가면 취소됩니다. 완료될 때까지 그대로 기다려 주세요.${ANSI.reset}`);
   console.log("원본 채팅과 장기기억 DB는 변경되지 않습니다.");
   const answer = String(await rl.question("계속할까요? [y/N] ")).trim().toLowerCase();
