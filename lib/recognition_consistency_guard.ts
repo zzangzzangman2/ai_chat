@@ -37,6 +37,7 @@ export type ScenePresenceContradiction = {
   kind:
     | "duplicate_entry"
     | "duplicate_introduction"
+    | "unauthorized_incapacitation"
     | "unauthorized_exit"
     | "unauthorized_reentry";
 };
@@ -85,6 +86,12 @@ const ENTRY_MODIFIER_CUE_PATTERN =
 
 const EXIT_MODIFIER_CUE_PATTERN =
   /(?:나간|떠난|퇴장한|사라진|자취를\s*감춘|모습을\s*감춘|돌아간|자리를\s*뜬|도망(?:친|간|가버린|쳐버린)|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+
+const INCAPACITATION_CUE_PATTERN =
+  /(?:기절(?:했|해버렸|하고\s*말았|한\s*채)|혼절(?:했|해버렸|하고\s*말았|한\s*채)|실신(?:했|해버렸|하고\s*말았|한\s*채)|의식을\s*잃(?:었|어버렸|고\s*말았|은\s*채)|정신을\s*잃(?:었|어버렸|고\s*말았|은\s*채)|의식불명(?:이\s*됐|이\s*되었|인\s*채)|잠들어버렸|마비(?:됐|되어버렸)|발화\s*불능(?:이\s*됐|인\s*채))/u;
+
+const INCAPACITATION_MODIFIER_CUE_PATTERN =
+  /(?:기절한|혼절한|실신한|의식을\s*잃은|정신을\s*잃은|의식불명인|잠들어버린|마비된|발화\s*불능인)/u;
 
 const GENERIC_SCENE_SUBJECT_PATTERN =
   /(?:곁에\s*(?:있|엎드려|서|앉아)[^.!?。！？\n]{0,35})?(?:작은\s*)?(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명)(?:은|는|이|가)?/u;
@@ -321,6 +328,15 @@ export function deriveCurrentScenePresence(args: {
   return [...states.values()];
 }
 
+function findNamedIncapacitationCue(passage: string, names: string[]) {
+  return findNamedDirectionalCue({
+    passage,
+    names,
+    cue: INCAPACITATION_CUE_PATTERN,
+    modifierCue: INCAPACITATION_MODIFIER_CUE_PATTERN,
+  });
+}
+
 /**
  * Reconstructs user-authoritative exclusions from the recent raw scene.
  * Assistant prose is deliberately unable to clear this state: a character the
@@ -399,6 +415,16 @@ function currentTurnAllowsExit(value: unknown, names: string[]) {
     return true;
   }
   return passageMentionsName(text, names) && Boolean(findNamedExitCue(text, names));
+}
+
+function currentTurnAllowsIncapacitation(value: unknown, names: string[]) {
+  const text = String(value || "");
+  if (!text.trim() || !passageMentionsName(text, names)) return false;
+  if (/(?:기절|혼절|실신|의식|정신|잠|마비|발화)[^.!?。！？\n]{0,18}(?:하지\s*마|말고|아니|않)/u.test(text)) {
+    return false;
+  }
+  return Boolean(findNamedIncapacitationCue(text, names)) ||
+    /(?:기절해|기절시켜|재워|의식을\s*잃게\s*해|정신을\s*잃게\s*해)/u.test(text);
 }
 
 function currentTurnAllowsReentry(value: unknown, names: string[]) {
@@ -484,6 +510,18 @@ export function findScenePresenceContradiction(args: {
             matchedText: exit[0],
             index: Math.max(0, passageIndex) + exit.index,
             kind: "unauthorized_exit",
+          };
+        }
+      }
+
+      if (!currentTurnAllowsIncapacitation(args.currentUserText, names)) {
+        const incapacitation = findNamedIncapacitationCue(passage, names);
+        if (incapacitation) {
+          return {
+            characterName: fact.characterName,
+            matchedText: incapacitation[0],
+            index: Math.max(0, passageIndex) + incapacitation.index,
+            kind: "unauthorized_incapacitation",
           };
         }
       }
@@ -850,6 +888,7 @@ export function removeScenePresenceContradictionPassages(args: {
     if (!contradiction) break;
 
     if (
+      contradiction.kind === "unauthorized_incapacitation" ||
       contradiction.kind === "unauthorized_exit" ||
       contradiction.kind === "unauthorized_reentry"
     ) {
@@ -876,11 +915,12 @@ export function removeScenePresenceContradictionPassages(args: {
           !passageMentionsName(localParagraph, implicatedNames)
       );
 
-      if (isRelationalAnonymousExit) {
-        // Anonymous-subject evasions are usually a self-contained opening
-        // flourish. Remove that contaminated paragraph (including "only X was
-        // left" consequences) while preserving later prose where the actual
-        // roster is still intact.
+      if (
+        contradiction.kind === "unauthorized_incapacitation" ||
+        isRelationalAnonymousExit
+      ) {
+        // Incapacitation and anonymous-subject evasions are usually a local
+        // paragraph. Remove that paragraph while preserving later valid prose.
         text = `${text.slice(0, paragraphStart).trimEnd()}\n\n${text
           .slice(paragraphEnd)
           .trimStart()}`.trim();

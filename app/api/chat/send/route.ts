@@ -1899,39 +1899,6 @@ ${body}`.trim();
     const characterFocusText = userText;
     let recentCharacterFocusText = "";
 
-    // (2026-08-15) 사용자 호명 창 — 자동 퇴장/자동 포커스 두 경로가 공유한다.
-    //
-    // 기존에는 두 곳이 각자 "현재 입력 + 직전 사용자 발화 3개"를 썼다. 그 창은
-    // "지금 상대하는 인물"의 근사치로 쓰기엔 너무 좁다. 사용자가 이름 없이 같은 상대를
-    // 계속 이어가면서 중간에 다른 인물을 한 번씩 호명하면, 정작 진행 중인 상대가
-    // "최근에 안 불린 인물"로 분류된다.
-    //
-    // 실사고(2026-08-15): 사용자가 카리나를 마지막으로 친 건 380턴이고 이후 384/386/388/394턴은
-    // 전부 이름 없는 연속 동작이었다. 그 사이 390턴에 '윈터'(성대모사 지시), 392턴에 '이서연'
-    // (전화 대사 지시)이 곁가지로 불렸다. 3턴 창에서는 호명 집합이 {윈터, 이서연}이 되어
-    //   - dynamic_character_context: 카리나가 포커스 폴백에서 제외
-    //   - stickyOverusedNames: 카리나가 퇴장 지시 대상(최근 30턴 97% 등장 / 누적 60)
-    // 두 경로 모두에서 카리나가 장면 밖으로 밀려났고, 395턴 응답에서는 현장 인물 명단에서
-    // 아예 사라진 채 다른 인물로 행위 대상이 바뀌었다.
-    //
-    // 8턴이면 위 사례의 380턴이 창에 들어온다. 창을 넓히면 오래전 단역이 다시 후보가 될
-    // 여지는 커지지만, 오래 눌러앉은 단역은 stickyOverusedNames의 누적/비율 기준이 따로
-    // 잡아낸다(그 감지기는 TDZ 버그가 고쳐진 뒤로 실제 동작 중이다).
-    //
-    // NOTE: tail은 keepUserTurns(7)만 담으므로 8턴을 보려면 all에서 직접 세야 한다.
-    const USER_MENTION_TURN_WINDOW = (() => {
-      const raw = Number(process.env.AI_USER_MENTION_TURN_WINDOW ?? 8);
-      return Number.isFinite(raw) ? Math.max(1, Math.min(30, Math.floor(raw))) : 8;
-    })();
-    const recentUserMentionText = (() => {
-      const parts: string[] = [String(userText || "")];
-      for (let i = all.length - 1; i >= 0 && parts.length <= USER_MENTION_TURN_WINDOW; i--) {
-        const m: any = all[i];
-        if (String(m?.role || "") !== "user") continue;
-        parts.push(String(m?.content || ""));
-      }
-      return parts.join("\n");
-    })();
     // The active-state ledger must see the full enabled roster, including the
     // persona. The narrower NPC-only list remains for identity canon/world
     // direction so a large cast cannot bloat those unrelated prompt blocks.
@@ -1997,122 +1964,9 @@ ${body}`.trim();
       personaName: personaNameFinal,
       characterSources: continuityIdentities,
     });
-    // (과다 등장 인물 퇴장 2026-08)
-    // 캐릭터 포커스 필터만으로는 막히지 않는 경로가 있다. 사용자가 대명사("너")만 쓰면
-    // 호명된 인물이 없어 필터가 무력화되고, 최근 원문 tail에 남아 있는 곁다리 인물을
-    // 모델이 계속 이어서 등장시킨다(실사고: 논평 역 NPC가 156턴 중 126턴, 사용자 호명은 10턴 중 1회).
-    // 그래서 "최근 연속 등장 + 사용자가 최근에 부르지 않은" 인물을 직접 집어 퇴장을 지시한다.
-    // 고착 판정 지표.
-    // 연속 등장(streak)으로 재던 이전 방식은 한 턴만 빠져도 0으로 리셋돼, 퇴장 → 즉시 복귀 →
-    // 한 턴 걸러 등장하는 진동을 만들었다(실측 패턴: O O O O O O O O O O . O).
-    // 실측 분포(164턴 대화)에서 갈리는 건 "누적 등장 턴수"다:
-    //   고착 최학수 164턴 / 카와무라 134턴  vs  정상 송지연 31턴 / 송병택 30턴
-    // 최근 활성도(윈도우 비율)만으로는 구분되지 않는다(97% 대 90~93%).
-    // 그래서 "최근에도 계속 나오고(비율) + 아주 오래 눌러앉았다(누적)"를 함께 본다.
-    const STICKY_WINDOW = 30;
-    const STICKY_MIN_RATIO = 0.7;
-    const STICKY_MIN_TOTAL = (() => {
-      const raw = Number(process.env.AI_STICKY_NPC_MIN_TOTAL ?? 60);
-      return Number.isFinite(raw) ? Math.max(10, Math.min(1000, Math.floor(raw))) : 60;
-    })();
-    // 고착 인물 이름 목록. 프롬프트 퇴장 지시(아래 블록)에 사용한다.
-    const stickyOverusedNames: string[] = (() => {
-      try {
-        if (String(process.env.AI_RETIRE_OVERUSED_NPC || "1").trim() === "0") return [];
-        const roster = (db
-          .prepare(`SELECT name FROM chat_character_roster WHERE chatId=? AND enabled != 0 LIMIT 60`)
-          .all(cid) as Array<{ name?: unknown }>)
-          .map((row) => String(row?.name || "").trim())
-          .filter((name) => name.length >= 2);
-        if (!roster.length) return [];
-
-        const userTurns = recentUserMentionText;
-
-        // 판정 기준은 "최근 몇 턴 연속"이 아니라 "얼마나 오래 눌러앉았는가"다.
-        // 최근 5턴만 보면 현재 장면의 주역까지 똑같이 걸린다(실측: 곁다리 논평역 85턴 연속과
-        // 사용자가 상대 중인 주역 9턴 연속이 같은 조건에 잡힘).
-        // 전체 응답 기준 연속 등장 길이로 보면 둘이 명확히 갈린다.
-        const assistantTexts = (all as any[])
-          .filter((m: any) => String(m?.role || "") !== "user")
-          .map((m: any) => String(m?.content || ""));
-        if (assistantTexts.length < STICKY_MIN_TOTAL) return [];
-        const windowTexts = assistantTexts.slice(-STICKY_WINDOW);
-
-        // 주의: npcName은 이 지점보다 한참 뒤(프롬프트 조립부)에서 선언된다.
-        // 여기서 참조하면 TDZ ReferenceError가 나고 아래 catch가 삼켜서
-        // 감지기가 항상 빈 배열을 반환한다(실제로 그렇게 죽어 있었다).
-        // preset은 이미 로드돼 있으므로 원본 필드를 직접 쓴다.
-        // (2026-08-15) preset.characterName은 신뢰할 수 없다.
-        // 실측: 이 컬럼에 캐릭터 이름이 아니라 프리셋 제목이 들어있는 방이 있다
-        // (예: "아일릿 신입 매니저 데뷔일지"). 그러면 아래 주역 보호 비교가 로스터의
-        // 어떤 이름과도 일치하지 않아 보호받는 인물이 0명이 된다.
-        // 로스터에 실제로 존재하는 이름일 때만 주역으로 인정한다.
-        const rawPresetCharacterName = String((preset as any)?.characterName || "").trim();
-        const presetCharacterName = roster.includes(rawPresetCharacterName)
-          ? rawPresetCharacterName
-          : "";
-
-        // 프리셋이 주역을 알려주지 못하는 방을 위한 보완 신호:
-        // "최근 사용자가 가장 자주 호명한 인물"을 주역으로 보고 퇴장 대상에서 제외한다.
-        // 전체 대화 누적으로 세면 안 된다 — 장면이 바뀐 뒤에도 옛 주역이 1위로 남는다
-        // (실측: 전체 기준 1위는 이미 퇴장한 인물이었고, 최근 30턴 기준 1위가 현재 주역이었다).
-        const LEAD_USER_MENTION_WINDOW = 30;
-        const leadNames = (() => {
-          const recentUserTexts: string[] = [];
-          for (let i = all.length - 1; i >= 0 && recentUserTexts.length < LEAD_USER_MENTION_WINDOW; i--) {
-            const m: any = all[i];
-            if (String(m?.role || "") !== "user") continue;
-            recentUserTexts.push(String(m?.content || ""));
-          }
-          const counted = roster
-            .map((name) => ({
-              name,
-              count: recentUserTexts.filter((text) => text.includes(name)).length,
-            }))
-            .filter((row) => row.count >= 2)
-            .sort((a, b) => b.count - a.count);
-          if (!counted.length) return new Set<string>();
-          const top = counted[0].count;
-          return new Set(counted.filter((row) => row.count === top).map((row) => row.name));
-        })();
-
-        return roster.filter((name) => {
-          if (userTurns.includes(name)) return false; // 사용자가 최근에 부른 인물은 제외
-          if (name === personaNameFinal || (presetCharacterName && name === presetCharacterName)) return false; // 주역/페르소나 보호
-          if (leadNames.has(name)) return false; // 최근 사용자가 가장 자주 부른 인물(주역) 보호
-          const recentHits = windowTexts.filter((text) => text.includes(name)).length;
-          if (recentHits / windowTexts.length < STICKY_MIN_RATIO) return false; // 이미 물러난 인물은 대상 아님
-          const totalHits = assistantTexts.filter((text) => text.includes(name)).length;
-          return totalHits >= STICKY_MIN_TOTAL; // 누적으로 오래 눌러앉은 인물만
-        });
-      } catch (error) {
-        // 조용한 실패가 이 기능을 몇 차례 무력화했다. 반드시 남긴다.
-        console.error("[chat/send] sticky character detection failed", {
-          chatId: cid,
-          reqId,
-          error: String((error as { message?: unknown })?.message || error),
-        });
-        return [];
-      }
-    })();
-    const stickyTotalOf = (name: string) =>
-      (all as any[])
-        .filter((m: any) => String(m?.role || "") !== "user")
-        .reduce((count: number, m: any) => (String(m?.content || "").includes(name) ? count + 1 : count), 0);
-    // 누적 등장으로 거르면 현재 장면의 주역은 포함되지 않으므로(실측 30~31턴 대 134~164턴)
-    // 완곡하게 권하지 않고 이번 턴 제외를 명확히 지시한다.
-    const overusedCharacterBlock = stickyOverusedNames.length
-      ? [
-          "# [고착 인물 퇴장 — 현재 턴 필수]",
-          `- 다음 인물은 장면에 너무 오래 눌러앉았고, 사용자는 최근 입력에서 이들을 부르지 않았다: ${stickyOverusedNames
-            .map((name) => `${name}(누적 ${stickyTotalOf(name)}턴 등장)`)
-            .slice(0, 4)
-            .join(", ")}`,
-          "- 이번 답변에서는 이들을 등장시키지 않는다. 이름을 부르지도, 대사를 주지도, 시선·표정·내심을 묘사하지도 않는다.",
-          "- 아직 그 자리에 있어야 하는 인물이라면 물러나거나 자리를 비우는 과정을 한 문장으로 처리하고 그대로 장면에서 뺀다.",
-          "- 사용자가 이름을 다시 부르거나 사건상 반드시 필요해질 때만 복귀시킨다. 빠진 자리는 사용자가 지금 상대하는 인물에게 준다.",
-        ].join("\n")
-      : "";
+    // Scene membership is persistent state. Earlier versions tried to retire
+    // frequently mentioned NPCs automatically; that directly conflicted with
+    // recent user-authored locations and caused arbitrary exits or incapacitation.
     let dynamicCharacterContext = {
       block: "",
       focusedRosterIds: [] as string[],
@@ -2155,14 +2009,8 @@ ${body}`.trim();
         personaName: personaNameFinal,
         focusText: characterFocusText,
         recentFocusText: recentCharacterFocusText,
-        // (자동 퇴장 2026-08) 최근 사용자 입력만 모아 전달한다.
-        // 이름 생략 시의 자동 포커스를 "사용자가 실제로 부른 인물"로 제한해,
-        // 한 번 등장한 단역이 자기강화 루프로 매 턴 눌러앉는 것을 막는다.
-        //
-        // (2026-08-15) 창을 3턴에서 USER_MENTION_TURN_WINDOW(기본 8턴)로 넓히고
-        // stickyOverusedNames와 같은 텍스트를 쓰도록 통일했다. 3턴은 "이름 없이 같은 상대를
-        // 이어가는 중에 다른 인물을 한 번 호명하는" 패턴에서 진행 중인 상대를 탈락시켰다.
-        // 자세한 경위는 recentUserMentionText 정의부 주석 참고.
+        // The active user-authored focus anchors pronouns without changing who
+        // is physically present in the scene.
         userMentionText: activeCharacterFocus.anchorText || characterFocusText,
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
         graph: relationshipGraph,
@@ -2579,9 +2427,6 @@ ${body}`.trim();
         evidence: item.evidence,
       })),
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
-      // (2026-08) 고착 인물 퇴장 진단 — 블록 발동 여부를 로그에서 직접 확인할 수 있게 한다.
-      stickyRetiredNames: stickyOverusedNames,
-      stickyRetiredChars: strlen(overusedCharacterBlock),
       // (2026-08) 전체 주입 모드 진단
       fullLongMemory: fullLongMemoryEnabled,
       fullLongMemoryMode,
@@ -3083,10 +2928,6 @@ const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
 const cacheFriendlyLayout = String(process.env.AI_CACHE_FRIENDLY_PROMPT || "1").trim() !== "0";
 const systemRaw = (cacheFriendlyLayout
     ? [
-        dynamicCharacterContext.block
-          ? sanitizePromptCached(dynamicCharacterContext.block)
-          : "",
-        dynamicCharacterContext.block ? `` : "",
         `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
         ``,
         sanitizePromptCached(presetBlock),
@@ -3101,19 +2942,17 @@ const systemRaw = (cacheFriendlyLayout
         ``,
         sanitizePromptCached(memoryBlock),
         ``,
+        dynamicCharacterContext.block
+          ? sanitizePromptCached(dynamicCharacterContext.block)
+          : "",
+        dynamicCharacterContext.block ? `` : "",
         sanitizePromptCached(formatGuide),
         recentExpressionAvoidanceBlock ? `` : "",
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
         worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
-        overusedCharacterBlock ? `` : "",
-        overusedCharacterBlock ? sanitizePromptCached(overusedCharacterBlock) : "",
       ]
     : [
-        dynamicCharacterContext.block
-          ? sanitizePromptCached(dynamicCharacterContext.block)
-          : "",
-        dynamicCharacterContext.block ? `` : "",
         `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
         ``,
         sanitizePromptCached(presetBlock),
@@ -3128,13 +2967,15 @@ const systemRaw = (cacheFriendlyLayout
         ``,
         sanitizePromptCached(loreBlock),
         ``,
+        dynamicCharacterContext.block
+          ? sanitizePromptCached(dynamicCharacterContext.block)
+          : "",
+        dynamicCharacterContext.block ? `` : "",
         sanitizePromptCached(formatGuide),
         recentExpressionAvoidanceBlock ? `` : "",
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
         worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
-        overusedCharacterBlock ? `` : "",
-        overusedCharacterBlock ? sanitizePromptCached(overusedCharacterBlock) : "",
       ]).join("\n");
     const npcName = preset.characterName || (preset as any).name || "상대";
     const systemBase = applyPromptPlaceholders(systemRaw, { charName: npcName, userName: personaNameFinal || "" });
@@ -3199,6 +3040,7 @@ const systemRaw = (cacheFriendlyLayout
       `- 사용자가 둘이/서로/얘들/다 같이처럼 현재 인물을 가리키면 직전 장면에 실제 남아 있는 인물을 그대로 이어 쓴다. 현장 밖 인물을 대신 끼워 넣지 않는다.`,
       `- 쫓겨났거나 출입을 금지당한 인물은 사용자가 그 인물의 복귀를 명시하기 전까지 현장 밖에 둔다. 감정이 격해졌다는 이유로 안으로 돌아오게 하지 않는다.`,
       `- 현재 인물이 충격, 공포, 수치심을 느껴도 사용자의 지시 없이 '견디지 못하고 도망쳤다', '방으로 사라졌다', '자리를 떴다'처럼 장면에서 제거하지 않는다. 현 위치에서 표정·대사·행동으로 반응시킨다.`,
+      `- 현재 인물을 반응에서 빼기 위해 기절, 혼절, 실신, 의식 상실, 수면, 마비, 발화 불능, 쓰러짐을 새로 만들지 않는다. 이런 상태는 최신 사용자 원문이나 검증된 현재 정사에 이미 명시된 경우에만 유지한다.`,
       `- 이름 검사를 피하려고 현재 인물을 '작은 형체', '곁의 소녀', '한 사람', '그녀/그' 같은 익명 표현으로 바꾼 뒤 자취를 감추거나 도망치게 하는 것도 동일한 임의 퇴장이다. 현재 인물의 이름과 위치를 명시적으로 유지한다.`,
       ...(currentScenePresence.length
         ? [
@@ -3521,28 +3363,12 @@ const systemRaw = (cacheFriendlyLayout
       metaRequired === "YES"
         ? Math.max(200, Math.floor(oneShotBodyTargetChars * 0.72))
         : Math.max(200, Math.floor(targetChars * 0.9));
-    const oneShotBeatBasisChars = metaRequired === "YES" ? oneShotBodyFloorChars : oneShotBodyTargetChars;
-    const oneShotBeatCount =
-      oneShotBeatBasisChars >= 2400 ? 7 :
-      oneShotBeatBasisChars >= 1700 ? 5 :
-      oneShotBeatBasisChars >= 1200 ? 4 :
-      3;
-    const oneShotParagraphHint =
-      oneShotBeatBasisChars >= 2400 ? "4~6" :
-      oneShotBeatBasisChars >= 1700 ? "3~5" :
-      oneShotBeatBasisChars >= 1200 ? "3~4" :
-      "2~3";
     const oneShotLengthContract = [
-      `[이번 턴 분량 계약]`,
-      `- 첫 호출에서 직접 충분하고 완결된 본문을 쓴다. 서버의 예외 복구에 기대어 조기 종료하지 않는다.`,
-      `- 서사 본문 목표: 약 ${targetChars}자. 메타/상태창이 필요하면 본문 뒤에 별도 코드블록으로 붙인다.`,
-      `- 본문이 약 ${oneShotBodyFloorChars}자보다 짧은 상태에서는 종료하지 않는다. 글자수를 정확히 셀 수 없으면 최소 ${oneShotBeatCount}개 장면 비트를 채운다.`,
-      `- 장면 비트는 서로 다른 내용이어야 한다: 관찰 가능한 반응, 표정/몸짓, 주변 상황 변화, NPC의 판단 변화, 다음 선택지를 압박하는 대사.`,
-      `- 목표 문단 수: ${oneShotParagraphHint}문단. 한 문단 요약, 짧은 즉답, 조기 종료 금지.`,
-      `- 메타/상태창이 필요하면 본문을 더 늘리는 것보다 완성된 fenced 코드블록이 우선이다. 메타를 시작했다면 항목 일부만 쓰고 닫지 말고, 짧더라도 의미 있는 전체 상태창을 완성한다.`,
-      `- 분량 한계에 가까워지면 새 문장을 시작하지 말고, 열린 대사 따옴표(")와 지문 별표(*)를 먼저 닫은 뒤 메타/상태창으로 넘어간다.`,
-      `- 주인공의 다음 행동/대사는 대신 쓰지 말고, NPC 반응과 현재 장면만 충분히 전개한다.`,
+      `[이번 턴 완료 조건]`,
+      `- 첫 호출에서 약 ${targetChars}자(최소 약 ${oneShotBodyFloorChars}자)의 완결된 서사 본문을 작성한다. 문장·대사·지문을 중간에 끊지 않는다.`,
+      `- 주인공의 다음 행동이나 대사를 대신 쓰지 않고, 현재 NPC 반응과 장면만 전개한다.`,
       `- 현재 입력이 둘 다·각자·모두·너네·너희처럼 복수 NPC에게 답변을 요구하면, 대상 전원의 관찰 가능한 반응과 대답을 본문에서 모두 끝낸 뒤에만 상태창으로 넘어간다. 한 명만 답하고 종료하지 않는다.`,
+      `- 메타/상태창이 필요하면 완결된 본문 뒤에 전체 fenced 코드블록을 한 번만 붙이고 닫는다.`,
     ].join("\n");
 
     const latestInputNoEchoRule = `사용자의 최신 입력은 이미 화면에 표시되고 끝난 사건이다. 절대 다시 직접 인용하거나, "~라는 말/명령/요구"로 간접 인용·요약·재서술하지 마라. 입력을 내뱉는 목소리·태도·행위도 다시 묘사하지 말고, 그 직후의 NPC 반응·행동·장면 변화부터 시작하라.`;

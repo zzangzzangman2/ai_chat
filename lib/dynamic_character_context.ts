@@ -204,9 +204,7 @@ export function buildDynamicCharacterContext(params: {
   personaName: string;
   focusText: string;
   recentFocusText?: string;
-  // (2026-08) 자동 퇴장용: 최근 사용자 입력 모음.
-  // 이름 생략 시의 자동 포커스(폴백)를 "사용자가 최근에 실제로 부른 인물"로 제한해,
-  // 정보 전달용으로 한 번 등장한 단역이 매 턴 눌러앉는 현상을 막는다.
+  // User-authored focus anchor used only for pronoun/name-omission continuity.
   userMentionText?: string;
   priorityNames?: string[];
   graph: RelationshipGraphData;
@@ -320,8 +318,8 @@ export function buildDynamicCharacterContext(params: {
   const focusedIds = findFocusedCharacterIds(scopeRows, params.focusText);
   const currentFocusedIds = new Set(focusedIds);
 
-  // (자동 퇴장 2026-08) 사용자가 최근 입력에서 실제로 부른 인물 집합.
-  // 폴백 경로들이 어시스턴트 자신의 직전 출력을 근거로 인물을 되살리는 것을 막는 기준선이다.
+  // Only user-authored names may support a name-omission fallback. Assistant
+  // narration and unrelated database recency are not scene-membership evidence.
   const userCalledIds = params.userMentionText
     ? findFocusedCharacterIds(scopeRows, params.userMentionText)
     : new Set<string>();
@@ -342,48 +340,11 @@ export function buildDynamicCharacterContext(params: {
     }
   }
 
-  // If the current text omits names, retain only the character(s) most recently
-  // involved in an individual-memory turn. This preserves pronoun continuity
-  // without activating the entire cast.
-  if (!personaMentioned && focusedIds.size === 0) {
-    // (자동 퇴장 2026-08)
-    // 기존에는 "가장 최근 개별기억 턴을 가진 인물"을 무조건 자동 포커스했다.
-    // 그런데 그 인물이 포커스되면 → 등장하고 → 개별기억 turnNo가 갱신되어
-    // 다시 최신이 되는 자기강화 루프가 생긴다.
-    // 실제 사고: 정보 전달용으로 한 번 만들어진 단역(기록원)이 41턴 연속 매 턴 등장.
-    // 따라서 사용자가 최근 입력에서 실제로 부른 적 있는 인물이 존재하면,
-    // 자동 포커스 후보를 그 인물들로 제한한다. (사용자가 아무도 안 불렀으면 기존 동작)
-    const restrictToUserCalled = userCalledIds.size > 0;
-
-    const latestRows = db
-      .prepare(
-        `SELECT rosterId, MAX(turnNo) AS latestTurn
-         FROM chat_character_turn_memories
-         WHERE chatId=?
-         GROUP BY rosterId
-         ORDER BY latestTurn DESC`
-      )
-      .all(chatId) as Array<{ rosterId?: string; latestTurn?: number }>;
-
-    const candidates = restrictToUserCalled
-      ? latestRows.filter((row) => userCalledIds.has(cleanText(row?.rosterId, 120)))
-      : latestRows;
-
-    const latestTurn = Math.max(0, Number(candidates[0]?.latestTurn || 0));
-    for (const row of candidates) {
-      if (Number(row?.latestTurn || 0) !== latestTurn) break;
-      const rosterId = cleanText(row?.rosterId, 120);
-      if (latestTurn > 0 && rosterRows.some((item) => item.id === rosterId)) {
-        focusedIds.add(rosterId);
-      }
-    }
-    // 사용자가 부른 인물이 개별기억을 아직 갖지 못한 경우에도 그 인물을 살린다.
-    if (restrictToUserCalled && focusedIds.size === 0) {
-      for (const id of userCalledIds) {
-        if (rosterRows.some((item) => item.id === id)) focusedIds.add(id);
-      }
-    }
-  }
+  // Do not guess the current actor from whichever character memory happened to
+  // be updated most recently. That old fallback could select an off-scene NPC,
+  // inject a very large unrelated history block, and then reinforce itself on
+  // every later turn. With no user-authored focus, an empty dynamic block is
+  // safer; the scene-membership ledger remains the authority.
   if (!personaMentioned && focusedIds.size === 0 && rosterRows.length === 1) {
     focusedIds.add(rosterRows[0].id);
   }
