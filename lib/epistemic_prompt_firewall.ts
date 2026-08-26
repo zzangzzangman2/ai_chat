@@ -14,6 +14,7 @@ export type ProtectedRelationshipFact = {
   relation: string;
   details: string;
   knownByNames: string[];
+  knowledgeEvidence: string;
 };
 
 export type EpistemicPromptFirewall = {
@@ -55,6 +56,10 @@ function nameKey(value: unknown) {
   return cleanText(value, 100).toLocaleLowerCase("ko-KR");
 }
 
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function contentTokens(value: unknown) {
   const stop = new Set([
     "관계",
@@ -94,6 +99,7 @@ function toProtectedFact(
     relation: relationText,
     details,
     knownByNames,
+    knowledgeEvidence: cleanText(relation.knowledgeEvidence, 1200),
   };
 }
 
@@ -280,10 +286,11 @@ export function sanitizeSharedEpistemicText(
   value: unknown,
   firewall: EpistemicPromptFirewall
 ): EpistemicSanitizeResult {
-  return sanitizeEpistemicText(
-    value,
-    firewall.facts.filter((fact) => fact.knownByNames.length === 0)
-  );
+  // Shared summaries have no single reader. A limited fact that is safe for
+  // one witness is still unsafe for every other NPC, so keep every confidential
+  // relationship out of this common prompt view. Authorized characters receive
+  // their own scoped memories separately.
+  return sanitizeEpistemicText(value, firewall.facts);
 }
 
 export function sanitizeCharacterEpistemicText(
@@ -313,6 +320,131 @@ export function sanitizeRecentAssistantEpistemicText(
   return sanitizeGeneratedEpistemicText(value, firewall);
 }
 
+const KNOWLEDGE_SPEECH_PATTERN =
+  /(?:말했|말하|대답|설명|알렸|밝혔|보고|전했|경고|외쳤|속삭|물었|입을\s*열|목소리)/u;
+
+const GENERIC_SPEAKER_ROLE_PATTERN =
+  /(?:경찰관?|형사|수사관|검사|교사|선생|기자|의사|간호사|공무원)/u;
+
+const PUBLIC_DISCLOSURE_PATTERN =
+  /(?:법정|재판|공판|검사|기소|선고|판결|수사|경찰|신고|진술|자백|보도|뉴스|수배|체포|구속|공개|발표|구출|증거)/u;
+
+const SECRET_SEMANTIC_PATTERNS = [
+  /(?:유린|성폭|강간|성착취|추행|능욕)/u,
+  /(?:인질|볼모)/u,
+  /(?:납치|유괴|감금)/u,
+  /(?:협박|강요|위협)/u,
+  /(?:살인|살해|사망|죽였)/u,
+  /(?:가족|일가족|부모|아들|딸)/u,
+  /(?:미성년|여중생|여고생|소녀|소년|학생)/u,
+] as const;
+
+type KnowledgeSpeakerHint = {
+  name: string;
+  role: string;
+};
+
+function inferKnowledgeSpeaker(
+  value: string,
+  facts: ProtectedRelationshipFact[]
+): KnowledgeSpeakerHint | null {
+  const text = String(value || "");
+  if (!text.trim()) return null;
+  const names = [
+    ...new Set(
+      facts.flatMap((fact) => [
+        fact.subjectName,
+        fact.objectName,
+        ...fact.knownByNames,
+      ])
+    ),
+  ]
+    .filter((name) => name.length >= 2)
+    .sort((a, b) => b.length - a.length);
+  if (KNOWLEDGE_SPEECH_PATTERN.test(text)) {
+    for (const name of names) {
+      const pattern = new RegExp(
+        `${escapeRegex(name)}(?:은|는|이|가|도)?[^.!?。！？\\n]{0,80}(?:${KNOWLEDGE_SPEECH_PATTERN.source})`,
+        "iu"
+      );
+      if (pattern.test(text)) return { name, role: "" };
+    }
+  }
+  const role = GENERIC_SPEAKER_ROLE_PATTERN.exec(text)?.[0] || "";
+  return role ? { name: "", role } : null;
+}
+
+function semanticSignature(value: unknown) {
+  const text = String(value || "");
+  return SECRET_SEMANTIC_PATTERNS.map((pattern, index) =>
+    pattern.test(text) ? index : -1
+  ).filter((index) => index >= 0);
+}
+
+function looselyAssertsProtectedFact(
+  segment: string,
+  fact: ProtectedRelationshipFact,
+  allFacts: ProtectedRelationshipFact[]
+) {
+  const segmentSignature = new Set(semanticSignature(segment));
+  const factSignature = semanticSignature(`${fact.relation} ${fact.details}`);
+  let overlap = 0;
+  for (const key of factSignature) {
+    if (segmentSignature.has(key)) overlap += 1;
+  }
+  if (overlap < 3) return false;
+
+  const relatedNames = new Set(
+    [fact.subjectName, fact.objectName, ...fact.knownByNames].map(nameKey)
+  );
+  const allNames = [
+    ...new Set(
+      allFacts.flatMap((item) => [
+        item.subjectName,
+        item.objectName,
+        ...item.knownByNames,
+      ])
+    ),
+  ].filter((name) => name.length >= 2);
+  const mentionedOtherName = allNames.some(
+    (name) =>
+      segment.includes(name) && !relatedNames.has(nameKey(name))
+  );
+  return !mentionedOtherName;
+}
+
+function factIsPubliclyDisclosed(fact: ProtectedRelationshipFact) {
+  const text = `${fact.relation} ${fact.details} ${fact.knowledgeEvidence}`;
+  if (
+    /(?:신고|수사기관에\s*전달|경찰에\s*전달|공개|발각)[^.!?。！？\n]{0,20}(?:되지\s*않|되지\s*못|안\s*됐|없)|아직[^.!?。！？\n]{0,30}(?:신고|수사|공개|발각)[^.!?。！？\n]{0,15}(?:전|되지\s*않|못)/u.test(
+      text
+    )
+  ) {
+    return false;
+  }
+  return PUBLIC_DISCLOSURE_PATTERN.test(text);
+}
+
+function speakerMayKnowFact(
+  speaker: KnowledgeSpeakerHint | null,
+  fact: ProtectedRelationshipFact
+) {
+  if (factIsPubliclyDisclosed(fact)) return true;
+  if (!speaker) return false;
+  const allowed = fact.knownByNames.map(nameKey);
+  if (speaker.name && allowed.includes(nameKey(speaker.name))) return true;
+  if (
+    speaker.role &&
+    allowed.some((name) =>
+      /(?:경찰|형사|수사관|검사|교사|선생|기자|의사|간호사|공무원)/u.test(name) &&
+      (name.includes(speaker.role) || speaker.role.includes(name))
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Final-response backstop. Unlike shared-memory sanitization, this removes only
  * the individual generated sentences that assert a world-only confidential
@@ -324,13 +456,14 @@ export function sanitizeGeneratedEpistemicText(
   options: GeneratedEpistemicOptions = {}
 ): EpistemicSanitizeResult {
   const source = String(value || "");
-  const facts = firewall.facts.filter((fact) => fact.knownByNames.length === 0);
+  const facts = firewall.facts;
   if (!source.trim() || facts.length === 0) {
     return { text: source, redactedSegments: 0 };
   }
 
   let redactedSegments = 0;
   let inFence = false;
+  let speakerHint: KnowledgeSpeakerHint | null = null;
   const lines = source.split(/\r?\n/u).map((line) => {
     if (/^\s*```/u.test(line)) {
       inFence = !inFence;
@@ -338,12 +471,23 @@ export function sanitizeGeneratedEpistemicText(
     }
     if (inFence || !line.trim()) return line;
 
+    const lineSpeaker = inferKnowledgeSpeaker(line, facts);
+    if (lineSpeaker) speakerHint = lineSpeaker;
+    const directDialogue = /^[\s*]*["“]/u.test(line);
+    const attributedSpeaker = directDialogue ? speakerHint : lineSpeaker;
+
     const kept = splitLineSentences(line).filter((sentence) => {
-      const attributesKnowledge = segmentAttributesKnowledge(sentence);
+      const attributesKnowledge = directDialogue || segmentAttributesKnowledge(sentence);
       const unsupported = facts.some((fact) => {
-        if (!segmentAssertsProtectedFact(sentence, fact)) return false;
+        if (
+          !segmentAssertsProtectedFact(sentence, fact) &&
+          !looselyAssertsProtectedFact(sentence, fact, facts)
+        ) {
+          return false;
+        }
         const grounded = options.groundedFactIds?.has(fact.relationId) === true;
-        return !grounded || attributesKnowledge;
+        if (fact.knownByNames.length === 0) return !grounded || attributesKnowledge;
+        return attributesKnowledge && !speakerMayKnowFact(attributedSpeaker, fact);
       });
       if (unsupported) redactedSegments += 1;
       return !unsupported;
