@@ -20,9 +20,25 @@ function loadTextPolicy() {
 
 const {
   formatStoryTurnsForMode,
+  selectMessagesBeforeContinuationTurn,
   selectMessagesBeforeCurrentUser,
   selectPromptHistoryWithSummaryCoverage,
 } = loadTextPolicy();
+
+test("continuation context excludes the already answered user/assistant pair", () => {
+  const messages = [
+    { id: "u1", role: "user", content: "이전 행동" },
+    { id: "a1", role: "assistant", content: "이전 반응" },
+    { id: "u2", role: "user", content: "이미 답한 질문" },
+    { id: "a2", role: "assistant", content: "이어 쓸 답변" },
+    { id: "u3", role: "user", content: "선택한 답변보다 나중 입력" },
+  ];
+
+  assert.deepEqual(
+    selectMessagesBeforeContinuationTurn(messages, "a2").map((message) => message.id),
+    ["u1", "a1"]
+  );
+});
 
 test("current user turn is excluded from historical prompt context", () => {
   const messages = [

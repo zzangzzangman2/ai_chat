@@ -62,6 +62,29 @@ export function selectMessagesBeforeCurrentUser(messages: any[], currentUserMess
   return currentIndex >= 0 ? list.slice(0, currentIndex) : list.slice();
 }
 
+export function selectMessagesBeforeContinuationTurn(
+  messages: any[],
+  assistantMessageId: string
+) {
+  const list = Array.isArray(messages) ? messages : [];
+  const targetId = String(assistantMessageId || "").trim();
+  if (!targetId) return list.slice();
+  const assistantIndex = list.findIndex(
+    (message) => String(message?.id || "") === targetId
+  );
+  if (assistantIndex < 0) return list.slice();
+
+  // The target answer itself is supplied separately as the continuation tail.
+  // Also omit its paired user turn so the model cannot mistake that already
+  // answered instruction for the active request and answer it a second time.
+  for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+    if (String(list[index]?.role || "").toLowerCase() === "user") {
+      return list.slice(0, index);
+    }
+  }
+  return list.slice(0, assistantIndex);
+}
+
 // lastN 메시지는 그대로 전달하고, 그 이전은 요약으로 대체하는 용도
 export function formatStoryTurns(messages: any[], personaName: string, npcName: string) {
   return messages

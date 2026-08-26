@@ -917,10 +917,13 @@ export function removeScenePresenceContradictionPassages(args: {
 
       if (
         contradiction.kind === "unauthorized_incapacitation" ||
+        contradiction.kind === "unauthorized_exit" ||
         isRelationalAnonymousExit
       ) {
-        // Incapacitation and anonymous-subject evasions are usually a local
-        // paragraph. Remove that paragraph while preserving later valid prose.
+        // An invented exit/incapacitation is a local continuity error, not a
+        // reason to discard every later paragraph the provider already wrote.
+        // Remove the offending paragraph, then loop so any dependent exit
+        // claims later in the draft are independently removed as well.
         text = `${text.slice(0, paragraphStart).trimEnd()}\n\n${text
           .slice(paragraphEnd)
           .trimStart()}`.trim();

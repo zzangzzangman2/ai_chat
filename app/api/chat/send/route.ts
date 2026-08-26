@@ -91,6 +91,7 @@ import {
   formatTurns,
   selectRecentByUserTurns,
   selectPromptHistoryWithSummaryCoverage,
+  selectMessagesBeforeContinuationTurn,
   selectMessagesBeforeCurrentUser,
   formatStoryTurnsForMode,
   buildUserLineForMode,
@@ -1067,15 +1068,17 @@ export async function POST(req: Request) {
 	    let effectiveUserText = finalUserText;
 
 	    // 재생성 모드면: userMessageId 기준으로 DB에서 읽어와 정확한 원문을 사용
-	    if (regen && userMid) {
+	    if (continueAid) {
+      // Client continuation helpers used to send the previous answer tail in
+      // userText. Treating that transport hint as the active story input made
+      // memory/focus/scene guards replay the already answered user turn.
+      // The authoritative continuation source is continueBaseText below.
+      effectiveUserText = "이어쓰기";
+	    } else if (regen && userMid) {
 	      const row = db.prepare(`SELECT content FROM messages WHERE id=? AND chatId=? AND userEmail=?`).get(userMid, cid, u.email) as any;
 	      const raw = row?.content ? decryptIfPossible(row.content) : "";
 	      effectiveUserText = String(raw || finalUserText || "").trim();
 	    }
-    if (continueAid && !effectiveUserText) {
-      // continue mode uses a dedicated prompt; this is a non-empty guard only.
-      effectiveUserText = "이어쓰기";
-    }
 
 	    const userText = effectiveUserText;
     const currentOocInstruction = isOocMetaInstruction(userText) ? userText : "";
@@ -3249,7 +3252,7 @@ const systemRaw = (cacheFriendlyLayout
     let legalStatusTailRedactions = 0;
     let vitalStatusTailRedactions = 0;
     const promptHistorySource = continueMode
-      ? all
+      ? selectMessagesBeforeContinuationTurn(all, continueAid)
       : selectMessagesBeforeCurrentUser(all, userMsg.id);
     const promptHistoryTail = selectPromptHistoryWithSummaryCoverage(
       promptHistorySource,
@@ -3360,7 +3363,11 @@ const systemRaw = (cacheFriendlyLayout
     }
 
     const continueTail = continueMode
-      ? stripUrlsAndMediaMarkdown(stripStatusErrorFences(String(continueBaseText || ""))).slice(-1400)
+      ? stripUrlsAndMediaMarkdown(
+          splitTrailingFenceBlockAtEnd(
+            stripStatusErrorFences(String(continueBaseText || ""))
+          ).body
+        ).slice(-1400)
       : "";
 
     const oneShotBodyTargetChars = Math.max(200, Math.min(bodyMaxChars, targetChars));
@@ -3383,8 +3390,10 @@ const systemRaw = (cacheFriendlyLayout
           context ? `[최근 대화]\n${context}` : "",
           ``,
           `다음은 직전 어시스턴트 출력의 마지막 부분이다. 반드시 이 내용의 '다음 문장'부터 이어서 작성하라.`,
+          `- 이것은 직전 사용자 행동에 다시 답하는 새 턴이 아니다. 직전 질문·명령·행동을 재현하거나 다시 반응하지 않는다.`,
           `- 이미 쓴 문장 반복/요약/재시작 금지.`,
           `- 장면/시점/말투를 유지하고, 전개만 자연스럽게 이어간다.`,
+          `- 이번 추가 본문도 약 ${targetChars}자(최소 약 ${Math.max(200, Math.floor(targetChars * 0.9))}자)로 충분히 전개하고 문장을 완결한다.`,
           `- 메타/STATUS/INFO/코드블록/설명문 금지.`,
           `[직전 출력 끝부분]\n${continueTail}`,
           ``,
@@ -5597,6 +5606,20 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       vitalStatusOutputChecked.removed ||
       scenePresenceOutputChecked.removed
     ) {
+      if (epistemicOutputChecked.redactedSegments) {
+        debugReasons.push(`guard:EPISTEMIC(${epistemicOutputChecked.redactedSegments})`);
+      }
+      if (legalStatusOutputChecked.removed) {
+        debugReasons.push(`guard:LEGAL_STATUS(${legalStatusOutputChecked.removed})`);
+      }
+      if (vitalStatusOutputChecked.removed) {
+        debugReasons.push(`guard:VITAL_STATUS(${vitalStatusOutputChecked.removed})`);
+      }
+      if (scenePresenceOutputChecked.removed) {
+        debugReasons.push(
+          `guard:SCENE_PRESENCE(${scenePresenceOutputChecked.kinds.join("+") || "unknown"}:${scenePresenceOutputChecked.removed})`
+        );
+      }
       dbg({
         tag: "send.output-fact-guard",
         chatId: cid,
@@ -5640,6 +5663,11 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       assistantText = markerBalance.text;
       debugReasons.push(`format:CLOSE_BODY_MARKERS:${markerBalance.added}`);
     }
+    usageForStore.outputChars = strlen(assistantText);
+    usageForStore.targetChars = targetChars;
+    usageForStore.promptMaxChars = promptMaxChars;
+    usageForStore.promptBreakdownMethod = breakdown.method;
+    latestUsage = { ...(latestUsage || {}), ...usageForStore };
 
 	    let assistantMsg: any = {
       id: randomUUID(),
