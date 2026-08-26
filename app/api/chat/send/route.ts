@@ -39,6 +39,10 @@ import {
   removeUnsupportedLegalStatusClaims,
   type LegalStatusIdentity,
 } from "@/lib/legal_status_consistency_guard";
+import {
+  isAuthorityClaimContext,
+  removeUnsupportedAuthorityClaims,
+} from "@/lib/authority_claim_consistency_guard";
 import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import { createGuardedTextStream } from "@/lib/guarded_text_stream";
 import {
@@ -2232,7 +2236,27 @@ ${body}`.trim();
         const role = String(message?.role || "");
         return role === "assistant" || role === "model";
       })
-      .map((message) => String(message?.content || ""));
+      .map((message) => String(message?.content || ""))
+      // Dialogue/briefing prose is not allowed to authenticate its own legal
+      // claim on later turns. Keep ordinary completed narration (for example a
+      // narrated arrest), but exclude authority speech and quoted assertions.
+      .filter((text) => !isAuthorityClaimContext(text))
+      .map((text) =>
+        text
+          .replace(/"[^"\n]*"/gu, " ")
+          .replace(/“[^”\n]*”/gu, " ")
+          .replace(/‘[^’\n]*’/gu, " ")
+      );
+    const authorityClaimContext = isAuthorityClaimContext(
+      [...trustedLegalStatusUserTexts.slice(-4), userText].join("\n")
+    );
+    const sanitizeAuthorityClaims = (text: unknown) =>
+      removeUnsupportedAuthorityClaims({
+        text,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        identities: legalStatusIdentities,
+        authorityContext: authorityClaimContext,
+      });
     const vitalStatusIdentities = legalStatusIdentities.map((identity) => ({
       name: identity.name,
       aliases: identity.aliases || [],
@@ -2249,7 +2273,7 @@ ${body}`.trim();
       });
     const groundedEpistemicFactIds = buildGroundedEpistemicFactIds(
       epistemicFirewall,
-      [...trustedLegalStatusUserTexts, ...trustedLegalStatusNarrationTexts]
+      trustedLegalStatusUserTexts
     );
     const sanitizeGeneratedFacts = (text: unknown) =>
       sanitizeGeneratedEpistemicText(text, epistemicFirewall, {
@@ -2258,14 +2282,24 @@ ${body}`.trim();
     const recoverAfterOverfilter = (text: unknown) => {
       const original = String(text || "");
       const epistemic = sanitizeGeneratedFacts(text);
+      const authorityClaims = sanitizeAuthorityClaims(epistemic.text);
       const legalStatus = removeUnsupportedLegalStatusClaims({
-        text: epistemic.text,
+        text: authorityClaims.text,
         trustedUserTexts: trustedLegalStatusUserTexts,
         trustedNarrationTexts: trustedLegalStatusNarrationTexts,
         identities: legalStatusIdentities,
       });
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
-      if (vitalStatus.removed > 0) return vitalStatus.text;
+      if (
+        epistemic.redactedSegments > 0 ||
+        authorityClaims.removed > 0 ||
+        legalStatus.removed > 0 ||
+        vitalStatus.removed > 0
+      ) {
+        return String(vitalStatus.text || "").trim()
+          ? vitalStatus.text
+          : "*확인된 사실만 다시 추려, 근거 없는 내용은 단정하지 않았다.*";
+      }
       // The guards may remove unsupported local passages, but a false-positive
       // match must never erase an otherwise completed provider response. Keep
       // the single-call draft only when the combined filters would return no
@@ -2377,8 +2411,11 @@ ${body}`.trim();
       historySummaryForPromptRaw,
       epistemicFirewall
     );
+    const historyAuthorityClaimView = sanitizeAuthorityClaims(
+      historyEpistemicView.text
+    );
     const historyLegalStatusView = removeUnsupportedLegalStatusClaims({
-      text: historyEpistemicView.text,
+      text: historyAuthorityClaimView.text,
       trustedUserTexts: trustedLegalStatusUserTexts,
       trustedNarrationTexts: trustedLegalStatusNarrationTexts,
       identities: legalStatusIdentities,
@@ -2417,6 +2454,8 @@ ${body}`.trim();
       continuityIdentityCount: continuityLedgerIdentities.length,
       canonIdentityCount: continuityIdentities.length,
       dynamicCharacterContextChars: strlen(dynamicCharacterContext.block),
+      authorityClaimContext,
+      authorityClaimMemoryRedactions: historyAuthorityClaimView.removed,
       dynamicCharacterFocus: dynamicCharacterContext.focusedNames,
       dynamicRelationshipCount: dynamicCharacterContext.relationshipCount,
       dynamicEventCount: dynamicCharacterContext.eventCount,
@@ -3087,6 +3126,13 @@ const systemRaw = (cacheFriendlyLayout
       `- 경찰·수사관이 경계하거나 출입을 막는 장면에서도 근거 없는 법적 신분을 새로 만들지 않는다. 필요하면 '사건 관계자', '방문자', '신원 확인 대상'처럼 관찰 가능한 중립 표현을 쓴다.`,
       `- 이번 응답에서 법적 지위를 한 단계라도 올리기 전, 누가 언제 어떤 절차를 집행했는지 근거 문장을 확인한다. 근거가 없으면 승격하지 않는다.`,
     ].join("\n");
+    const authorityClaimPriorityBlock = [
+      `# [OFFICIAL CLAIM GROUNDING HARD GUARD — APPLIES TO EVERY CHAT]`,
+      `- 경찰·형사·수사관·검사·의사·기자·공무원의 설명, 기록, 브리핑은 기존 AI 서술을 조합해 새로운 과거사를 만드는 장면이 아니다. 사용자가 직접 확정한 사실과 실제 신고·목격·증거 확보·절차 기록만 말한다.`,
+      `- 사용자가 '전부 말해', '모든 죄명', '자세히 설명해'라고 요구한 것은 설명 범위 지시일 뿐, 새 범죄·피해자·전과가 존재한다는 근거가 아니다. 확인된 항목이 적으면 그 항목만 말하고 빈칸을 창작으로 채우지 않는다.`,
+      `- 사용자 원문에 없는 피해자 수, 기간, 반복·상습 패턴, 범행 수법, 의학적 후유증, 법적 죄명, 수배·기소·유죄 상태를 추론하거나 단정하지 않는다. 서로 다른 피해자·사건의 기억을 한 사람의 반복 범행 이력으로 합치지 않는다.`,
+      `- 이전 AI 응답에만 있고 사용자가 확인하지 않은 고위험 사실은 정사가 아니라 미검증 초안이다. 공식 인물의 대사, 수사 기록, 요약, 회상에서 반복하지 않는다.`,
+    ].join("\n");
     const vitalStatusPriorityBlock = [
       `# [LIFE/DEATH CANON HARD GUARD — APPLIES TO EVERY CHAT]`,
       `- 죽음·사망·자살·살해는 인물의 등장 가능성을 영구 변경하는 최상위 정사다. 최신 사용자 지문이나 이미 검증된 연속성 장부에 실제 완료 사건으로 확정된 경우에만 발생한 사실로 쓴다.`,
@@ -3135,6 +3181,7 @@ const systemRaw = (cacheFriendlyLayout
       recognitionPriorityBlock,
       scenePresencePriorityBlock,
       epistemicPriorityBlock,
+      authorityClaimPriorityBlock,
       legalStatusPriorityBlock,
       vitalStatusPriorityBlock,
       activeInterlocutorPriorityBlock,
@@ -3249,6 +3296,7 @@ const systemRaw = (cacheFriendlyLayout
     };
 
     let epistemicTailRedactions = 0;
+    let authorityClaimTailRedactions = 0;
     let legalStatusTailRedactions = 0;
     let vitalStatusTailRedactions = 0;
     const promptHistorySource = continueMode
@@ -3278,8 +3326,10 @@ const systemRaw = (cacheFriendlyLayout
         epistemicFirewall
       );
       epistemicTailRedactions += sanitized.redactedSegments;
+      const authorityClaims = sanitizeAuthorityClaims(sanitized.text);
+      authorityClaimTailRedactions += authorityClaims.removed;
       const legalStatus = removeUnsupportedLegalStatusClaims({
-        text: sanitized.text,
+        text: authorityClaims.text,
         trustedUserTexts: trustedLegalStatusUserTexts,
         trustedNarrationTexts: trustedLegalStatusNarrationTexts,
         identities: legalStatusIdentities,
@@ -3299,6 +3349,8 @@ const systemRaw = (cacheFriendlyLayout
     if (
       historyEpistemicView.redactedSegments ||
       epistemicTailRedactions ||
+      historyAuthorityClaimView.removed ||
+      authorityClaimTailRedactions ||
       historyLegalStatusView.removed ||
       legalStatusTailRedactions ||
       historyVitalStatusView.removed ||
@@ -3312,6 +3364,8 @@ const systemRaw = (cacheFriendlyLayout
         worldOnlyFacts: epistemicFirewall.worldOnlyRelationIds.size,
         summaryRedactions: historyEpistemicView.redactedSegments,
         recentAssistantRedactions: epistemicTailRedactions,
+        authorityClaimSummaryRedactions: historyAuthorityClaimView.removed,
+        authorityClaimTailRedactions,
         legalStatusSummaryRedactions: historyLegalStatusView.removed,
         vitalStatusSummaryRedactions: historyVitalStatusView.removed,
         vitalStatusTailRedactions,
@@ -3771,13 +3825,15 @@ let cancelStreamWork: (() => void) | null = null;
           }
         };
         let streamEpistemicRedactions = 0;
+        let streamAuthorityClaimRedactions = 0;
         let streamLegalStatusRedactions = 0;
         let streamVitalStatusRedactions = 0;
         let streamScenePresenceRedactions = 0;
         const guardedTextStream = createGuardedTextStream((text) => {
           const epistemic = sanitizeGeneratedFacts(text);
+          const authorityClaims = sanitizeAuthorityClaims(epistemic.text);
           const legalStatus = removeUnsupportedLegalStatusClaims({
-            text: epistemic.text,
+            text: authorityClaims.text,
             trustedUserTexts: trustedLegalStatusUserTexts,
             trustedNarrationTexts: trustedLegalStatusNarrationTexts,
             identities: legalStatusIdentities,
@@ -3790,6 +3846,7 @@ let cancelStreamWork: (() => void) | null = null;
             excludedCharacters: currentSceneExclusions,
           });
           streamEpistemicRedactions += epistemic.redactedSegments;
+          streamAuthorityClaimRedactions += authorityClaims.removed;
           streamLegalStatusRedactions += legalStatus.removed;
           streamVitalStatusRedactions += vitalStatus.removed;
           streamScenePresenceRedactions += scenePresence.removed;
@@ -4285,8 +4342,9 @@ if (!TRANSPORT_STREAMING) {
           assistantText = guardedTextStream.output();
           if (shortContinue.replaced || postGenerationTextChanged) {
             const epistemic = sanitizeGeneratedFacts(factGuardRecoverySource);
+            const authorityClaims = sanitizeAuthorityClaims(epistemic.text);
             const legalStatus = removeUnsupportedLegalStatusClaims({
-              text: epistemic.text,
+              text: authorityClaims.text,
               trustedUserTexts: trustedLegalStatusUserTexts,
               trustedNarrationTexts: trustedLegalStatusNarrationTexts,
               identities: legalStatusIdentities,
@@ -4299,6 +4357,7 @@ if (!TRANSPORT_STREAMING) {
               excludedCharacters: currentSceneExclusions,
             });
             streamEpistemicRedactions += epistemic.redactedSegments;
+            streamAuthorityClaimRedactions += authorityClaims.removed;
             streamLegalStatusRedactions += legalStatus.removed;
             streamVitalStatusRedactions += vitalStatus.removed;
             streamScenePresenceRedactions += scenePresence.removed;
@@ -4316,6 +4375,7 @@ if (!TRANSPORT_STREAMING) {
           }
           if (
             streamEpistemicRedactions ||
+            streamAuthorityClaimRedactions ||
             streamLegalStatusRedactions ||
             streamVitalStatusRedactions ||
             streamScenePresenceRedactions
@@ -4325,6 +4385,7 @@ if (!TRANSPORT_STREAMING) {
               chatId: cid,
               reqId,
               epistemicRedactions: streamEpistemicRedactions,
+              authorityClaimRedactions: streamAuthorityClaimRedactions,
               legalStatusRedactions: streamLegalStatusRedactions,
               vitalStatusRedactions: streamVitalStatusRedactions,
               scenePresenceRedactions: streamScenePresenceRedactions,
@@ -5585,7 +5646,10 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
 
     const factGuardRecoverySource = assistantText;
     const epistemicOutputChecked = sanitizeGeneratedFacts(assistantText);
-    assistantText = epistemicOutputChecked.text;
+    const authorityClaimOutputChecked = sanitizeAuthorityClaims(
+      epistemicOutputChecked.text
+    );
+    assistantText = authorityClaimOutputChecked.text;
     const legalStatusOutputChecked = removeUnsupportedLegalStatusClaims({
       text: assistantText,
       trustedUserTexts: trustedLegalStatusUserTexts,
@@ -5602,12 +5666,18 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     assistantText = scenePresenceOutputChecked.text;
     if (
       epistemicOutputChecked.redactedSegments ||
+      authorityClaimOutputChecked.removed ||
       legalStatusOutputChecked.removed ||
       vitalStatusOutputChecked.removed ||
       scenePresenceOutputChecked.removed
     ) {
       if (epistemicOutputChecked.redactedSegments) {
         debugReasons.push(`guard:EPISTEMIC(${epistemicOutputChecked.redactedSegments})`);
+      }
+      if (authorityClaimOutputChecked.removed) {
+        debugReasons.push(
+          `guard:AUTHORITY_CLAIM(${authorityClaimOutputChecked.removed})`
+        );
       }
       if (legalStatusOutputChecked.removed) {
         debugReasons.push(`guard:LEGAL_STATUS(${legalStatusOutputChecked.removed})`);
@@ -5625,6 +5695,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         chatId: cid,
         reqId,
         epistemicRedactions: epistemicOutputChecked.redactedSegments,
+        authorityClaimRedactions: authorityClaimOutputChecked.removed,
+        authorityClaimTypes: authorityClaimOutputChecked.claimTypes,
         legalStatusRedactions: legalStatusOutputChecked.removed,
         legalStatuses: legalStatusOutputChecked.statuses,
         legalCharacters: legalStatusOutputChecked.characterNames,

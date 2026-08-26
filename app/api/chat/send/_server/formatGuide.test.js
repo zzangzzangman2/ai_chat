@@ -43,6 +43,16 @@ test("route no longer injects automatic character-retirement instructions", () =
   assert.doesNotMatch(route, /stickyOverusedNames|overusedCharacterBlock/u);
 });
 
+test("global route prompt forbids official characters from inventing history", () => {
+  const routePath = path.join(__dirname, "..", "route.ts");
+  const route = fs.readFileSync(routePath, "utf8");
+
+  assert.match(route, /OFFICIAL CLAIM GROUNDING HARD GUARD/u);
+  assert.match(route, /설명 범위 지시일 뿐/u);
+  assert.match(route, /서로 다른 피해자·사건의 기억을 한 사람의 반복 범행 이력으로 합치지 않는다/u);
+  assert.match(route, /authorityClaimPriorityBlock/u);
+});
+
 test("global prompt starts with stable instructions instead of dynamic memory", () => {
   const routePath = path.join(__dirname, "..", "route.ts");
   const route = fs.readFileSync(routePath, "utf8");
