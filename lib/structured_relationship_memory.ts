@@ -3,10 +3,7 @@ import { randomUUID } from "crypto";
 import { generateText } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { db } from "@/lib/db";
-import {
-  inferCharacterOccupation,
-  isValidDescriptiveRelationship,
-} from "@/lib/relationship_context";
+import { inferCharacterOccupation } from "@/lib/relationship_context";
 import { parseRelationshipKnownBy } from "@/lib/character_knowledge";
 import {
   CANONICAL_FACT_KEYS,
@@ -79,6 +76,12 @@ export const STRUCTURED_RELATION_TYPES = [
 const ROLE_LIKE_NAME_PATTERN =
   /^[가-힣A-Za-z]{1,8}(?:대표|사장|교수|박사|원장|팀장|실장|과장|부장|대리|비서|선생)$/u;
 const RELATION_TYPE_SET = new Set<string>(STRUCTURED_RELATION_TYPES);
+const IMMUTABLE_FAMILY_RELATION_SET = new Set<string>([
+  "아버지", "어머니", "부모", "딸", "아들", "자녀",
+  "할아버지", "할머니", "조부모", "손녀", "손자", "손자녀",
+  "언니", "누나", "오빠", "형", "동생", "여동생", "남동생",
+  "자매", "형제", "형제자매", "배우자",
+]);
 const PERSON_NAME_PATTERN = /^(?:[가-힣]{2,8}|[A-Za-z][A-Za-z0-9._-]{1,39})$/u;
 const NON_CHARACTER_NAMES = new Set([
   "사용자",
@@ -577,7 +580,8 @@ export async function extractStructuredCharacterGraph(params: {
     "- 예: '아이돌과 경비원'이 사귀기 시작하면 '연인', 결혼하면 '배우자', 이혼하면 '이혼한 전 배우자'로 갱신한다.",
     "- 각 character의 job에는 대화와 배경에서 확인되는 직업만 간결하게 기록한다. 확인되지 않으면 빈 문자열을 쓴다.",
     "- relation에 '미확인', '알 수 없음', '관계 미정', '중립'을 쓰는 것은 엄격히 금지한다.",
-    "- 명확한 가족·학교·직장 관계가 없으면 '아이돌과 소속사 경비원', '이제 막 통성명을 한 초면', '현재 사건으로 얽힌 당사자'처럼 직업과 현재 상황을 조합한 서술형 관계를 쓴다.",
+    "- 명확한 구조적 관계가 없으면 relationships에 넣지 않는다. '현재 사건으로 얽힌 당사자', '대화를 나누며 알아가는 사이', 감정·행동·일시적 상황을 관계 라벨로 만들지 않는다.",
+    "- 기존 레지스트리에 이미 있던 두 인물 사이의 가족·혼인 관계는 [어시스턴트] 출력만으로 새로 만들지 않는다. 사용자 설정·수동 관계도에 확정되었거나 기존 동일 관계를 유지하는 경우만 기록한다.",
     "- 감정(공포, 호감, 분노, 경계)은 relation이 아니다. 감정은 details에만 쓰고 relation에는 가족·학교·직장·사회적 지위 또는 현재 상황 관계를 쓴다.",
     "- aliases에는 원문에 실제 등장한 표현만 쓴다. '너/당신/그/그녀/우리' 같은 문맥 의존 대명사는 aliases에 넣지 않는다.",
     "- aliases는 evidence 한 구절 안에 main_name과 alias가 함께 있어 동일 인물임이 직접 증명될 때만 넣는다. 근거가 분리되거나 추측이면 aliases를 비운다.",
@@ -806,7 +810,7 @@ export async function extractStructuredCharacterGraph(params: {
       !source ||
       !target ||
       source.mainName === target.mainName ||
-      (!RELATION_TYPE_SET.has(relation) && !isValidDescriptiveRelationship(relation)) ||
+      !RELATION_TYPE_SET.has(relation) ||
       !evidence ||
       !sourceRole ||
       declaredSourceRole !== sourceRole ||
@@ -1196,7 +1200,7 @@ export function applyStructuredCharacterGraph(params: {
       if (
         !subjectName ||
         !objectName ||
-        (!RELATION_TYPE_SET.has(relation) && !isValidDescriptiveRelationship(relation))
+        !RELATION_TYPE_SET.has(relation)
       ) {
         continue;
       }
@@ -1278,6 +1282,19 @@ export function applyStructuredCharacterGraph(params: {
         addressTargetName?: string;
         addressTerm?: string;
       } | undefined;
+      const subjectAlreadyKnown =
+        subjectKey === "persona" || existingByName.has(normalizedKey(subjectName));
+      const objectAlreadyKnown =
+        objectKey === "persona" || existingByName.has(normalizedKey(objectName));
+      if (
+        sourceRole === "assistant" &&
+        IMMUTABLE_FAMILY_RELATION_SET.has(relation) &&
+        subjectAlreadyKnown &&
+        objectAlreadyKnown &&
+        !existingRelation?.id
+      ) {
+        continue;
+      }
       const knownByNames = [
         ...new Set([
           ...parseRelationshipKnownBy(existingRelation?.knownBy),

@@ -373,27 +373,57 @@ const RELATIONSHIP_EVOLUTION_PRIORITY: Record<string, number> = {
   지인: 80,
 };
 
+const CANONICAL_STRUCTURAL_RELATIONS = new Set([
+  "아버지", "어머니", "부모", "딸", "아들", "자녀",
+  "할아버지", "할머니", "조부모", "손녀", "손자", "손자녀",
+  "언니", "누나", "오빠", "형", "동생", "여동생", "남동생",
+  "자매", "형제", "형제자매", "배우자", "연인", "친구", "절친",
+  "소꿉친구", "같은 반 친구", "동급생", "같은 학교", "선배", "후배",
+  "동료", "상사", "부하 직원", "고용주", "비서", "스승", "제자",
+  "의사", "환자", "보호자", "피보호자", "주인", "하인", "담당자",
+  "이웃", "지인", "동맹", "라이벌", "원수", "가해자", "피해자",
+]);
+
+function relationshipAuthority(row: RelationshipGraphRelation) {
+  if (row.isManual || row.source === "manual") return 4;
+  if (String(row.sourceRole || "").toLowerCase() === "user") return 3;
+  if (row.source === "identity") return 2;
+  if (row.source === "structured") return 1;
+  return 0;
+}
+
 function selectCurrentStoredRelationships(rows: RelationshipGraphRelation[]) {
   const selected = new Map<string, RelationshipGraphRelation>();
-  for (const row of rows) {
+  for (const row of rows.filter(
+    (item) => {
+      if (item.source !== "structured") return true;
+      if (item.addressTerm) return true;
+      if (!CANONICAL_STRUCTURAL_RELATIONS.has(item.relation)) return false;
+      if (String(item.sourceRole || "").toLowerCase() === "user") return true;
+      // Assistant extraction is an observation, not immediate canon. Keep it
+      // quarantined until the same structural relation appears on another turn.
+      // This prevents one generated hallucination from entering every later prompt.
+      return Number(item.lastSeenTurn || 0) > Number(item.firstSeenTurn || 0);
+    }
+  )) {
     const pairKey = unorderedRelationshipPairKey(row.subjectKey, row.objectKey);
     const previous = selected.get(pairKey);
     if (!previous) {
       selected.set(pairKey, row);
       continue;
     }
-    const rowManual = Number(row.isManual);
-    const previousManual = Number(previous.isManual);
+    const rowAuthority = relationshipAuthority(row);
+    const previousAuthority = relationshipAuthority(previous);
     const rowPriority = RELATIONSHIP_EVOLUTION_PRIORITY[row.relation] || 0;
     const previousPriority = RELATIONSHIP_EVOLUTION_PRIORITY[previous.relation] || 0;
     const rowSort = [
-      rowManual,
+      rowAuthority,
       Math.max(0, Number(row.lastSeenTurn || 0)),
       rowPriority,
       Math.max(0, Number(row.updatedAt || 0)),
     ];
     const previousSort = [
-      previousManual,
+      previousAuthority,
       Math.max(0, Number(previous.lastSeenTurn || 0)),
       previousPriority,
       Math.max(0, Number(previous.updatedAt || 0)),

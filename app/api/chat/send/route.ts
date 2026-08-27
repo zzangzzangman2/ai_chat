@@ -44,6 +44,10 @@ import {
   removeUnsupportedAuthorityClaims,
 } from "@/lib/authority_claim_consistency_guard";
 import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
+import {
+  formatRelationshipCanonGuardBlock,
+  removeUnsupportedRelationshipClaims,
+} from "@/lib/relationship_claim_consistency_guard";
 import { createGuardedTextStream } from "@/lib/guarded_text_stream";
 import {
   deriveCurrentSceneExclusions,
@@ -2296,6 +2300,10 @@ ${body}`.trim();
       addLegalIdentity({ name: node.name, isPersona: node.isPersona });
     }
     const legalStatusIdentities = [...legalIdentityByName.values()];
+    const relationshipClaimIdentities = legalStatusIdentities.map((identity) => ({
+      name: identity.name,
+      aliases: identity.aliases || [],
+    }));
     const trustedLegalStatusUserTexts = all
       .filter((message) => String(message?.role || "") === "user")
       .map((message) => String(message?.content || ""));
@@ -2342,6 +2350,17 @@ ${body}`.trim();
         identities: vitalStatusIdentities,
         establishedDeceasedNames,
       });
+    const sanitizeRelationshipClaims = (text: unknown, contextText: unknown = "") =>
+      removeUnsupportedRelationshipClaims({
+        text,
+        contextText,
+        trustedUserTexts: trustedLegalStatusUserTexts,
+        identities: relationshipClaimIdentities,
+        relations: relationshipGraph.relations,
+      });
+    const relationshipCanonGuardBlock = formatRelationshipCanonGuardBlock({
+      relations: relationshipGraph.relations,
+    });
     const groundedEpistemicFactIds = buildGroundedEpistemicFactIds(
       epistemicFirewall,
       trustedLegalStatusUserTexts
@@ -2366,12 +2385,15 @@ ${body}`.trim();
         identities: legalStatusIdentities,
       });
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
-      const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
+      const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
+      const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
       if (
         epistemic.redactedSegments > 0 ||
         authorityClaims.removed > 0 ||
         legalStatus.removed > 0 ||
         vitalStatus.removed > 0 ||
+        relationshipClaims.removed > 0 ||
+        relationshipClaims.rewritten > 0 ||
         physicalOwnership.removed > 0 ||
         physicalOwnership.qualified > 0
       ) {
@@ -2502,8 +2524,11 @@ ${body}`.trim();
       identities: legalStatusIdentities,
     });
     const historyVitalStatusView = sanitizeVitalStatus(historyLegalStatusView.text);
-    const historyPhysicalOwnershipView = sanitizePhysicalOwnership(
+    const historyRelationshipClaimView = sanitizeRelationshipClaims(
       historyVitalStatusView.text
+    );
+    const historyPhysicalOwnershipView = sanitizePhysicalOwnership(
+      historyRelationshipClaimView.text
     );
     const historySummaryForPrompt = historyPhysicalOwnershipView.text;
     dbg({
@@ -2580,6 +2605,8 @@ ${body}`.trim();
       legalStatusSummaryRedactions: historyLegalStatusView.removed,
       physicalOwnershipSummaryQualified: historyPhysicalOwnershipView.qualified,
       physicalOwnershipSummaryRemoved: historyPhysicalOwnershipView.removed,
+      relationshipClaimSummaryRemoved: historyRelationshipClaimView.removed,
+      relationshipClaimSummaryRewritten: historyRelationshipClaimView.rewritten,
     });
     const memoryBlock = [
       fullLongMemoryText
@@ -3270,6 +3297,7 @@ const systemRaw = (cacheFriendlyLayout
       authorityClaimPriorityBlock,
       legalStatusPriorityBlock,
       vitalStatusPriorityBlock,
+      relationshipCanonGuardBlock,
       activeInterlocutorPriorityBlock,
       physicalFactOwnershipBlock,
       addressDirectionPriorityBlock,
@@ -3326,6 +3354,7 @@ const systemRaw = (cacheFriendlyLayout
 	          continuityPriorityBlock,
 	          ``,
 	          vitalStatusPriorityBlock,
+	          relationshipCanonGuardBlock,
 	          currentOocPriorityBlock ? `` : "",
 	          currentOocPriorityBlock
 	            ? sanitizePromptCached(currentOocPriorityBlock)
@@ -3386,6 +3415,8 @@ const systemRaw = (cacheFriendlyLayout
     let authorityClaimTailRedactions = 0;
     let legalStatusTailRedactions = 0;
     let vitalStatusTailRedactions = 0;
+    let relationshipClaimTailRemoved = 0;
+    let relationshipClaimTailRewritten = 0;
     let physicalOwnershipTailQualified = 0;
     let physicalOwnershipTailRedactions = 0;
     const promptHistorySource = continueMode
@@ -3426,7 +3457,10 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusTailRedactions += legalStatus.removed;
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
       vitalStatusTailRedactions += vitalStatus.removed;
-      const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
+      const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
+      relationshipClaimTailRemoved += relationshipClaims.removed;
+      relationshipClaimTailRewritten += relationshipClaims.rewritten;
+      const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
       physicalOwnershipTailQualified += physicalOwnership.qualified;
       physicalOwnershipTailRedactions += physicalOwnership.removed;
       return { ...message, content: physicalOwnership.text };
@@ -3447,6 +3481,10 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusTailRedactions ||
       historyVitalStatusView.removed ||
       vitalStatusTailRedactions ||
+      historyRelationshipClaimView.removed ||
+      historyRelationshipClaimView.rewritten ||
+      relationshipClaimTailRemoved ||
+      relationshipClaimTailRewritten ||
       historyPhysicalOwnershipView.qualified ||
       historyPhysicalOwnershipView.removed ||
       physicalOwnershipTailQualified ||
@@ -3465,6 +3503,10 @@ const systemRaw = (cacheFriendlyLayout
         legalStatusSummaryRedactions: historyLegalStatusView.removed,
         vitalStatusSummaryRedactions: historyVitalStatusView.removed,
         vitalStatusTailRedactions,
+        relationshipClaimSummaryRemoved: historyRelationshipClaimView.removed,
+        relationshipClaimSummaryRewritten: historyRelationshipClaimView.rewritten,
+        relationshipClaimTailRemoved,
+        relationshipClaimTailRewritten,
         physicalOwnershipSummaryQualified: historyPhysicalOwnershipView.qualified,
         physicalOwnershipSummaryRedactions: historyPhysicalOwnershipView.removed,
         physicalOwnershipTailQualified,
@@ -3928,6 +3970,9 @@ let cancelStreamWork: (() => void) | null = null;
         let streamAuthorityClaimRedactions = 0;
         let streamLegalStatusRedactions = 0;
         let streamVitalStatusRedactions = 0;
+        let streamRelationshipClaimRemoved = 0;
+        let streamRelationshipClaimRewritten = 0;
+        let streamRelationshipContext = "";
         let streamPhysicalOwnershipQualified = 0;
         let streamPhysicalOwnershipRedactions = 0;
         let streamScenePresenceRedactions = 0;
@@ -3941,7 +3986,12 @@ let cancelStreamWork: (() => void) | null = null;
             identities: legalStatusIdentities,
           });
           const vitalStatus = sanitizeVitalStatus(legalStatus.text);
-          const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
+          const relationshipClaims = sanitizeRelationshipClaims(
+            vitalStatus.text,
+            streamRelationshipContext
+          );
+          streamRelationshipContext = `${streamRelationshipContext}\n${text}`.slice(-1200);
+          const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
           const scenePresence = removeScenePresenceContradictionPassages({
             text: physicalOwnership.text,
             currentUserText: userText,
@@ -3952,6 +4002,8 @@ let cancelStreamWork: (() => void) | null = null;
           streamAuthorityClaimRedactions += authorityClaims.removed;
           streamLegalStatusRedactions += legalStatus.removed;
           streamVitalStatusRedactions += vitalStatus.removed;
+          streamRelationshipClaimRemoved += relationshipClaims.removed;
+          streamRelationshipClaimRewritten += relationshipClaims.rewritten;
           streamPhysicalOwnershipQualified += physicalOwnership.qualified;
           streamPhysicalOwnershipRedactions += physicalOwnership.removed;
           streamScenePresenceRedactions += scenePresence.removed;
@@ -4445,6 +4497,16 @@ if (!TRANSPORT_STREAMING) {
           const guardedTail = guardedTextStream.finish();
           if (guardedTail) enqueueWire({ type: "delta", text: guardedTail });
           assistantText = guardedTextStream.output();
+          const finalRelationshipClaims = sanitizeRelationshipClaims(assistantText);
+          if (
+            finalRelationshipClaims.removed > 0 ||
+            finalRelationshipClaims.rewritten > 0
+          ) {
+            streamRelationshipClaimRemoved += finalRelationshipClaims.removed;
+            streamRelationshipClaimRewritten += finalRelationshipClaims.rewritten;
+            assistantText = finalRelationshipClaims.text;
+            postGenerationTextChanged = true;
+          }
           if (shortContinue.replaced || postGenerationTextChanged) {
             const epistemic = sanitizeGeneratedFacts(factGuardRecoverySource);
             const authorityClaims = sanitizeAuthorityClaims(epistemic.text);
@@ -4455,7 +4517,8 @@ if (!TRANSPORT_STREAMING) {
               identities: legalStatusIdentities,
             });
             const vitalStatus = sanitizeVitalStatus(legalStatus.text);
-            const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
+            const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
+            const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
             const scenePresence = removeScenePresenceContradictionPassages({
               text: physicalOwnership.text,
               currentUserText: userText,
@@ -4466,6 +4529,8 @@ if (!TRANSPORT_STREAMING) {
             streamAuthorityClaimRedactions += authorityClaims.removed;
             streamLegalStatusRedactions += legalStatus.removed;
             streamVitalStatusRedactions += vitalStatus.removed;
+            streamRelationshipClaimRemoved += relationshipClaims.removed;
+            streamRelationshipClaimRewritten += relationshipClaims.rewritten;
             streamPhysicalOwnershipQualified += physicalOwnership.qualified;
             streamPhysicalOwnershipRedactions += physicalOwnership.removed;
             streamScenePresenceRedactions += scenePresence.removed;
@@ -4486,6 +4551,8 @@ if (!TRANSPORT_STREAMING) {
             streamAuthorityClaimRedactions ||
             streamLegalStatusRedactions ||
             streamVitalStatusRedactions ||
+            streamRelationshipClaimRemoved ||
+            streamRelationshipClaimRewritten ||
             streamPhysicalOwnershipQualified ||
             streamPhysicalOwnershipRedactions ||
             streamScenePresenceRedactions
@@ -4498,6 +4565,8 @@ if (!TRANSPORT_STREAMING) {
               authorityClaimRedactions: streamAuthorityClaimRedactions,
               legalStatusRedactions: streamLegalStatusRedactions,
               vitalStatusRedactions: streamVitalStatusRedactions,
+              relationshipClaimRemoved: streamRelationshipClaimRemoved,
+              relationshipClaimRewritten: streamRelationshipClaimRewritten,
               physicalOwnershipQualified: streamPhysicalOwnershipQualified,
               physicalOwnershipRedactions: streamPhysicalOwnershipRedactions,
               scenePresenceRedactions: streamScenePresenceRedactions,
@@ -5769,8 +5838,11 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       identities: legalStatusIdentities,
     });
     const vitalStatusOutputChecked = sanitizeVitalStatus(legalStatusOutputChecked.text);
-    const physicalOwnershipOutputChecked = sanitizePhysicalOwnership(
+    const relationshipClaimOutputChecked = sanitizeRelationshipClaims(
       vitalStatusOutputChecked.text
+    );
+    const physicalOwnershipOutputChecked = sanitizePhysicalOwnership(
+      relationshipClaimOutputChecked.text
     );
     const scenePresenceOutputChecked = removeScenePresenceContradictionPassages({
       text: physicalOwnershipOutputChecked.text,
@@ -5784,6 +5856,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       authorityClaimOutputChecked.removed ||
       legalStatusOutputChecked.removed ||
       vitalStatusOutputChecked.removed ||
+      relationshipClaimOutputChecked.removed ||
+      relationshipClaimOutputChecked.rewritten ||
       physicalOwnershipOutputChecked.qualified ||
       physicalOwnershipOutputChecked.removed ||
       scenePresenceOutputChecked.removed
@@ -5801,6 +5875,16 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       }
       if (vitalStatusOutputChecked.removed) {
         debugReasons.push(`guard:VITAL_STATUS(${vitalStatusOutputChecked.removed})`);
+      }
+      if (relationshipClaimOutputChecked.removed) {
+        debugReasons.push(
+          `guard:RELATIONSHIP_CLAIM_REMOVE(${relationshipClaimOutputChecked.removed})`
+        );
+      }
+      if (relationshipClaimOutputChecked.rewritten) {
+        debugReasons.push(
+          `guard:RELATIONSHIP_CLAIM_REWRITE(${relationshipClaimOutputChecked.rewritten})`
+        );
       }
       if (physicalOwnershipOutputChecked.qualified) {
         debugReasons.push(
@@ -5829,6 +5913,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         legalCharacters: legalStatusOutputChecked.characterNames,
         vitalStatusRedactions: vitalStatusOutputChecked.removed,
         vitalStatusSubjects: vitalStatusOutputChecked.subjects,
+        relationshipClaimRemoved: relationshipClaimOutputChecked.removed,
+        relationshipClaimRewritten: relationshipClaimOutputChecked.rewritten,
+        relationshipClaims: relationshipClaimOutputChecked.claims,
         physicalOwnershipQualified: physicalOwnershipOutputChecked.qualified,
         physicalOwnershipRedactions: physicalOwnershipOutputChecked.removed,
         physicalOwnershipSubjects: physicalOwnershipOutputChecked.owners,
