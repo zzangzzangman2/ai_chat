@@ -251,8 +251,11 @@ type RelatedMemoryBlock = {
   explicitMatch: boolean;
 };
 
-const relatedMemoryStatementCache = new Map<string, ReturnType<typeof db.prepare>>();
-function relatedMemoryStatement(sql: string) {
+// `ReturnType<typeof db.prepare>` collapses better-sqlite3's variadic bind
+// tuple to a single unknown parameter under TypeScript 5.9. Keep the cached
+// statement dynamic, as SQL strings here intentionally have different arity.
+const relatedMemoryStatementCache = new Map<string, any>();
+function relatedMemoryStatement(sql: string): any {
   const cached = relatedMemoryStatementCache.get(sql);
   if (cached) return cached;
   const statement = db.prepare(sql);

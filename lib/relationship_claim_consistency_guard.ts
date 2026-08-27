@@ -10,6 +10,8 @@ export type RelationshipCanonRelation = {
   source?: "manual" | "structured" | "identity" | "contextual";
   sourceRole?: string;
   isManual?: boolean;
+  firstSeenTurn?: number;
+  lastSeenTurn?: number;
 };
 
 export type RelationshipClaimGuardResult = {
@@ -67,7 +69,15 @@ function relationIsTrusted(relation: RelationshipCanonRelation) {
   if (relation.isManual || relation.source === "manual" || relation.source === "identity") {
     return true;
   }
-  return String(relation.sourceRole || "").toLowerCase() === "user";
+  if (String(relation.sourceRole || "").toLowerCase() === "user") return true;
+  // The graph loader already quarantines one-turn assistant extractions. A
+  // structural edge independently observed on later turns can be used to keep
+  // ordinary family address intact, while a single generated claim still
+  // cannot authenticate itself.
+  return (
+    relation.source === "structured" &&
+    Number(relation.lastSeenTurn || 0) > Number(relation.firstSeenTurn || 0)
+  );
 }
 
 function addClaim(map: Map<string, FamilyClaim>, owner: string, relation: string, target: string) {
@@ -303,6 +313,56 @@ function restoreOuterNarrationMarkers(original: string, value: string) {
   return output;
 }
 
+function neutralFamilyReference(rawTerm: unknown) {
+  return CHILD_TERMS.has(normalizeFamilyTerm(rawTerm)) ? "그 아이" : "그 사람";
+}
+
+function repairNameReferenceArtifacts(
+  text: string,
+  variants: Array<{ value: string; canonical: string }>
+) {
+  let output = text;
+  let rewritten = 0;
+  const labels = new Set<string>();
+  const seenValues = new Set<string>();
+  for (const variant of variants) {
+    if (seenValues.has(variant.value)) continue;
+    seenValues.add(variant.value);
+    const name = escapeRegex(variant.value);
+    const boundary = "(?<![가-힣A-Za-z0-9])";
+    const coordinated = new RegExp(
+      `${boundary}${name}(?:이?랑|와|과)\\s*${name}(?=(?:은|는|이|가|을|를|의|에게|한테|에서|으로|로|부터|까지|만|도|\\s|[,，.!?。！？]|$))`,
+      "gu"
+    );
+    output = output.replace(coordinated, () => {
+      rewritten += 1;
+      labels.add(`중복 인물명: ${variant.canonical}`);
+      return variant.value;
+    });
+
+    const repeated = new RegExp(
+      `${boundary}${name}(?:(?:한테|에게|에서)(?:서)?|으로부터|은|는|이|가|을|를|의|와|과)?\\s*[,，]\\s*${name}(?=(?:은|는|이|가|을|를|의|에게|한테|에서|으로|로|부터|까지|만|도|\\s|[,，.!?。！？]|$))`,
+      "gu"
+    );
+    output = output.replace(repeated, () => {
+      rewritten += 1;
+      labels.add(`중복 인물명: ${variant.canonical}`);
+      return variant.value;
+    });
+
+    const pluralized = new RegExp(
+      `${boundary}${name}들(?=(?:은|는|이|가|을|를|의|에게|한테|에서|으로|로|부터|까지|만|도))`,
+      "gu"
+    );
+    output = output.replace(pluralized, () => {
+      rewritten += 1;
+      labels.add(`고유명사 복수화: ${variant.canonical}`);
+      return "그들";
+    });
+  }
+  return { text: output, rewritten, labels: [...labels] };
+}
+
 function splitLineSentences(line: string) {
   return String(line || "")
     .replace(/([.!?。！？](?:["”']|\*+)?)(\s+)/gu, "$1\u0000")
@@ -385,12 +445,16 @@ export function removeUnsupportedRelationshipClaims(input: {
       }
       rewritten += 1;
       rejected.add(`${speaker} → ${relation} → ${target}`);
-      return target;
+      // Inferring the target is useful for validation, but it is not safe for
+      // text generation. Replacing "내 딸" with a nearby name produced broken
+      // prose such as "박지아랑 박지아" and even changed the victim. Neutralize
+      // the unsupported kinship without inventing a name.
+      return neutralFamilyReference(rawTerm);
     }
     if (!hasAnySupportedRelative(claims, speaker, relation)) {
       rewritten += 1;
       rejected.add(`${speaker} → ${relation} → (미확정 대상)`);
-      return CHILD_TERMS.has(rawTerm) ? "그 아이" : "그 사람";
+      return neutralFamilyReference(rawTerm);
     }
     return matched;
   });
@@ -423,6 +487,10 @@ export function removeUnsupportedRelationshipClaims(input: {
     return restoreOuterNarrationMarkers(line, kept.join(" "));
   });
   rewrittenText = lines.join("\n").replace(/\n{3,}/gu, "\n\n");
+  const nameArtifacts = repairNameReferenceArtifacts(rewrittenText, variants);
+  rewrittenText = nameArtifacts.text;
+  rewritten += nameArtifacts.rewritten;
+  nameArtifacts.labels.forEach((label) => rejected.add(label));
 
   if (!removed && !rewritten) {
     return { text: source, removed: 0, rewritten: 0, claims: [] };
@@ -447,6 +515,7 @@ export function formatRelationshipCanonGuardBlock(input: {
     "- 등록된 기존 인물 사이의 혈연·혼인 관계는 사용자 직접 설정, 관계도 수동값, 정체성 정본에 있는 항목만 확정 사실이다.",
     "- 아래 목록에 없는 기존 인물 둘을 부모·자녀·형제자매·조부모·배우자로 새로 묶지 않는다. 이전 AI 대사·지문·요약만으로 새 가족관계를 만들거나 기존 가족관계를 다른 인물에게 복사하지 않는다.",
     "- '우리 애/우리 아이/내 딸/내 아들/우리 엄마/우리 아빠' 같은 소유형 가족 표현도 실제 화자와 실제 대상을 먼저 실명으로 해석한 뒤 아래 정사와 일치할 때만 쓴다. 애칭·보호 본능·친근감은 혈연 증거가 아니다.",
+    "- 보정 과정에서도 모호한 가족 호칭을 주변 인물의 이름으로 추측 치환하지 않는다. 같은 인물명을 나열하거나 같은 이름·조사구를 연달아 반복하지 않으며, 한 사람의 고유명사에 '들'을 붙여 집단처럼 쓰지 않는다.",
     "- 관계가 불확실하면 가족 호칭을 쓰지 말고 대상의 이름이나 중립 표현을 쓴다. 새 관계가 필요하면 사용자가 설정하기 전까지 확정하지 않는다.",
   ];
   if (exact.length) {
