@@ -906,7 +906,9 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
         });
       const detailParts = [
         node.job ? `직업: ${node.job}` : "",
-        affinity?.latestMemory ? `최근 개별 기억: ${cleanText(affinity.latestMemory, 260)}` : "",
+        affinity?.latestMemory
+          ? `최근 개별 기억(기억 소유자: ${node.name}; 문장 속 다른 참여자의 신체·행동은 실명 기준): ${cleanText(affinity.latestMemory, 260)}`
+          : "",
         "직업·배경·개별 장기기억을 바탕으로 자동 추론한 현재 관계",
       ].filter(Boolean);
       return {

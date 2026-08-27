@@ -63,6 +63,12 @@ import {
   formatCanonicalCharacterFactsBlock,
   loadCanonicalCharacterFacts,
 } from "@/lib/canonical_character_facts";
+import {
+  buildPhysicalFactIdentities,
+  enforcePhysicalFactOwnership,
+  formatPhysicalFactOwnershipBlock,
+  type PhysicalFactIdentity,
+} from "@/lib/physical_fact_consistency_guard";
 import { buildSpatialCanon } from "@/lib/spatial_canon";
 import { resolveActiveCharacterFocus } from "@/lib/active_character_focus";
 import {
@@ -650,7 +656,9 @@ function buildManualCharacterRosterBlock(
   chatIdRaw: string,
   focusTextRaw = "",
   personaNameOverride = "",
-  recentFocusTextRaw = ""
+  recentFocusTextRaw = "",
+  physicalFactIdentities: PhysicalFactIdentity[] = [],
+  includeDetailedContext = true
 ) {
   const chatId = String(chatIdRaw || "").trim();
   if (!chatId) return "";
@@ -738,7 +746,7 @@ function buildManualCharacterRosterBlock(
   // 고정 개수 제한 없이 전체 이력을 읽고, 사실상 같은 요약+근거만 합쳐
   // 오래된 사건이나 반응성 기록도 조회 단계에서 사라지지 않게 한다.
   const memoriesByRoster = new Map<string, any[]>();
-  {
+  if (includeDetailedContext) {
     const rosterIds: string[] = [];
     for (const r of detailedRows) {
       const rid = String(r?.id || "").trim();
@@ -782,19 +790,36 @@ function buildManualCharacterRosterBlock(
   for (const row of detailedRows) {
     const name = String(row?.name || "").trim();
     if (!name) continue;
-    const aliases = decryptIfPossible(String(row?.aliases || "")).trim();
-    const role = decryptIfPossible(String(row?.role || "")).trim();
-    const profile = decryptIfPossible(String(row?.profile || "")).trim();
-    const relationshipNote = decryptIfPossible(String(row?.relationshipNote || "")).trim();
-    const emotionNote = decryptIfPossible(String(row?.emotionNote || "")).trim();
-    const status = decryptIfPossible(String(row?.status || "")).trim();
-    const memories = memoriesByRoster.get(String(row?.id || "")) || [];
+    const aliases = includeDetailedContext
+      ? decryptIfPossible(String(row?.aliases || "")).trim()
+      : "";
+    const role = includeDetailedContext
+      ? decryptIfPossible(String(row?.role || "")).trim()
+      : "";
+    const profile = includeDetailedContext
+      ? decryptIfPossible(String(row?.profile || "")).trim()
+      : "";
+    const relationshipNote = includeDetailedContext
+      ? decryptIfPossible(String(row?.relationshipNote || "")).trim()
+      : "";
+    const emotionNote = includeDetailedContext
+      ? decryptIfPossible(String(row?.emotionNote || "")).trim()
+      : "";
+    const status = includeDetailedContext
+      ? decryptIfPossible(String(row?.status || "")).trim()
+      : "";
+    const memories = includeDetailedContext
+      ? memoriesByRoster.get(String(row?.id || "")) || []
+      : [];
     // (최적화) replacer를 미리 만들어 두면 모든 메모리 라인이 같은 캐싱된 함수를 사용 → regex 컴파일 0회.
     const replacer = getPersonaRefReplacer(personaName);
     const memoryLines = memories
       .map((m: any) => {
         const turnNo = Math.max(0, Math.floor(Number(m?.turnNo || 0)));
-        const summary = replacer(String(m?.summary || "").trim());
+        const summary = enforcePhysicalFactOwnership({
+          text: replacer(String(m?.summary || "").trim()),
+          identities: physicalFactIdentities,
+        }).text;
         return turnNo > 0 && summary ? `  - ${turnNo}턴: ${summary}` : "";
       })
       .filter(Boolean);
@@ -821,19 +846,38 @@ function buildManualCharacterRosterBlock(
   return [
     "# (2-C) manual character registry",
     "- These are user-pinned characters to remember across the chat.",
-    "- Detailed encounter logs below belong only to the character under the same ## heading.",
-    "- Never transfer a relationship, title, promise, emotion, or dialogue style from one character heading to another.",
-    "- A title used by one character does not authorize any other character to use it.",
-    "- Preserve relationship, dialogue distance, emotional residue, unresolved conflicts, promises, and aliases only for that same character.",
-    "- Encounter logs are ordered by turn number from oldest to newest; treat later turn numbers as happening after earlier turn numbers.",
-    `- The persona name is "${personaName}". Do not refer to the persona as 사용자, 주인공, or 플레이어 in character memory.`,
-    `- Use the encounter logs mainly to remember what happened between ${personaName} and each character.`,
+    includeDetailedContext
+      ? "- Each ## heading is the memory owner: the character whose relationship/emotion continuity is being stored. It is not the grammatical subject or physical-attribute owner of every sentence in that encounter."
+      : "",
+    includeDetailedContext
+      ? `- An encounter can describe both ${personaName} and the memory owner. Keep every height, weight, build, appearance, action, and spoken line attached to the participant explicitly named in that sentence; never attach an unnamed physical value to the ## heading character.`
+      : "",
+    includeDetailedContext
+      ? "- Never transfer a relationship, title, promise, emotion, or dialogue style from one character heading to another."
+      : "",
+    includeDetailedContext
+      ? "- A title used by one character does not authorize any other character to use it."
+      : "",
+    includeDetailedContext
+      ? "- Preserve relationship, dialogue distance, emotional residue, unresolved conflicts, promises, and aliases only for that same character."
+      : "",
+    includeDetailedContext
+      ? "- Encounter logs are ordered by turn number from oldest to newest; treat later turn numbers as happening after earlier turn numbers."
+      : "",
+    includeDetailedContext
+      ? `- The persona name is "${personaName}". Do not refer to the persona as 사용자, 주인공, or 플레이어 in character memory.`
+      : "",
+    includeDetailedContext
+      ? `- Use the encounter logs mainly to remember what happened between ${personaName} and each character.`
+      : "",
     "- This registry is not a complete cast list. An unregistered or role-only NPC present in recent conversation remains a separate current-scene character.",
     "- Never omit, merge, or silence an unregistered current-scene NPC merely because only registered characters have detailed memory below.",
-    detailedRows.length ? `- Current-scene detailed characters: ${detailedRows.map((row) => row.name).join(", ")}` : "",
+    detailedRows.length
+      ? `- Current-scene ${includeDetailedContext ? "detailed characters" : "registered names (details already supplied by dynamic context)"}: ${detailedRows.map((row) => row.name).join(", ")}`
+      : "",
     body,
     inactiveNames.length ? `- Other registered but currently inactive characters (names only): ${inactiveNames.join(", ")}` : "",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 type PromptBreakdownWeights = {
@@ -2074,11 +2118,13 @@ ${body}`.trim();
       ),
     };
     const identityCanonBlock = formatIdentityCanonBlock(identityCanonForPrompt);
+    let canonicalCharacterFacts = [] as ReturnType<typeof loadCanonicalCharacterFacts>;
     let canonicalCharacterFactsBlock = "";
     try {
+      canonicalCharacterFacts = loadCanonicalCharacterFacts(cid);
       canonicalCharacterFactsBlock = formatCanonicalCharacterFactsBlock({
         persona: authoritativePersonaFacts,
-        facts: loadCanonicalCharacterFacts(cid),
+        facts: canonicalCharacterFacts,
         focusNames: [
           personaNameFinal,
           preset.characterName,
@@ -2093,6 +2139,29 @@ ${body}`.trim();
         reqId,
         error: String((error as { message?: unknown })?.message || error),
       });
+    }
+    const physicalFactIdentities = buildPhysicalFactIdentities({
+      persona: authoritativePersonaFacts,
+      facts: canonicalCharacterFacts,
+      characters: continuityLedgerIdentities.map((identity) => ({
+        name: identity.name,
+        aliases: identity.aliases,
+      })),
+    });
+    const physicalFactOwnershipBlock = formatPhysicalFactOwnershipBlock(
+      physicalFactIdentities
+    );
+    if (dynamicCharacterContext.block) {
+      // Event summaries can mention both the memory owner and the persona. Make
+      // every exact canonical measurement self-identifying before the JSON is
+      // reused, so character_id cannot absorb another participant's body facts.
+      dynamicCharacterContext = {
+        ...dynamicCharacterContext,
+        block: enforcePhysicalFactOwnership({
+          text: dynamicCharacterContext.block,
+          identities: physicalFactIdentities,
+        }).text,
+      };
     }
     const spatialCanon = buildSpatialCanon({
       messages: all,
@@ -2177,7 +2246,9 @@ ${body}`.trim();
           cid,
           characterFocusText,
           personaNameFinal,
-          recentCharacterFocusText
+          recentCharacterFocusText,
+          physicalFactIdentities,
+          !dynamicCharacterContext.block
         );
       } catch (error) {
         console.error("[chat/send] manual character context fallback failed", {
@@ -2279,6 +2350,11 @@ ${body}`.trim();
       sanitizeGeneratedEpistemicText(text, epistemicFirewall, {
         groundedFactIds: groundedEpistemicFactIds,
       });
+    const sanitizePhysicalOwnership = (text: unknown) =>
+      enforcePhysicalFactOwnership({
+        text,
+        identities: physicalFactIdentities,
+      });
     const recoverAfterOverfilter = (text: unknown) => {
       const original = String(text || "");
       const epistemic = sanitizeGeneratedFacts(text);
@@ -2290,21 +2366,26 @@ ${body}`.trim();
         identities: legalStatusIdentities,
       });
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+      const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
       if (
         epistemic.redactedSegments > 0 ||
         authorityClaims.removed > 0 ||
         legalStatus.removed > 0 ||
-        vitalStatus.removed > 0
+        vitalStatus.removed > 0 ||
+        physicalOwnership.removed > 0 ||
+        physicalOwnership.qualified > 0
       ) {
-        return String(vitalStatus.text || "").trim()
-          ? vitalStatus.text
+        return String(physicalOwnership.text || "").trim()
+          ? physicalOwnership.text
           : "*확인된 사실만 다시 추려, 근거 없는 내용은 단정하지 않았다.*";
       }
       // The guards may remove unsupported local passages, but a false-positive
       // match must never erase an otherwise completed provider response. Keep
       // the single-call draft only when the combined filters would return no
       // visible text at all; partial redactions remain fully enforced.
-      return String(vitalStatus.text || "").trim() ? vitalStatus.text : original;
+      return String(physicalOwnership.text || "").trim()
+        ? physicalOwnership.text
+        : original;
     };
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
@@ -2421,7 +2502,10 @@ ${body}`.trim();
       identities: legalStatusIdentities,
     });
     const historyVitalStatusView = sanitizeVitalStatus(historyLegalStatusView.text);
-    const historySummaryForPrompt = historyVitalStatusView.text;
+    const historyPhysicalOwnershipView = sanitizePhysicalOwnership(
+      historyVitalStatusView.text
+    );
+    const historySummaryForPrompt = historyPhysicalOwnershipView.text;
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -2494,6 +2578,8 @@ ${body}`.trim();
       epistemicWorldOnlyFactCount: epistemicFirewall.worldOnlyRelationIds.size,
       epistemicSummaryRedactions: historyEpistemicView.redactedSegments,
       legalStatusSummaryRedactions: historyLegalStatusView.removed,
+      physicalOwnershipSummaryQualified: historyPhysicalOwnershipView.qualified,
+      physicalOwnershipSummaryRemoved: historyPhysicalOwnershipView.removed,
     });
     const memoryBlock = [
       fullLongMemoryText
@@ -3185,6 +3271,7 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusPriorityBlock,
       vitalStatusPriorityBlock,
       activeInterlocutorPriorityBlock,
+      physicalFactOwnershipBlock,
       addressDirectionPriorityBlock,
       statusContinuityPriorityBlock,
       currentOocPriorityBlock,
@@ -3299,6 +3386,8 @@ const systemRaw = (cacheFriendlyLayout
     let authorityClaimTailRedactions = 0;
     let legalStatusTailRedactions = 0;
     let vitalStatusTailRedactions = 0;
+    let physicalOwnershipTailQualified = 0;
+    let physicalOwnershipTailRedactions = 0;
     const promptHistorySource = continueMode
       ? selectMessagesBeforeContinuationTurn(all, continueAid)
       : selectMessagesBeforeCurrentUser(all, userMsg.id);
@@ -3337,7 +3426,10 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusTailRedactions += legalStatus.removed;
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
       vitalStatusTailRedactions += vitalStatus.removed;
-      return { ...message, content: vitalStatus.text };
+      const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
+      physicalOwnershipTailQualified += physicalOwnership.qualified;
+      physicalOwnershipTailRedactions += physicalOwnership.removed;
+      return { ...message, content: physicalOwnership.text };
     });
     const contextRaw = formatStoryTurnsForMode(
       epistemicTail,
@@ -3354,7 +3446,11 @@ const systemRaw = (cacheFriendlyLayout
       historyLegalStatusView.removed ||
       legalStatusTailRedactions ||
       historyVitalStatusView.removed ||
-      vitalStatusTailRedactions
+      vitalStatusTailRedactions ||
+      historyPhysicalOwnershipView.qualified ||
+      historyPhysicalOwnershipView.removed ||
+      physicalOwnershipTailQualified ||
+      physicalOwnershipTailRedactions
     ) {
       dbg({
         tag: "send.epistemic-firewall",
@@ -3369,6 +3465,10 @@ const systemRaw = (cacheFriendlyLayout
         legalStatusSummaryRedactions: historyLegalStatusView.removed,
         vitalStatusSummaryRedactions: historyVitalStatusView.removed,
         vitalStatusTailRedactions,
+        physicalOwnershipSummaryQualified: historyPhysicalOwnershipView.qualified,
+        physicalOwnershipSummaryRedactions: historyPhysicalOwnershipView.removed,
+        physicalOwnershipTailQualified,
+        physicalOwnershipTailRedactions,
         recentLegalStatusRedactions: legalStatusTailRedactions,
       });
     }
@@ -3828,6 +3928,8 @@ let cancelStreamWork: (() => void) | null = null;
         let streamAuthorityClaimRedactions = 0;
         let streamLegalStatusRedactions = 0;
         let streamVitalStatusRedactions = 0;
+        let streamPhysicalOwnershipQualified = 0;
+        let streamPhysicalOwnershipRedactions = 0;
         let streamScenePresenceRedactions = 0;
         const guardedTextStream = createGuardedTextStream((text) => {
           const epistemic = sanitizeGeneratedFacts(text);
@@ -3839,8 +3941,9 @@ let cancelStreamWork: (() => void) | null = null;
             identities: legalStatusIdentities,
           });
           const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+          const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
           const scenePresence = removeScenePresenceContradictionPassages({
-            text: vitalStatus.text,
+            text: physicalOwnership.text,
             currentUserText: userText,
             presentCharacters: currentScenePresence,
             excludedCharacters: currentSceneExclusions,
@@ -3849,6 +3952,8 @@ let cancelStreamWork: (() => void) | null = null;
           streamAuthorityClaimRedactions += authorityClaims.removed;
           streamLegalStatusRedactions += legalStatus.removed;
           streamVitalStatusRedactions += vitalStatus.removed;
+          streamPhysicalOwnershipQualified += physicalOwnership.qualified;
+          streamPhysicalOwnershipRedactions += physicalOwnership.removed;
           streamScenePresenceRedactions += scenePresence.removed;
           return scenePresence.text;
         });
@@ -4350,8 +4455,9 @@ if (!TRANSPORT_STREAMING) {
               identities: legalStatusIdentities,
             });
             const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+            const physicalOwnership = sanitizePhysicalOwnership(vitalStatus.text);
             const scenePresence = removeScenePresenceContradictionPassages({
-              text: vitalStatus.text,
+              text: physicalOwnership.text,
               currentUserText: userText,
               presentCharacters: currentScenePresence,
               excludedCharacters: currentSceneExclusions,
@@ -4360,6 +4466,8 @@ if (!TRANSPORT_STREAMING) {
             streamAuthorityClaimRedactions += authorityClaims.removed;
             streamLegalStatusRedactions += legalStatus.removed;
             streamVitalStatusRedactions += vitalStatus.removed;
+            streamPhysicalOwnershipQualified += physicalOwnership.qualified;
+            streamPhysicalOwnershipRedactions += physicalOwnership.removed;
             streamScenePresenceRedactions += scenePresence.removed;
             assistantText = scenePresence.text;
           }
@@ -4378,6 +4486,8 @@ if (!TRANSPORT_STREAMING) {
             streamAuthorityClaimRedactions ||
             streamLegalStatusRedactions ||
             streamVitalStatusRedactions ||
+            streamPhysicalOwnershipQualified ||
+            streamPhysicalOwnershipRedactions ||
             streamScenePresenceRedactions
           ) {
             dbg({
@@ -4388,6 +4498,8 @@ if (!TRANSPORT_STREAMING) {
               authorityClaimRedactions: streamAuthorityClaimRedactions,
               legalStatusRedactions: streamLegalStatusRedactions,
               vitalStatusRedactions: streamVitalStatusRedactions,
+              physicalOwnershipQualified: streamPhysicalOwnershipQualified,
+              physicalOwnershipRedactions: streamPhysicalOwnershipRedactions,
               scenePresenceRedactions: streamScenePresenceRedactions,
             });
           }
@@ -5657,8 +5769,11 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       identities: legalStatusIdentities,
     });
     const vitalStatusOutputChecked = sanitizeVitalStatus(legalStatusOutputChecked.text);
+    const physicalOwnershipOutputChecked = sanitizePhysicalOwnership(
+      vitalStatusOutputChecked.text
+    );
     const scenePresenceOutputChecked = removeScenePresenceContradictionPassages({
-      text: vitalStatusOutputChecked.text,
+      text: physicalOwnershipOutputChecked.text,
       currentUserText: userText,
       presentCharacters: currentScenePresence,
       excludedCharacters: currentSceneExclusions,
@@ -5669,6 +5784,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       authorityClaimOutputChecked.removed ||
       legalStatusOutputChecked.removed ||
       vitalStatusOutputChecked.removed ||
+      physicalOwnershipOutputChecked.qualified ||
+      physicalOwnershipOutputChecked.removed ||
       scenePresenceOutputChecked.removed
     ) {
       if (epistemicOutputChecked.redactedSegments) {
@@ -5684,6 +5801,16 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       }
       if (vitalStatusOutputChecked.removed) {
         debugReasons.push(`guard:VITAL_STATUS(${vitalStatusOutputChecked.removed})`);
+      }
+      if (physicalOwnershipOutputChecked.qualified) {
+        debugReasons.push(
+          `guard:PHYSICAL_OWNER_QUALIFY(${physicalOwnershipOutputChecked.qualified})`
+        );
+      }
+      if (physicalOwnershipOutputChecked.removed) {
+        debugReasons.push(
+          `guard:PHYSICAL_OWNER_REMOVE(${physicalOwnershipOutputChecked.removed})`
+        );
       }
       if (scenePresenceOutputChecked.removed) {
         debugReasons.push(
@@ -5702,6 +5829,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         legalCharacters: legalStatusOutputChecked.characterNames,
         vitalStatusRedactions: vitalStatusOutputChecked.removed,
         vitalStatusSubjects: vitalStatusOutputChecked.subjects,
+        physicalOwnershipQualified: physicalOwnershipOutputChecked.qualified,
+        physicalOwnershipRedactions: physicalOwnershipOutputChecked.removed,
+        physicalOwnershipSubjects: physicalOwnershipOutputChecked.owners,
         scenePresenceRedactions: scenePresenceOutputChecked.removed,
         scenePresenceCharacters: scenePresenceOutputChecked.characterNames,
       });
