@@ -38,7 +38,7 @@ type PhysicalFactInput = {
 const HEIGHT_RE = /(\d{2,3}(?:\.\d+)?)\s*(?:cm|㎝|센티미터|센티)(?![A-Za-z])/giu;
 const WEIGHT_RE = /(\d{2,3}(?:\.\d+)?)\s*(?:kg|㎏|킬로그램|킬로)(?![A-Za-z])/giu;
 const LARGE_BUILD_RE =
-  /(?:거구(?:의\s*(?:남자|여자|사람|인물))?|육중(?:한\s*(?:몸집|체구|몸|체격)?|하고|하며|하게|했다)|우람(?:한\s*(?:몸집|체구|몸|체격)?|하고|하며|하게|했다)|비대(?:한\s*(?:몸집|체구|몸|체격)?|하고|하며|하게|했다|해진)|거대한\s*(?:몸집|체구|몸|체격|살덩어리))/giu;
+  /(?:거구(?:의\s*(?:남자|여자|사람|인물))?|(?:육중|우람|비대)한\s*(?:몸집|체구|몸|체격)|비대해진\s*(?:몸집|체구|몸|체격)|거대한\s*(?:몸집|체구|몸|체격|살덩어리))/giu;
 const SMALL_BUILD_RE =
   /(?:(?:왜소한?|가냘픈|가녀린|호리호리한|마른|깡마른)\s*(?:몸집|체구|몸|체격))/giu;
 const DENIAL_OR_CORRECTION_RE =
@@ -345,18 +345,11 @@ export function enforcePhysicalFactOwnership(input: {
                 owners.add(owner.name);
                 return matched;
               }
-              qualified += 1;
-              owners.add(owner.name);
-              if (/^거구의\s*(?:남자|여자|사람|인물)$/u.test(matched)) {
-                return `거구인 ${owner.name}`;
-              }
-              if (/^거구/u.test(matched)) return `${owner.name}의 ${matched}`;
-              if (/(?:하고|하며)$/u.test(matched)) return `${owner.name}은 ${matched}`;
-              if (/하게$/u.test(matched)) return `${owner.name}이 ${matched}`;
-              if (/(?:했다|해졌다)$/u.test(matched)) {
-                return `${owner.name}의 체구는 ${matched}`;
-              }
-              return `${owner.name}의 ${matched}`;
+              // A qualitative adjective is not a unique identifier. Unlike an
+              // exact 150kg/150cm value, "육중한" may describe another actor,
+              // a door, footsteps, or a temporary pose. Never inject the
+              // canonical owner's name into otherwise unnamed prose.
+              return matched;
             });
           };
           next = qualifyBuild("large", LARGE_BUILD_RE);
@@ -403,7 +396,8 @@ export function formatPhysicalFactOwnershipBlock(identities: PhysicalFactIdentit
   return [
     "# [신체 사실 소유권 HARD GUARD — 전체 채팅 공통]",
     "- 키·체중·체형·외모는 아래에 적힌 정확한 인물에게만 속한다. 사건 기억의 memory_owner/character_id는 그 기억을 보관하는 인물일 뿐, 사건 문장 속 모든 신체 묘사의 주인이 아니다.",
-    "- 다른 인물과 함께 나온 사건·대사·직전 AI 지문에서 수치나 체형을 발견해도 현재 화자·현재 NPC에게 복사하지 않는다. 이름 없는 수치 묘사는 반드시 아래 정본 소유자의 이름을 밝혀 쓴다.",
+    "- 다른 인물과 함께 나온 사건·대사·직전 AI 지문에서 수치나 체형을 발견해도 현재 화자·현재 NPC에게 복사하지 않는다. 이름 없는 정확한 키·체중 수치는 반드시 아래 정본 소유자의 이름을 밝혀 쓴다.",
+    "- '육중한/거구/가녀린/마른' 같은 정성적 형용사만 보고 아래 정본 인물의 이름을 문장에 새로 끼워 넣지 않는다. 그 표현은 문·발소리 같은 사물이나 현재의 다른 행동 주체를 꾸밀 수 있다.",
     "- 아래에 없는 NPC의 키·체중·체형은 미정이다. 장면 초점, 성별, 나이, 관계, 주변 인물의 체격을 근거로 새 수치나 '거구/육중/비대/왜소/마름'을 추정하지 않는다.",
     "- 이전 AI 출력·요약이 아래 수치를 다른 인물에게 붙였다면 오염된 서술이므로 반복하지 않는다.",
     ...rows,
