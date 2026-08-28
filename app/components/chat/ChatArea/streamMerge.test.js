@@ -24,4 +24,28 @@ const server = '"열린 대사"\n\n```상태\n날짜: 22:36\n호감도: 지아 -
 const merged = streamMerge.mergeStreamFinalContent({ buffered, fromServer: server, metaLabels: ["상태"] });
 assert.equal(merged.content, server);
 assert.equal((merged.content.match(/```상태/g) || []).length, 1);
+
+const malformedLongerBuffer = [
+  "*스트리밍 중에만 남은 삭제 대상 문장.*",
+  "",
+  '또한 이미 제출된 증거만으로도 충분히 소명되었습니다."',
+  "",
+  "```상태",
+  "날짜: 22:36",
+  "```",
+].join("\n");
+const authoritativeServer = [
+  '"또한 이미 제출된 증거만으로도 충분히 소명되었습니다."',
+  "",
+  "```상태",
+  "날짜: 22:36",
+  "```",
+].join("\n");
+const authoritative = streamMerge.mergeStreamFinalContent({
+  buffered: malformedLongerBuffer,
+  fromServer: authoritativeServer,
+  metaLabels: ["상태"],
+});
+assert.equal(authoritative.content, authoritativeServer);
+assert.equal(authoritative.source, "server");
 console.log("streamMerge tests passed");

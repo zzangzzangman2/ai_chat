@@ -4603,15 +4603,10 @@ if (!TRANSPORT_STREAMING) {
             assistantText = streamMarkerBalance.text;
             debugReasons.push(`format:CLOSE_BODY_MARKERS:${streamMarkerBalance.added}`);
           }
-          if (
-            shortContinue.replaced ||
-            postGenerationTextChanged ||
-            streamNovelMarkers.changed ||
-            streamStatusContinuity.changed ||
-            streamMarkerBalance.repaired
-          ) {
-            enqueueWire({ type: "replace", text: assistantText });
-          }
+          // The streamed draft may differ from the guarded/normalized text that
+          // is persisted below. Always replace it once at completion so the UI,
+          // done payload, and database are byte-for-byte identical.
+          enqueueWire({ type: "replace", text: assistantText });
 
 // messages 저장
           const createdAt = Date.now();

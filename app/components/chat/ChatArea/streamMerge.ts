@@ -43,20 +43,13 @@ export function mergeStreamFinalContent(args: {
 
   const buffered = String(args.buffered || "");
   const fromServer = String(args.fromServer || "");
-  const bufferedParts = splitForMeta(buffered);
-  const serverParts = splitForMeta(fromServer);
-  const comparableBody = (value: string) => String(value || "").trimEnd().replace(/["*]+$/g, "").trimEnd();
-  const serverHasAuthoritativeFinal = Boolean(
-    serverParts.meta.trim() &&
-      bufferedParts.meta.trim() &&
-      comparableBody(serverParts.body) === comparableBody(bufferedParts.body)
-  );
-  // Server-side deterministic repairs can insert a missing quote/star immediately
-  // before the final status fence or restore omitted status fields. Appending that
-  // corrected suffix to the streamed draft duplicates/corrupts the status panel.
-  let content = serverHasAuthoritativeFinal ? fromServer : mergeAppendOnly(buffered, fromServer);
-  let source: StreamMergeSource =
-    content === buffered ? "buffered" : content === fromServer ? "server" : "merged";
+  // The done payload is the exact text persisted by the server after all fact,
+  // role-marker, and status-panel repairs. A longer streamed draft is not more
+  // authoritative: keeping it can resurrect a missing opening quote or text that
+  // the server deliberately repaired. Fall back to the buffer only when a legacy
+  // response genuinely omits final assistant content.
+  let content = fromServer || buffered;
+  let source: StreamMergeSource = fromServer ? "server" : "buffered";
 
   const serverMeta = splitForMeta(fromServer).meta.trimEnd();
   if (serverMeta && !splitForMeta(content).meta.trim()) {
