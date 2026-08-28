@@ -18,7 +18,7 @@ export type AuthorityClaimIdentity = {
 };
 
 const AUTHORITY_CONTEXT =
-  /(?:경찰|형사|수사관|수사팀|강력팀|검사|검찰|경찰서|경위|경감|공소장|수사\s*기록|사건\s*기록|범죄\s*기록|혐의|죄명|전과|체포영장|수배)/u;
+  /(?:경찰|형사|수사관|수사팀|강력팀|검사|검찰|경찰서|경위|경감|판사|재판장|재판부|법원|법정|공판|판결(?:문)?|선고|주문|공소장|기소|수사\s*기록|사건\s*기록|범죄\s*기록|혐의|죄명|전과|체포영장|수배)/u;
 
 // A correction that merely names a hallucinated fact is not evidence for it.
 const CORRECTION_OR_DENIAL =
@@ -130,6 +130,24 @@ const CLAIMS: ClaimDefinition[] = [
     id: "stalking",
     claim: /(?:스토킹|불법\s*촬영)/u,
     evidence: /(?:스토킹|미행했|미행한|불법\s*촬영|몰래\s*촬영)/u,
+  },
+  {
+    // A private in-scene request to "commentate" and a later blog/photo
+    // upload are not evidence that the crime itself was publicly broadcast
+    // live. This method-of-crime detail must be user-authored explicitly.
+    id: "live_public_broadcast",
+    claim: /(?:생중계|실시간\s*(?:송출|방송|중계))/u,
+    evidence: /(?:생중계|실시간\s*(?:송출|방송|중계))/u,
+  },
+  {
+    // Keep still-photo/blog publication distinct from invented camera footage.
+    // Otherwise an assistant-authored "video" can be promoted into an
+    // indictment, witness statement, and verdict on every later turn.
+    id: "crime_video_distribution",
+    claim:
+      /(?:(?:불법\s*)?(?:촬영|영상|동영상|카메라)[^.!?。！？\n]{0,50}(?:송출|유포|배포|공개|전송)|(?:송출|유포|배포|공개|전송)[^.!?。！？\n]{0,50}(?:불법\s*)?(?:촬영|영상|동영상))/u,
+    evidence:
+      /(?:(?:불법\s*)?(?:촬영|영상|동영상|카메라)[^.!?。！？\n]{0,50}(?:송출|유포|배포|공개|전송)|(?:송출|유포|배포|공개|전송)[^.!?。！？\n]{0,50}(?:불법\s*)?(?:촬영|영상|동영상))/u,
   },
 ];
 
