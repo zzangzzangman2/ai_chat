@@ -5,7 +5,7 @@ import { getSessionUser, isAdminEmail } from "@/lib/auth";
 import { randomUUID } from "crypto";
 import { countTokens, generateText, generateTextStream, summarizeKorean, summarizeLongMemoryKorean, isRefusalText, REFUSAL_FALLBACK_MODEL } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
-import { DEFAULT_CHAT_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
+import { DEFAULT_CHAT_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini31ProModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
 
 import {
   postprocessLongMemorySummary,
@@ -2653,13 +2653,12 @@ ${body}`.trim();
     const modelName = String((opts as any)?.model || "");
     const isGemini3 = modelName.includes("gemini-3");
     const isGemini3Pro = isGemini3ProFamilyModel(modelName);
+    const isGemini31Pro = isGemini31ProModel(modelName);
 
-    
-    // (2026-07) gemini-3-pro 계열도 기본은 실시간 델타 스트리밍.
-    // 과거 DONE-ONLY 전환 사유였던 "본문 캡+메타 펜스 직전 문장 잘림"은 streamLoop의
-    // 홀드백 버퍼(마지막 N자 보류 → 경계 보정 후 방출)로 해결했다.
-    // 롤백: AI_G3PRO_DONE_ONLY=1 이면 기존 DONE-ONLY(버퍼링+done만 전송)로 복귀.
-    const G3PRO_DONE_ONLY = Boolean(isGemini3Pro) && String(process.env.AI_G3PRO_DONE_ONLY || "0").trim() === "1";
+    // Gemini 3.1 Pro는 모델 텍스트 델타를 화면에 내보내지 않는다.
+    // 한 번에 생성한 완성본을 검증·정규화한 뒤 done으로만 전달한다.
+    // NDJSON 연결의 keep-alive ping은 장시간 요청의 연결 유지만 담당한다.
+    const G3PRO_DONE_ONLY = isGemini31Pro;
 // Gemini 3 Pro는 1-shot으로 한 번에 출력을 뱉는 경우가 많아서,
     // 이어쓰기(추가 generateText 호출)가 들어가면 대기 시간이 거의 2배가 된다.
     // → 이 모델에 한해 "추가 호출(이어쓰기/짧음 보정/메타 오버랩)"을 금지한다.
@@ -4098,12 +4097,9 @@ let cancelStreamWork: (() => void) | null = null;
           const makeContinueUser = (combined: string, reasons: readonly string[] = []) =>
             makeContinueUserPrompt(context, combined, reasons, userText);
 
-          // (2026-07) gemini-3-pro 계열도 기본은 실시간 델타 스트리밍(generateTextStream).
-          // 과거 DONE-ONLY(전체 버퍼링) 전환 사유였던 "본문 캡(bodyMaxChars) + 메타 펜스 직전 문장 잘림"은
-          // streamLoop의 홀드백 버퍼(마지막 N자 보류 → 캡/펜스 경계 보정 후 방출)로 해결했다.
-          // - 방출된 델타는 절대 회수/수정하지 않으므로 delta 누적본과 done/DB 본문이 항상 일치한다.
-          // 롤백: AI_G3PRO_DONE_ONLY=1 이면 기존 DONE-ONLY(버퍼링+done만 전송) 모드로 복귀.
-          const PRO_DONE_ONLY = Boolean(isGemini3Pro) && String(process.env.AI_G3PRO_DONE_ONLY || "0").trim() === "1";
+          // Gemini 3.1 Pro는 항상 비스트리밍 generateText 경로를 사용한다.
+          // 전송 연결은 ping을 보낼 수 있지만 생성 본문은 완료 후 한 번만 전달된다.
+          const PRO_DONE_ONLY = isGemini31Pro;
 
 	          const runOneBuffered = async (userPrompt: string, tag: string) => {
 	            try {
