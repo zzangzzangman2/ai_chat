@@ -1750,6 +1750,10 @@ const loadOlder = useCallback(async () => {
 
   const npcName = (selectedPreset?.characterName || "상대").trim() || "상대";
   const userName = (settings?.personaName || selectedProfile?.personaName || "나").trim() || "나";
+  const configuredNarrationColor = String(settings?.narrationColor || "").trim();
+  const resolvedNarrationColor = /^#[0-9a-fA-F]{6}$/.test(configuredNarrationColor)
+    ? configuredNarrationColor
+    : "#CCC7C7";
 
   // Chat UI theme (dark, novel-focused). 다른 화면(작업실 등) 테마는 추후 분리 가능.
   // (성능) 렌더마다 객체가 새로 생성되면 하위 콜백/컴포넌트가 매번 새 타입으로 인식될 수 있으므로 고정한다.
@@ -1772,14 +1776,13 @@ const loadOlder = useCallback(async () => {
     accent: "#a78bfa",
     iconBg: "rgba(255,255,255,0.06)",
     iconBorder: "rgba(255,255,255,0.14)",
-    // 기본 지문 색상(요청): rgb(204,199,199)
-    // (헌법) 소설 지문은 항상 흰색 고정 (회색 금지)
-    narration: "#ffffff",
+    // 채팅별 지문 색상 설정을 사용하고, 값이 없으면 기본 회색으로 폴백한다.
+    narration: resolvedNarrationColor,
     speech: "#e5e7eb",
     thought: "#c7d2fe",
     name: "#a78bfa",
     }),
-    []
+    [resolvedNarrationColor]
   );
 
   const renderInline = useCallback(
@@ -2387,8 +2390,8 @@ const loadOlder = useCallback(async () => {
             return out.join("\n").trimEnd();
           };
 
-          // 소설 모드 UI: 지문은 항상 흰색(회색/기울임 금지)
-					const NOVEL_NARRATION = "#ffffff";
+          // 채팅 설정의 지문 색상을 실제 소설 렌더러에도 적용한다.
+					const NOVEL_NARRATION = CHAT_THEME.narration;
           const NOVEL_BASE_FONT_SIZE = Math.max(12, Math.min(24, Number(chatFontSizePx || 18)));
           const NOVEL_LINE_HEIGHT = 1.85;
 
@@ -3882,7 +3885,7 @@ return (
         const ls = String(rawUser || "").replace(/\r\n/g, "\n").split("\n");
 
         // user(내 메시지) 소설 모드 규칙
-        // - 지문(*...* / **...**) => 회색 + italic
+        // - 지문(*...* / **...**) => 채팅별 지문 색상 + italic
         // - 대사 => 흰색 (막대/박스 없음)
         const userDialogueStyle: React.CSSProperties = { color: "#ffffff", lineHeight: 1.85, fontStyle: "normal" };
 
@@ -3962,7 +3965,7 @@ return (
               if (g.kind === "blank") return <div key={j} style={{ height: 6 }} />;
               if (g.kind === "narration") {
                 return (
-                  <div key={j} style={{ color: "rgba(229,231,235,0.72)", lineHeight: 1.85, fontStyle: "italic" }}>
+                  <div key={j} style={{ color: CHAT_THEME.narration, lineHeight: 1.85, fontStyle: "italic" }}>
                     {renderInline(g.text)}
                   </div>
                 );

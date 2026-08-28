@@ -318,7 +318,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_chat_role_createdAt_desc ON mes
 
       thinkingBudget INTEGER NOT NULL DEFAULT 1024,
 
-      narrationColor TEXT NOT NULL DEFAULT '#666666',
+      narrationColor TEXT NOT NULL DEFAULT '#CCC7C7',
 
       -- 렌더링 모드: chat(기존 채팅) / novel(소설형)
       renderMode TEXT NOT NULL DEFAULT 'novel',
@@ -361,7 +361,7 @@ if (!hasColumn("chat_settings", "longMemoryPerTurnChars")) {
 }
 
 if (!hasColumn("chat_settings", "narrationColor")) {
-    db.exec(`ALTER TABLE chat_settings ADD COLUMN narrationColor TEXT NOT NULL DEFAULT '#666666'`);
+    db.exec(`ALTER TABLE chat_settings ADD COLUMN narrationColor TEXT NOT NULL DEFAULT '#CCC7C7'`);
   }
 
   // chat_settings: renderMode (채팅/소설 렌더링 모드)
