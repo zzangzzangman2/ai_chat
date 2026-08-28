@@ -4606,6 +4606,7 @@ if (!TRANSPORT_STREAMING) {
           if (
             shortContinue.replaced ||
             postGenerationTextChanged ||
+            streamNovelMarkers.changed ||
             streamStatusContinuity.changed ||
             streamMarkerBalance.repaired
           ) {

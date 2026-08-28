@@ -33,6 +33,7 @@ test("global prompt preserves scene membership and closes incapacity loopholes",
   assert.doesNotMatch(guide, /나머지\s*인물은\s*물러난\s*상태/u);
   assert.match(guide, /기절·혼절·의식 상실.*새로 만들지 않는다/u);
   assert.match(guide, /현재 장면의 인물 구성은 정리 대상이 아니라 지속되는 상태/u);
+  assert.match(guide, /열린 마커를 빈 줄 너머 다음 문단까지 이어가지 않는다/u);
 });
 
 test("route no longer injects automatic character-retirement instructions", () => {

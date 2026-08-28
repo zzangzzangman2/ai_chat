@@ -3106,6 +3106,15 @@ const normalizeNovelLine = (lineRaw: string) => {
 								const body = inner.replace(/^[“”‘’]/, '"').replace(/[“”‘’]$/, '"');
 								return { kind: "dialogue" as const, text: cleanDialogueText(body) };
 							}
+							const orphanDialogueClose =
+								!["\"", "“", "”", "＂"].some((quote) => innerNoWs.startsWith(quote)) &&
+								(innerNoWs.match(/["“”＂]/g) || []).length === 1 &&
+								/["”＂]$/.test(innerNoWs);
+							if (orphanDialogueClose) {
+								const close = innerNoWs.slice(-1);
+								const open = close === "”" ? "“" : close === "＂" ? "＂" : '"';
+								return { kind: "dialogue" as const, text: cleanDialogueText(`${open}${innerNoWs}`) };
+							}
 							return { kind: "narration" as const, text: inner };
 						}
 
@@ -3131,7 +3140,16 @@ const normalizeNovelLine = (lineRaw: string) => {
 							const hasQuote = rest.startsWith('"') || rest.startsWith("“") || rest.startsWith("”");
 							if (hasQuote) return { kind: "dialogue" as const, text: cleanDialogueText(rawProbe) };
 						}
-							const rawEnd = rawProbe.trimEnd();
+						const rawEnd = rawProbe.trimEnd();
+						const orphanDialogueClose =
+							!["\"", "“", "”", "＂"].some((quote) => rawProbe.startsWith(quote)) &&
+							(rawEnd.match(/["“”＂]/g) || []).length === 1 &&
+							/["”＂]$/.test(rawEnd);
+						if (orphanDialogueClose) {
+							const close = rawEnd.slice(-1);
+							const open = close === "”" ? "“" : close === "＂" ? "＂" : '"';
+							return { kind: "dialogue" as const, text: cleanDialogueText(`${open}${rawEnd}`) };
+						}
 							const isDialogue = introStrictQuotes
 								? (() => {
 										// 첫(인트로) 메시지는 '쌍따옴표로 감싼 문장만' 대사로 인정한다.
@@ -3642,14 +3660,13 @@ const normalizeNovelLine = (lineRaw: string) => {
 													const buf: string[] = [first];
 													i++;
 													let closed = false;
-													while (i < ls.length) {
-														const r = String(ls[i] ?? "").trimEnd();
-														if (!r.trim()) {
-															// 빈 줄을 만났는데 아직 닫히지 않았다면, 스트리밍 중(혹은 모델 실수)로 보고 지문을 계속 이어간다.
-															buf.push("");
-															i++;
-															continue;
-														}
+							while (i < ls.length) {
+								const r = String(ls[i] ?? "").trimEnd();
+								if (!r.trim()) {
+									// 빈 줄은 문단 경계다. 닫는 *가 누락돼도 다음 대사/지문까지
+									// 같은 지문 색으로 삼키지 않고 현재 문단에서 종료한다.
+									break;
+								}
 														const rTrim = normalizeStarVariants(r.trim());
 														if (rTrim.endsWith("*") && !rTrim.endsWith("**") && rTrim.length >= 2) {
 															// 마지막 줄의 종료 '*' 제거

@@ -27,12 +27,107 @@ function isNovelImageParagraph(value: string) {
   );
 }
 
+function dialogueCloseFor(open: string) {
+  if (open === "“" || open === "”") return "”";
+  return open === "＂" ? "＂" : '"';
+}
+
+function openingForOrphanClose(close: string) {
+  if (close === "”") return "“";
+  return close === "＂" ? "＂" : '"';
+}
+
+function quoteGlyphs(value: string) {
+  return value.match(/["“”＂]/gu) || [];
+}
+
+function normalizeNovelBodyParagraph(part: string) {
+  if (!part.trim()) return part;
+  const leading = part.match(/^\s*/u)?.[0] || "";
+  // Preserve structural newlines but never keep horizontal whitespace before
+  // a blank paragraph boundary; it can create visible indentation and makes
+  // otherwise identical normalized paragraphs non-idempotent.
+  const trailing = (part.match(/\s*$/u)?.[0] || "").replace(/[^\r\n]/gu, "");
+  const trimmed = part.trim();
+  if (trimmed.startsWith("```") || isNovelImageParagraph(trimmed)) return part;
+
+  // A model sometimes emits *spoken words."* — a narration wrapper with only
+  // an orphan closing quote. That is a dialogue paragraph whose opening quote
+  // was lost, not narration.
+  if (trimmed.startsWith("*") && !trimmed.startsWith("**")) {
+    // A valid narration paragraph may have acquired one stray quote after its
+    // closing star. Drop that quote instead of turning the narration into
+    // dialogue (for example: *그가 서류를 내려놓았다.*").
+    const closedNarrationWithStrayQuote = trimmed.match(/^\*([\s\S]*?)\*["”＂]+$/u);
+    if (closedNarrationWithStrayQuote) {
+      const content = String(closedNarrationWithStrayQuote[1] || "")
+        .replace(/\*+/gu, "")
+        .trim();
+      return `${leading}*${content}*${trailing}`;
+    }
+
+    let inner = trimmed.slice(1).replace(/\*+\s*$/u, "").trim();
+    if (/^["“”＂]/u.test(inner) && /["”＂]$/u.test(inner)) {
+      const open = inner[0];
+      const close = dialogueCloseFor(open);
+      const content = inner.slice(1).replace(/["”＂]+$/u, "").trim();
+      return `${leading}${open}${content}${close}${trailing}`;
+    }
+    const quotes = quoteGlyphs(inner);
+    const orphanClose = inner.match(/(["”＂])\s*$/u)?.[1] || "";
+    if (orphanClose && quotes.length === 1) {
+      const content = inner
+        .replace(/["”＂]+\s*$/u, "")
+        .replace(/\*+/gu, "")
+        .trimEnd();
+      return `${leading}${openingForOrphanClose(orphanClose)}${content}${orphanClose}${trailing}`;
+    }
+    // Nested or early-closing star fragments cannot carry role state inside a
+    // paragraph. The whole paragraph is narration, so retain one outer pair.
+    inner = inner.replace(/\*+/gu, "").trim();
+    return `${leading}*${inner}*${trailing}`;
+  }
+
+  // Dialogue markers are paragraph-scoped. Close a missing quote at this
+  // paragraph boundary and collapse duplicate closing quotes locally.
+  const dialogue = trimmed.match(/^((?:[^"“”＂\n]{1,50}\|\s*)?)(["“”＂])([\s\S]*)$/u);
+  if (dialogue) {
+    const prefix = dialogue[1] || "";
+    const open = dialogue[2] || '"';
+    const close = dialogueCloseFor(open);
+    const content = String(dialogue[3] || "")
+      .replace(/\*+\s*$/u, "")
+      .replace(/["”＂]+\s*$/u, "")
+      .trim();
+    return `${leading}${prefix}${open}${content}${close}${trailing}`;
+  }
+
+  // A standalone paragraph with exactly one closing quote lost its opener.
+  // Repairing it here prevents the renderer from treating spoken words as
+  // white narration merely because the first character went missing.
+  const quotes = quoteGlyphs(trimmed);
+  const orphanClose = trimmed.match(/(["”＂])\s*$/u)?.[1] || "";
+  if (orphanClose && quotes.length === 1) {
+    const content = trimmed.replace(/["”＂]+\s*$/u, "").trimEnd();
+    return `${leading}${openingForOrphanClose(orphanClose)}${content}${orphanClose}${trailing}`;
+  }
+
+  return `${leading}*${trimmed}*${trailing}`;
+}
+
 // Streaming responses are shown append-only while tokens arrive, so the strict
 // novel formatter cannot safely rewrite them mid-stream. Normalize only the
 // completed body and leave the trailing STATUS/INFO fence byte-for-byte intact.
 export function normalizeNovelParagraphMarkers(value: unknown) {
-  const text = String(value || "").replace(/\r\n/g, "\n");
-  if (!text.trim()) return { text, changed: false };
+  const original = String(value || "").replace(/\r\n/g, "\n");
+  if (!original.trim()) return { text: original, changed: false };
+  // Older/provider output can glue the trailing metadata fence directly to a
+  // completed dialogue. Split it before role normalization so the status panel
+  // is never swallowed into dialogue or given a synthetic closing quote.
+  const text = original.replace(
+    /([^\n])```(?=(?:STATUS|INFO|STREAM|TEXT|상태))/giu,
+    "$1\n\n```"
+  );
 
   const splitAt = trailingFenceStart(text);
   const body = text.slice(0, splitAt);
@@ -41,22 +136,11 @@ export function normalizeNovelParagraphMarkers(value: unknown) {
     .split(/(\n{2,})/)
     .map((part) => {
       if (!part.trim() || /^\n{2,}$/.test(part)) return part;
-      const leading = part.match(/^\s*/)?.[0] || "";
-      const trailing = part.match(/\s*$/)?.[0] || "";
-      const trimmed = part.trim();
-      if (
-        trimmed.startsWith("*") ||
-        /^(?:[^"“\n]{1,50}\|\s*)?["“]/u.test(trimmed) ||
-        trimmed.startsWith("```") ||
-        isNovelImageParagraph(trimmed)
-      ) {
-        return part;
-      }
-      return `${leading}*${trimmed}*${trailing}`;
+      return normalizeNovelBodyParagraph(part);
     })
     .join("");
   const normalized = normalizedBody + tail;
-  return { text: normalized, changed: normalized !== text };
+  return { text: normalized, changed: normalized !== original };
 }
 
 export function repairUnbalancedNovelBodyMarkers(value: unknown): NovelOutputBalanceResult {
