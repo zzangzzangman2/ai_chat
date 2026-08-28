@@ -21,16 +21,58 @@ Function("exports", "module", "require", js)(
   continuationModule,
   (id) => (id === "./textPolicy" ? textPolicyModule.exports : require(id))
 );
-const { buildManualContinuationPrompt, mergeManualContinuationBase } = continuationModule.exports;
+const {
+  buildManualContinuationPrompt,
+  mergeManualContinuationBase,
+  selectManualContinuationAnchor,
+} = continuationModule.exports;
 
 test("manual continuation contains only the selected assistant tail", () => {
   const tail = '*재판장이 판결문을 내려다보았다.*\n\n"주문을 선고합니다."';
   const prompt = buildManualContinuationPrompt({ continueTail: tail, targetChars: 1200 });
 
-  assert.match(prompt, /\[직전 어시스턴트 출력 끝부분\]/);
+  assert.match(prompt, /\[이어쓰기 기준점 — 이미 출력 완료된 마지막 문단들\]/);
   assert.match(prompt, /주문을 선고합니다/);
   assert.doesNotMatch(prompt, /\[최근 대화\]|CURRENT USER|PREVIOUS USER/);
   assert.doesNotMatch(prompt, /사용자 입력 끝부분/);
+});
+
+test("manual continuation anchor uses the actual endpoint instead of an older unfinished beat", () => {
+  const base = [
+    '*재판장이 판결문을 내려다보았다.*',
+    '',
+    '"주문."',
+    '',
+    '*방청석에서 이미 첫 반응이 터져 나왔다. 이수진은 박지아를 끌어안고 울었고 박도훈은 얼굴을 감쌌다.*',
+    '',
+    '*박지훈은 눈가를 닦고 굳게 고개를 들었다.*',
+    '',
+    '```STATUS',
+    '장소: 법정',
+    '```',
+  ].join('\n');
+  const anchor = selectManualContinuationAnchor(base, { maxChars: 1200, maxParagraphs: 2 });
+  const prompt = buildManualContinuationPrompt({ continueTail: anchor, targetChars: 1200 });
+
+  assert.doesNotMatch(anchor, /주문|판결문을 내려다/);
+  assert.match(anchor, /방청석에서 이미 첫 반응/);
+  assert.match(anchor, /박지훈은 눈가를 닦고/);
+  assert.doesNotMatch(anchor, /STATUS|장소: 법정/);
+  assert.match(prompt, /유일한 시간적 끝점/);
+  assert.match(prompt, /같은 인물의 같은 반응/);
+});
+
+test("manual continuation anchor also handles novel lines without blank separators", () => {
+  const base = [
+    '"주문."',
+    '*첫 번째 반응은 이미 끝났다.*',
+    '*두 번째 반응도 이미 끝났다.*',
+  ].join('\n');
+  const anchor = selectManualContinuationAnchor(base, { maxParagraphs: 2 });
+
+  assert.doesNotMatch(anchor, /주문/);
+  assert.match(anchor, /첫 번째 반응/);
+  assert.match(anchor, /두 번째 반응/);
 });
 
 test("continuation removes repeated tail and keeps one status panel at the end", () => {

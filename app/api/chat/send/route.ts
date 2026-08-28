@@ -166,7 +166,11 @@ import { buildModelCallOpts, runBufferedOne, runOptionalShortContinue, runStream
 import { makeContinueUserPrompt, mergeStreamUsage } from "./_server/streamHelpers";
 import { buildRecentExpressionAvoidanceBlock } from "./_server/repetitionGuard";
 import { buildWorldDirectorBlock } from "./_server/worldDirector";
-import { buildManualContinuationPrompt, mergeManualContinuationBase } from "./_server/continuation";
+import {
+  buildManualContinuationPrompt,
+  mergeManualContinuationBase,
+  selectManualContinuationAnchor,
+} from "./_server/continuation";
 import { applyStreamFinalizeUsageStats, finalizeStreamResult } from "./_server/streamFinal";
 import { consumeMainStreamDeltas } from "./_server/streamLoop";
 import {
@@ -3541,13 +3545,29 @@ const systemRaw = (cacheFriendlyLayout
       }
     }
 
-    const continueTail = continueMode
+    const continueBody = continueMode
       ? stripUrlsAndMediaMarkdown(
           splitTrailingFenceBlockAtEnd(
             stripStatusErrorFences(String(continueBaseText || ""))
           ).body
-        ).slice(-4000)
+        )
       : "";
+    const continueTail = continueMode
+      ? selectManualContinuationAnchor(continueBody, {
+          maxChars: 1200,
+          maxParagraphs: 2,
+        })
+      : "";
+    if (continueMode) {
+      dbg({
+        tag: "send.continuation.anchor",
+        chatId: cid,
+        reqId,
+        baseChars: strlen(continueBody),
+        anchorChars: strlen(continueTail),
+        anchorParagraphs: continueTail ? continueTail.split(/\r?\n\s*\r?\n+/u).length : 0,
+      });
+    }
 
     const oneShotBodyTargetChars = Math.max(200, Math.min(bodyMaxChars, targetChars));
     const oneShotBodyFloorChars =
@@ -5784,10 +5804,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       },
     });
 
-    if (continueMode && continueBaseText) {
-      assistantText = mergeManualContinuationBase(continueBaseText, assistantText);
-    }
-
+    // In manual continuation mode the generated delta must be checked on its
+    // own. Merging first made every Ctrl+G request re-run the guards over the
+    // already displayed answer, so old prose could disappear or change.
     const factGuardRecoverySource = assistantText;
     const epistemicOutputChecked = sanitizeGeneratedFacts(assistantText);
     const authorityClaimOutputChecked = sanitizeAuthorityClaims(
@@ -5895,6 +5914,9 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     if (novelMarkers.changed) {
       assistantText = novelMarkers.text;
       debugReasons.push("format:NORMALIZE_NOVEL_PARAGRAPHS");
+    }
+    if (continueMode && continueBaseText) {
+      assistantText = mergeManualContinuationBase(continueBaseText, assistantText);
     }
     const statusContinuity = mergeStatusPanelContinuity({
       currentText: assistantText,
