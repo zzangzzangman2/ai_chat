@@ -5519,19 +5519,11 @@ setMessages((prev) =>
         personaInfo: String(settings?.personaInfo || selectedProfile?.personaInfo || "").trim(),
       };
 
-      const tailForGuide = cleanTextForSuggest(baseText).slice(-900);
-      const continueInstruction = [
-        "직전 답변의 마지막 문장 다음부터 그대로 이어서 작성해줘.",
-        "이미 작성한 문장/표현은 반복하지 말고, 이어지는 본문만 출력해.",
-        "메타/INFO/STATUS/코드블록은 출력하지 마.",
-        "",
-        "[직전 출력 끝부분]",
-        tailForGuide,
-      ].join("\n");
-
       const payload = {
         chatId,
-        userText: continueInstruction,
+        // The server reads the selected assistant message from the database.
+        // Do not send its tail again as a synthetic user turn.
+        userText: "[이어쓰기]",
         personaOverride,
         runtime: {
           model: settings?.model,
