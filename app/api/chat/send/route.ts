@@ -88,6 +88,7 @@ import {
   enforceCommunicationAbilities,
   formatCommunicationAbilityBlock,
 } from "@/lib/communication_ability_guard";
+import { usesEventOnlyMetaPolicy } from "@/lib/meta_panel_policy";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -2686,6 +2687,7 @@ ${body}`.trim();
 	    // - formatGuide 자체에 STATUS/INFO 단어가 포함될 수 있으므로, preset/persona/note/userNote/lore 쪽만 본다.
 	    // - 실제 제작 프리셋에선 ```INFO, "Info" 헤더, 📍/🕒 같은 표기가 쓰이기도 해서 함께 탐지한다.
 	    const _statusNeedHaystack = [presetBlock, personaBlock, noteBlock, relationshipConsistencyBlock, String(settings.userNote || ""), loreBlock].filter(Boolean).join("\n");
+    const eventOnlyMetaPolicy = usesEventOnlyMetaPolicy(_statusNeedHaystack);
     // (정확 플래그) '제작자 상태창 요구: YES' 같은 명시 플래그는 무조건 STATUS를 강제한다.
     const authorWantsStatusExplicit =
       /제작자\s*상태\s*창\s*요구\s*:\s*YES/i.test(_statusNeedHaystack) ||
@@ -2815,11 +2817,12 @@ const statusTemplateOpenFenceLenGuess = (() => {
 
 
     const authorWantsStatus =
+      !eventOnlyMetaPolicy && (
       authorWantsStatusExplicit ||
       /상태\s*창|캐릭터\s*상태|\[\s*시간\s*\/\s*장소\s*\]|```\s*(?:STATUS|INFO)\b|Info\s*\n\s*📍|📍\s*위치|🕒\s*시간|위치\s*\|\s*시간|#\s*상태\s*창\s*=|항상\s*응답\s*끝.*상태\s*창/i.test(
         _statusNeedHaystack
       ) ||
-      hasStatusTemplateFence;
+      hasStatusTemplateFence);
 
     // (요구사항)
     // 슬라이더 체감 길이(글자수)를 기준으로 char/token 예산을 계산한다.
@@ -2969,6 +2972,10 @@ const statusTemplateOpenFenceLenGuess = (() => {
   // (Some presets keep an *open* ```STATUS template without a closing fence, so metaLabelHint may come from elsewhere.)
   if (!allowedMetaLabels.includes("STATUS")) allowedMetaLabels.push("STATUS");
   if (!allowedMetaLabels.includes("INFO")) allowedMetaLabels.push("INFO");
+  if (eventOnlyMetaPolicy) {
+    if (!allowedMetaLabels.includes("QUEST")) allowedMetaLabels.push("QUEST");
+    if (!allowedMetaLabels.includes("ABILITY")) allowedMetaLabels.push("ABILITY");
+  }
 const previousStatusPanelSnapshot = buildPreviousStatusPanelSnapshot(all, 20);
 const _compactMetaFenceTemplateHint = (raw: string) => {
 	const s = String(raw || "").trim();
@@ -2995,7 +3002,7 @@ const _compactMetaFenceTemplateHint = (raw: string) => {
 
 const metaFenceTemplateHintRaw = String(metaFenceTemplatePick?.block || "").trim();
 					const metaFenceTemplateHint = _compactMetaFenceTemplateHint(metaFenceTemplateHintRaw);
-					const authorWantsMetaPanel = Boolean(metaFenceTemplateHint);
+					const authorWantsMetaPanel = !eventOnlyMetaPolicy && Boolean(metaFenceTemplateHint);
 // If the author wants a status window, reserve meta tail budget even when no closed template was found.
 // This prevents the server from hard-capping a model-generated ```STATUS fence to ~80 chars.
 const metaRequired = !continueMode && (authorWantsMetaPanel || authorWantsStatus) ? "YES" : "NO";

@@ -47,6 +47,7 @@ import RelationshipGraphPanel from "@/app/components/RelationshipGraphPanel";
 import { CHAT_MODEL_IDS, type ChatModelId, coerceChatModelId } from "@/lib/models";
 import { mergeStreamFinalContent } from "@/app/components/chat/ChatArea/streamMerge";
 import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
+import { supportsAbilityViewQuickCommand } from "@/lib/meta_panel_policy";
 
 const LOCAL_POINTS_DISABLED = true;
 
@@ -1639,6 +1640,10 @@ const loadOlder = useCallback(async () => {
     if (!presetId) return null;
     return presets.find((p) => p.id === presetId) || null;
   }, [presetId, presets]);
+  const showAbilityViewQuickCommand = useMemo(
+    () => supportsAbilityViewQuickCommand(selectedPreset?.systemPrompt),
+    [selectedPreset?.systemPrompt]
+  );
   const effectiveChatTitle = useMemo(() => {
     const t = (chatTitle || "").trim();
     if (t) return t;
@@ -7746,6 +7751,30 @@ boxSizing: "border-box",
 	              >
 	                <Icon name="paperPlane" size={16} />
 	              </button>
+	            )}
+
+	            {showAbilityViewQuickCommand && (
+	              <div style={{ display: "flex", gap: 8, marginBottom: 8, paddingRight: 44 }}>
+	                <button
+	                  type="button"
+	                  disabled={busy || !!editingAssistantId || !chatId}
+	                  onClick={() => sendRef.current("능력치 보기")}
+	                  style={{
+	                    padding: "6px 11px",
+	                    borderRadius: 999,
+	                    border: "1px solid rgba(96,165,250,0.28)",
+	                    background: "rgba(37,99,235,0.16)",
+	                    color: "#bfdbfe",
+	                    cursor: busy || editingAssistantId || !chatId ? "not-allowed" : "pointer",
+	                    fontSize: 12,
+	                    fontWeight: 800,
+	                    opacity: busy || editingAssistantId || !chatId ? 0.45 : 1,
+	                  }}
+	                  title="서사를 진행하지 않고 현재 능력치만 확인합니다."
+	                >
+	                  능력치 보기
+	                </button>
+	              </div>
 	            )}
 
 	            {(suggestions.length > 0 || suggestLoading) && (

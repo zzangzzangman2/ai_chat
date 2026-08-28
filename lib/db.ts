@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { buildMemorySearchIndex, type MemorySearchIndex } from "./memory_search_index";
+import { applyMedicalQuestPresetUiMigration } from "./medical_quest_preset_migration";
 
 const dataDir = path.join(process.cwd(), "data");
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -1153,6 +1154,15 @@ if (!hasColumn("chat_settings", "narrationColor")) {
     }
   } catch {
     // ignore
+  }
+
+  try {
+    const result = applyMedicalQuestPresetUiMigration(db);
+    if (result.applied) {
+      console.log("[db] medical quest UI policy migrated", result);
+    }
+  } catch (error) {
+    console.warn("[db] medical quest UI policy migration skipped", error);
   }
 }
 
