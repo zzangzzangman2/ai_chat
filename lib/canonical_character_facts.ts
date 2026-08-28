@@ -15,6 +15,7 @@ export const CANONICAL_FACT_KEYS = [
   "background",
   "identity",
   "speech_style",
+  "communication",
   "residence",
 ] as const;
 
@@ -306,6 +307,7 @@ const FACT_LABELS: Record<CanonicalFactKey, string> = {
   background: "배경",
   identity: "정체",
   speech_style: "말투",
+  communication: "의사소통",
   residence: "거주지",
 };
 

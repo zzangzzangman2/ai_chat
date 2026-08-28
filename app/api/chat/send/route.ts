@@ -83,6 +83,11 @@ import {
   buildPreviousStatusPanelSnapshot,
   mergeStatusPanelContinuity,
 } from "@/lib/status_panel_continuity";
+import {
+  buildCommunicationConstraints,
+  enforceCommunicationAbilities,
+  formatCommunicationAbilityBlock,
+} from "@/lib/communication_ability_guard";
 
 const LOCAL_POINTS_DISABLED = true;
 // ---- 비용 추정(간단 버전) ----
@@ -2131,6 +2136,13 @@ ${body}`.trim();
         error: String((error as { message?: unknown })?.message || error),
       });
     }
+    const communicationConstraints = buildCommunicationConstraints({
+      identities: continuityLedgerIdentities,
+      facts: canonicalCharacterFacts,
+    });
+    const communicationAbilityBlock = formatCommunicationAbilityBlock(
+      communicationConstraints
+    );
     const physicalFactIdentities = buildPhysicalFactIdentities({
       persona: authoritativePersonaFacts,
       facts: canonicalCharacterFacts,
@@ -2361,6 +2373,15 @@ ${body}`.trim();
         text,
         identities: physicalFactIdentities,
       });
+    const sanitizeCommunicationAbilities = (
+      text: unknown,
+      contextText: unknown = ""
+    ) =>
+      enforceCommunicationAbilities({
+        text,
+        contextText,
+        constraints: communicationConstraints,
+      });
     const recoverAfterOverfilter = (text: unknown) => {
       const original = String(text || "");
       const epistemic = sanitizeGeneratedFacts(text);
@@ -2374,6 +2395,7 @@ ${body}`.trim();
       const vitalStatus = sanitizeVitalStatus(legalStatus.text);
       const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
       const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
+      const communication = sanitizeCommunicationAbilities(physicalOwnership.text);
       if (
         epistemic.redactedSegments > 0 ||
         authorityClaims.removed > 0 ||
@@ -2382,18 +2404,19 @@ ${body}`.trim();
         relationshipClaims.removed > 0 ||
         relationshipClaims.rewritten > 0 ||
         physicalOwnership.removed > 0 ||
-        physicalOwnership.qualified > 0
+        physicalOwnership.qualified > 0 ||
+        communication.rewritten > 0
       ) {
-        return String(physicalOwnership.text || "").trim()
-          ? physicalOwnership.text
+        return String(communication.text || "").trim()
+          ? communication.text
           : "*확인된 사실만 다시 추려, 근거 없는 내용은 단정하지 않았다.*";
       }
       // The guards may remove unsupported local passages, but a false-positive
       // match must never erase an otherwise completed provider response. Keep
       // the single-call draft only when the combined filters would return no
       // visible text at all; partial redactions remain fully enforced.
-      return String(physicalOwnership.text || "").trim()
-        ? physicalOwnership.text
+      return String(communication.text || "").trim()
+        ? communication.text
         : original;
     };
     // Transient presence belongs to the recent raw scene, not long memory or
@@ -2517,7 +2540,10 @@ ${body}`.trim();
     const historyPhysicalOwnershipView = sanitizePhysicalOwnership(
       historyRelationshipClaimView.text
     );
-    const historySummaryForPrompt = historyPhysicalOwnershipView.text;
+    const historyCommunicationView = sanitizeCommunicationAbilities(
+      historyPhysicalOwnershipView.text
+    );
+    const historySummaryForPrompt = historyCommunicationView.text;
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -2576,6 +2602,8 @@ ${body}`.trim();
       alwaysInjectRoster,
       identityCanonChars: strlen(identityCanonBlock),
       canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
+      communicationConstraintCount: communicationConstraints.length,
+      communicationAbilityChars: strlen(communicationAbilityBlock),
       activeCharacterFocus: activeCharacterFocus.names,
       activeCharacterFocusReason: activeCharacterFocus.reason,
       spatialCanonChars: strlen(spatialCanon.block),
@@ -3126,6 +3154,9 @@ const systemRaw = (cacheFriendlyLayout
       canonicalCharacterFactsBlock
         ? sanitizePromptCached(canonicalCharacterFactsBlock)
         : "",
+      communicationAbilityBlock
+        ? sanitizePromptCached(communicationAbilityBlock)
+        : "",
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -3329,6 +3360,10 @@ const systemRaw = (cacheFriendlyLayout
 	          canonicalCharacterFactsBlock
 	            ? sanitizePromptCached(canonicalCharacterFactsBlock)
 	            : "",
+	          communicationAbilityBlock ? `` : "",
+	          communicationAbilityBlock
+	            ? sanitizePromptCached(communicationAbilityBlock)
+	            : "",
 	          spatialCanon.block ? `` : "",
 	          spatialCanon.block ? sanitizePromptCached(spatialCanon.block) : "",
 	          ``,
@@ -3406,6 +3441,7 @@ const systemRaw = (cacheFriendlyLayout
     let relationshipClaimTailRewritten = 0;
     let physicalOwnershipTailQualified = 0;
     let physicalOwnershipTailRedactions = 0;
+    let communicationTailRewritten = 0;
     const promptHistorySource = continueMode
       ? selectMessagesBeforeContinuationTurn(all, continueAid)
       : selectMessagesBeforeCurrentUser(all, userMsg.id);
@@ -3450,7 +3486,9 @@ const systemRaw = (cacheFriendlyLayout
       const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
       physicalOwnershipTailQualified += physicalOwnership.qualified;
       physicalOwnershipTailRedactions += physicalOwnership.removed;
-      return { ...message, content: physicalOwnership.text };
+      const communication = sanitizeCommunicationAbilities(physicalOwnership.text);
+      communicationTailRewritten += communication.rewritten;
+      return { ...message, content: communication.text };
     });
     const contextRaw = formatStoryTurnsForMode(
       epistemicTail,
@@ -3475,7 +3513,9 @@ const systemRaw = (cacheFriendlyLayout
       historyPhysicalOwnershipView.qualified ||
       historyPhysicalOwnershipView.removed ||
       physicalOwnershipTailQualified ||
-      physicalOwnershipTailRedactions
+      physicalOwnershipTailRedactions ||
+      historyCommunicationView.rewritten ||
+      communicationTailRewritten
     ) {
       dbg({
         tag: "send.epistemic-firewall",
@@ -3498,6 +3538,8 @@ const systemRaw = (cacheFriendlyLayout
         physicalOwnershipSummaryRedactions: historyPhysicalOwnershipView.removed,
         physicalOwnershipTailQualified,
         physicalOwnershipTailRedactions,
+        communicationSummaryRewritten: historyCommunicationView.rewritten,
+        communicationTailRewritten,
         recentLegalStatusRedactions: legalStatusTailRedactions,
       });
     }
@@ -3965,6 +4007,8 @@ let cancelStreamWork: (() => void) | null = null;
         let streamPhysicalOwnershipQualified = 0;
         let streamPhysicalOwnershipRedactions = 0;
         let streamScenePresenceRedactions = 0;
+        let streamCommunicationRewritten = 0;
+        let streamCommunicationContext = "";
         const guardedTextStream = createGuardedTextStream((text) => {
           const epistemic = sanitizeGeneratedFacts(text);
           const authorityClaims = sanitizeAuthorityClaims(epistemic.text);
@@ -3987,6 +4031,11 @@ let cancelStreamWork: (() => void) | null = null;
             presentCharacters: currentScenePresence,
             excludedCharacters: currentSceneExclusions,
           });
+          const communication = sanitizeCommunicationAbilities(
+            scenePresence.text,
+            streamCommunicationContext
+          );
+          streamCommunicationContext = `${streamCommunicationContext}\n${text}`.slice(-1600);
           streamEpistemicRedactions += epistemic.redactedSegments;
           streamAuthorityClaimRedactions += authorityClaims.removed;
           streamLegalStatusRedactions += legalStatus.removed;
@@ -3996,7 +4045,8 @@ let cancelStreamWork: (() => void) | null = null;
           streamPhysicalOwnershipQualified += physicalOwnership.qualified;
           streamPhysicalOwnershipRedactions += physicalOwnership.removed;
           streamScenePresenceRedactions += scenePresence.removed;
-          return scenePresence.text;
+          streamCommunicationRewritten += communication.rewritten;
+          return communication.text;
         });
         const safeEnqueue = (obj: any) => {
           if (obj?.type !== "delta" || typeof obj?.text !== "string") {
@@ -4511,6 +4561,7 @@ if (!TRANSPORT_STREAMING) {
               presentCharacters: currentScenePresence,
               excludedCharacters: currentSceneExclusions,
             });
+            const communication = sanitizeCommunicationAbilities(scenePresence.text);
             streamEpistemicRedactions += epistemic.redactedSegments;
             streamAuthorityClaimRedactions += authorityClaims.removed;
             streamLegalStatusRedactions += legalStatus.removed;
@@ -4520,7 +4571,8 @@ if (!TRANSPORT_STREAMING) {
             streamPhysicalOwnershipQualified += physicalOwnership.qualified;
             streamPhysicalOwnershipRedactions += physicalOwnership.removed;
             streamScenePresenceRedactions += scenePresence.removed;
-            assistantText = scenePresence.text;
+            streamCommunicationRewritten += communication.rewritten;
+            assistantText = communication.text;
           }
           if (!assistantText.trim()) {
             const recovered = recoverAfterOverfilter(factGuardRecoverySource).trim();
@@ -4541,7 +4593,8 @@ if (!TRANSPORT_STREAMING) {
             streamRelationshipClaimRewritten ||
             streamPhysicalOwnershipQualified ||
             streamPhysicalOwnershipRedactions ||
-            streamScenePresenceRedactions
+            streamScenePresenceRedactions ||
+            streamCommunicationRewritten
           ) {
             dbg({
               tag: "send.stream.output-fact-guard",
@@ -4556,6 +4609,7 @@ if (!TRANSPORT_STREAMING) {
               physicalOwnershipQualified: streamPhysicalOwnershipQualified,
               physicalOwnershipRedactions: streamPhysicalOwnershipRedactions,
               scenePresenceRedactions: streamScenePresenceRedactions,
+              communicationRewritten: streamCommunicationRewritten,
             });
           }
 
@@ -5832,7 +5886,10 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       presentCharacters: currentScenePresence,
       excludedCharacters: currentSceneExclusions,
     });
-    assistantText = scenePresenceOutputChecked.text;
+    const communicationOutputChecked = sanitizeCommunicationAbilities(
+      scenePresenceOutputChecked.text
+    );
+    assistantText = communicationOutputChecked.text;
     if (
       epistemicOutputChecked.redactedSegments ||
       authorityClaimOutputChecked.removed ||
@@ -5842,7 +5899,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       relationshipClaimOutputChecked.rewritten ||
       physicalOwnershipOutputChecked.qualified ||
       physicalOwnershipOutputChecked.removed ||
-      scenePresenceOutputChecked.removed
+      scenePresenceOutputChecked.removed ||
+      communicationOutputChecked.rewritten
     ) {
       if (epistemicOutputChecked.redactedSegments) {
         debugReasons.push(`guard:EPISTEMIC(${epistemicOutputChecked.redactedSegments})`);
@@ -5883,6 +5941,11 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           `guard:SCENE_PRESENCE(${scenePresenceOutputChecked.kinds.join("+") || "unknown"}:${scenePresenceOutputChecked.removed})`
         );
       }
+      if (communicationOutputChecked.rewritten) {
+        debugReasons.push(
+          `guard:COMMUNICATION_ABILITY(${communicationOutputChecked.rewritten})`
+        );
+      }
       dbg({
         tag: "send.output-fact-guard",
         chatId: cid,
@@ -5903,6 +5966,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
         physicalOwnershipSubjects: physicalOwnershipOutputChecked.owners,
         scenePresenceRedactions: scenePresenceOutputChecked.removed,
         scenePresenceCharacters: scenePresenceOutputChecked.characterNames,
+        communicationRewritten: communicationOutputChecked.rewritten,
+        communicationCharacters: communicationOutputChecked.characterNames,
       });
     }
     if (!assistantText.trim()) {
