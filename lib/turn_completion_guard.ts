@@ -76,6 +76,19 @@ function hasUnbalancedNovelMarkers(body: string) {
   return quoteCount % 2 !== 0 || starCount % 2 !== 0;
 }
 
+function hasUnbalancedInlineCode(body: string) {
+  let count = 0;
+  const text = String(body || "");
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (text[index] === "`") count += 1;
+  }
+  return count % 2 !== 0;
+}
+
 export function assessTurnCompletion(params: {
   text: unknown;
   currentUserText?: unknown;
@@ -94,6 +107,7 @@ export function assessTurnCompletion(params: {
   if (!body) reasons.push("EMPTY_BODY");
   if (narrativeChars > 0 && minNarrativeChars - narrativeChars > 50) reasons.push("SHORT_BODY");
   if (body && hasUnbalancedNovelMarkers(body)) reasons.push("UNBALANCED_MARKER");
+  if (body && hasUnbalancedInlineCode(body)) reasons.push("UNBALANCED_INLINE_CODE");
 
   const pluralResponseRequested =
     PLURAL_ADDRESS_PATTERN.test(userText) && RESPONSE_REQUEST_PATTERN.test(userText);

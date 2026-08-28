@@ -41,6 +41,56 @@ function quoteGlyphs(value: string) {
   return value.match(/["“”＂]/gu) || [];
 }
 
+function unescapedMarkerCount(value: string, marker: string) {
+  let count = 0;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (text[index] === marker) count += 1;
+  }
+  return count;
+}
+
+function repairTrailingInlineCodeInNarration(body: string): {
+  text: string;
+  repaired: boolean;
+  added: string;
+} {
+  const trailingWhitespace = body.match(/\s*$/u)?.[0] || "";
+  const core = trailingWhitespace ? body.slice(0, -trailingWhitespace.length) : body;
+  const paragraphBoundary = core.lastIndexOf("\n\n");
+  const paragraphStart = paragraphBoundary >= 0 ? paragraphBoundary + 2 : 0;
+  const paragraph = core.slice(paragraphStart);
+  if (!paragraph.startsWith("*")) return { text: body, repaired: false, added: "" };
+
+  const hasOuterClose = paragraph.length > 1 && paragraph.endsWith("*");
+  const innerEnd = hasOuterClose ? paragraph.length - 1 : paragraph.length;
+  const inner = paragraph.slice(1, innerEnd);
+  if (unescapedMarkerCount(inner, "`") % 2 === 0) {
+    return { text: body, repaired: false, added: "" };
+  }
+
+  const openTickAt = inner.lastIndexOf("`");
+  if (openTickAt < 0) return { text: body, repaired: false, added: "" };
+  const inlineTail = inner.slice(openTickAt + 1);
+  const missingSquareClosers = Math.max(
+    0,
+    Math.min(4, unescapedMarkerCount(inlineTail, "[") - unescapedMarkerCount(inlineTail, "]"))
+  );
+  const added = `${"]".repeat(missingSquareClosers)}\``;
+  const repairedParagraph = hasOuterClose
+    ? `${paragraph.slice(0, -1)}${added}*`
+    : `${paragraph}${added}`;
+  return {
+    text: `${core.slice(0, paragraphStart)}${repairedParagraph}${trailingWhitespace}`,
+    repaired: true,
+    added,
+  };
+}
+
 function normalizeNovelBodyParagraph(part: string) {
   if (!part.trim()) return part;
   const leading = part.match(/^\s*/u)?.[0] || "";
@@ -146,8 +196,10 @@ export function normalizeNovelParagraphMarkers(value: unknown) {
 export function repairUnbalancedNovelBodyMarkers(value: unknown): NovelOutputBalanceResult {
   const text = String(value || "");
   const splitAt = trailingFenceStart(text);
-  const body = text.slice(0, splitAt);
+  const originalBody = text.slice(0, splitAt);
   const tail = text.slice(splitAt);
+  const inlineRepair = repairTrailingInlineCodeInNarration(originalBody);
+  const body = inlineRepair.text;
   let quoteOpen = false;
   let starOpen = false;
   let quoteOpenedAt = -1;
@@ -174,9 +226,12 @@ export function repairUnbalancedNovelBodyMarkers(value: unknown): NovelOutputBal
   ]
     .filter((item): item is { at: number; marker: string } => Boolean(item))
     .sort((a, b) => b.at - a.at);
-  const added = open.map((item) => item.marker).join("");
+  const markerAdded = open.map((item) => item.marker).join("");
+  const added = `${inlineRepair.added}${markerAdded}`;
   if (!added) return { text, repaired: false, added: "" };
 
-  const repairedBody = body.replace(/\s*$/, (whitespace) => `${added}${whitespace}`);
+  const repairedBody = markerAdded
+    ? body.replace(/\s*$/, (whitespace) => `${markerAdded}${whitespace}`)
+    : body;
   return { text: repairedBody + tail, repaired: true, added };
 }
