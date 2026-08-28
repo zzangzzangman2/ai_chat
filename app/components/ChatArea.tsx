@@ -1641,8 +1641,10 @@ const loadOlder = useCallback(async () => {
     return presets.find((p) => p.id === presetId) || null;
   }, [presetId, presets]);
   const showAbilityViewQuickCommand = useMemo(
-    () => supportsAbilityViewQuickCommand(selectedPreset?.systemPrompt),
-    [selectedPreset?.systemPrompt]
+    () =>
+      Number(selectedPreset?.supportsAbilityView || 0) === 1 ||
+      supportsAbilityViewQuickCommand(selectedPreset?.systemPrompt),
+    [selectedPreset?.supportsAbilityView, selectedPreset?.systemPrompt]
   );
   const effectiveChatTitle = useMemo(() => {
     const t = (chatTitle || "").trim();

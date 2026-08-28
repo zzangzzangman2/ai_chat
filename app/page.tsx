@@ -48,6 +48,7 @@ export type Preset = {
   lorebooks?: string;
   isPublic?: 0 | 1;
   isNsfw?: 0 | 1;
+  supportsAbilityView?: 0 | 1;
   createdAt?: number;
   updatedAt?: number;
 };
