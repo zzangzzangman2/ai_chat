@@ -134,6 +134,7 @@ import {
   preserveTrailingMetaFenceBlocksOutsideBudget,
   finalizeOneShotOutputWithMeta,
   buildLocalFallbackMetaFence,
+  summarizeNarrativeForMetaFallback,
   isMetaFenceLikelyIncomplete,
 } from "./_server/textPolicy";
 import { sanitizePromptCached } from "./_server/promptCache";
@@ -4871,14 +4872,11 @@ if (_localMetaFallbackEnabled) {
   try {
     const prev = extractLastMetaContextFromMessages(all, allowedMetaLabels);
     const bodyForSum = String((fin as any)?.body || assistantText || "");
-    let sum = bodyForSum
-      .replace(/```[\s\S]*?```/g, "")
-      .replace(/\s+/g, " " )
-      .trim();
-    if (sum.length > 160) sum = sum.slice(sum.length - 160);
+    const sum = summarizeNarrativeForMetaFallback(bodyForSum, 90);
 
-    // Prefer STATUS when the author explicitly wants a status window.
-    const labelHint = (authorWantsStatus ? "STATUS" : (metaLabelHint || "INFO")).trim() || "INFO";
+    // Preserve the creator's exact custom label (including Korean labels such
+    // as ```상태). STATUS is only a fallback when no template label exists.
+    const labelHint = (metaLabelHint || (authorWantsStatus ? "STATUS" : "INFO")).trim() || "INFO";
 
     const fallback = buildLocalFallbackMetaFence({
       labelHint,

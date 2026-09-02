@@ -19,11 +19,52 @@ function loadTextPolicy() {
 }
 
 const {
+  buildLocalFallbackMetaFence,
   formatStoryTurnsForMode,
   selectMessagesBeforeContinuationTurn,
   selectMessagesBeforeCurrentUser,
   selectPromptHistoryWithSummaryCoverage,
+  summarizeNarrativeForMetaFallback,
 } = loadTextPolicy();
+
+test("local meta fallback preserves a Korean creator fence and its fields", () => {
+  const template = [
+    "```상태",
+    "날짜: 2026년 3월 2일 09:15",
+    "장소: 현재 장소",
+    "빙의: 1일차",
+    "호감도: 인물명 0 | 인물명 0",
+    "```",
+  ].join("\n");
+
+  const result = buildLocalFallbackMetaFence({
+    labelHint: "상태",
+    templateHint: template,
+    context: { summaryLine: "완결된 요약입니다." },
+  });
+
+  assert.equal(result, template);
+  assert.doesNotMatch(result, /```STATUS/u);
+});
+
+test("local meta fallback keeps existing ASCII label normalization", () => {
+  const result = buildLocalFallbackMetaFence({ labelHint: "status" });
+  assert.match(result, /^```STATUS\n/u);
+});
+
+test("local meta summary uses a clean complete sentence instead of a sliced raw tail", () => {
+  const body = [
+    "*앞선 상황을 길게 설명하는 첫 번째 문장이다.*",
+    "",
+    '"원장님, 현재 인원은 모두 확인했습니다."',
+    "",
+    "*김 교감은 징계 보고서를 다시 내밀었다.*",
+  ].join("\n");
+
+  const summary = summarizeNarrativeForMetaFallback(body, 90);
+  assert.equal(summary, "김 교감은 징계 보고서를 다시 내밀었다.");
+  assert.doesNotMatch(summary, /[*"`]/u);
+});
 
 test("continuation context excludes the already answered user/assistant pair", () => {
   const messages = [
