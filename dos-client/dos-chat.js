@@ -208,7 +208,16 @@ function createInactivityWatchdog(parentSignal, timeoutMs = SEND_INACTIVITY_TIME
   };
 }
 
+let kittyKeyboardProtocolActive = false;
+
+function restoreKeyboardProtocol(output = process.stdout) {
+  if (!kittyKeyboardProtocolActive) return;
+  kittyKeyboardProtocolActive = false;
+  try { output.write("\x1b[<u"); } catch {}
+}
+
 function restoreTerminal() {
+  restoreKeyboardProtocol();
   try {
     process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}${ANSI.alternateOff}`);
   } catch {}
@@ -250,6 +259,88 @@ function requestPromptShortcut(action) {
 
 function isCtrlGShortcut(str, key) {
   return Boolean((key && key.ctrl && key.name === "g") || str === "\x07");
+}
+
+function isShiftEnterKeypress(str, key) {
+  const name = String((key && key.name) || "").toLowerCase();
+  if (key && key.shift && (name === "return" || name === "enter")) return true;
+
+  const sequence = String((key && key.sequence) || str || "");
+  // Kitty keyboard protocol: CSI 13 ; 2 [ : event ] [ ; text ] u
+  if (/^\x1b\[13;2(?::[123])?(?:;[0-9:]+)?u$/u.test(sequence)) return true;
+  // Compatibility with terminals that encode modified Enter using CSI ~.
+  if (/^\x1b\[13;2~$/u.test(sequence)) return true;
+
+  // Windows Terminal win32-input-mode:
+  // CSI Vk;Sc;Uc;Kd;Cs;Rc_ (VK_RETURN=13, SHIFT_PRESSED=0x10).
+  const win32 = sequence.match(/^\x1b\[(\d+);(\d+);(\d+);(\d+);(\d+);(\d+)_$/u);
+  if (!win32) return false;
+  const virtualKey = Number(win32[1]);
+  const keyDown = Number(win32[4]);
+  const controlKeyState = Number(win32[5]);
+  return virtualKey === 13 && keyDown === 1 && (controlKeyState & 0x10) !== 0;
+}
+
+function insertReadlineLineBreak(rl) {
+  if (!rl) return false;
+  if (typeof rl._insertString === "function") {
+    rl._insertString("\n");
+    return true;
+  }
+
+  if (typeof rl.line !== "string") return false;
+  const cursor = Math.max(0, Math.min(rl.line.length, Number(rl.cursor) || 0));
+  rl.line = `${rl.line.slice(0, cursor)}\n${rl.line.slice(cursor)}`;
+  rl.cursor = cursor + 1;
+  if (typeof rl._refreshLine === "function") rl._refreshLine();
+  return true;
+}
+
+function findReadlineTtyWriteSymbol(rl) {
+  let current = rl;
+  while (current) {
+    const symbol = Object.getOwnPropertySymbols(current).find(
+      (candidate) => candidate.description === "_ttyWrite" && typeof rl[candidate] === "function"
+    );
+    if (symbol) return symbol;
+    current = Object.getPrototypeOf(current);
+  }
+  return null;
+}
+
+function installShiftEnterLineBreak(rl, options = {}) {
+  const ttyWriteSymbol = findReadlineTtyWriteSymbol(rl);
+  if (!ttyWriteSymbol) return () => {};
+
+  const original = rl[ttyWriteSymbol];
+  rl[ttyWriteSymbol] = function patchedTtyWrite(str, key) {
+    if (isShiftEnterKeypress(str, key)) {
+      insertReadlineLineBreak(this);
+      return;
+    }
+    return original.call(this, str, key);
+  };
+
+  const output = options.output || rl.output || process.stdout;
+  const enableProtocol =
+    options.enableProtocol !== false &&
+    process.stdin.isTTY &&
+    output &&
+    output.isTTY &&
+    typeof output.write === "function";
+  if (enableProtocol) {
+    // Ask modern terminals (including Windows Terminal) to report modified
+    // Enter distinctly as CSI-u. Unsupported terminals safely ignore it.
+    try {
+      output.write("\x1b[>1u");
+      kittyKeyboardProtocolActive = true;
+    } catch {}
+  }
+
+  return () => {
+    if (rl[ttyWriteSymbol] !== original) rl[ttyWriteSymbol] = original;
+    if (enableProtocol) restoreKeyboardProtocol(output);
+  };
 }
 
 // Ctrl+C 처리:
@@ -3672,7 +3763,9 @@ async function main() {
     output: process.stdout,
     historySize: 100,
   });
+  const removeShiftEnterLineBreak = installShiftEnterLineBreak(rl);
   installPromptShortcuts(rl);
+  console.log(`${ANSI.gray}입력: Shift+Enter 줄바꿈 · Enter 전송${ANSI.reset}`);
 
   try {
     while (true) {
@@ -3770,6 +3863,7 @@ async function main() {
     }
   } finally {
     pauseBackgroundMaintenance({ abortRunning: true });
+    removeShiftEnterLineBreak();
     rl.close();
   }
   console.log("종료했습니다.");
@@ -3800,6 +3894,9 @@ module.exports = {
   promptPersonaFields,
   createInactivityWatchdog,
   isCtrlGShortcut,
+  isShiftEnterKeypress,
+  insertReadlineLineBreak,
+  installShiftEnterLineBreak,
   buildContinueInstruction,
   continuationDelta,
   pickNextMaintenanceEntry,
