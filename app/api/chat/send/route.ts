@@ -175,6 +175,7 @@ import {
 } from "./_server/fence";
 import { buildModelCallOpts, runBufferedOne, runOptionalShortContinue, runStreamMainGeneration } from "./_server/streamRunner";
 import { makeContinueUserPrompt, mergeStreamUsage } from "./_server/streamHelpers";
+import { inspectRefusalOutput } from "./_server/refusalGuard";
 import { buildRecentExpressionAvoidanceBlock } from "./_server/repetitionGuard";
 import { buildWorldDirectorBlock } from "./_server/worldDirector";
 import {
@@ -4136,6 +4137,12 @@ let cancelStreamWork: (() => void) | null = null;
           // 전송 연결은 ping을 보낼 수 있지만 생성 본문은 완료 후 한 번만 전달된다.
           const PRO_DONE_ONLY = isGemini31Pro;
 
+          // (2026-08-16) 거부 응답 자동 리롤 회차. 아래 생성 호출들이 이 값을 읽어
+          // 리롤마다 샘플링을 넓힌다(같은 temperature로 다시 굴리면 같은 거부가 재현된다).
+          let refusalRerollAttempt = 0;
+          // 리롤로 버려진 시도들의 사용량 누적분(과금/표시에 합산한다).
+          let refusalDiscardedUsage: any = null;
+
 	          const runOneBuffered = async (userPrompt: string, tag: string) => {
 	            try {
 const doneOnlyOverlapStart = maybeStartDoneOnlyMetaOverlap({
@@ -4166,6 +4173,7 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
 	                maxOutputTokensForCall,
 	                metaRequired: String(metaRequired || ""),
 	                statusRequired: String(statusRequired || ""),
+	                rerollAttempt: refusalRerollAttempt,
 	                generateText,
 	                onEmptyRaw: (t) => {
 	                  debugReasons.push(`empty:${t}`);
@@ -4188,6 +4196,7 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
 			                metaRequired: String(metaRequired || ""),
 			                statusRequired: String(statusRequired || ""),
 			                mode: "stream",
+			                rerollAttempt: refusalRerollAttempt,
 			              }),
 	            });
 
@@ -4260,19 +4269,71 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           // guard. It covers MAX_TOKENS, short STOP, unbalanced prose markers,
           // and incomplete plural responses without allowing chained calls.
           const MAX_CONTINUES = 0;
-          const generation = await runStreamMainGeneration({
-            proDoneOnly: PRO_DONE_ONLY,
-            runOneBuffered,
-            runOneStream,
-            mergeUsage,
-            makeContinueUser,
-            endsWithCompleteFence,
-            userPrompt: user,
-            maxContinues: MAX_CONTINUES,
-          });
+          const runMainGeneration = () =>
+            runStreamMainGeneration({
+              proDoneOnly: PRO_DONE_ONLY,
+              runOneBuffered,
+              runOneStream,
+              mergeUsage,
+              makeContinueUser,
+              endsWithCompleteFence,
+              userPrompt: user,
+              maxContinues: MAX_CONTINUES,
+            });
+
+          let generation = await runMainGeneration();
+
+          // (2026-08-16) 거부/차단 응답 자동 리롤.
+          //
+          // 거부 응답이 저장되면 다음 턴의 [최근 대화]에 그대로 실려 들어간다. 모델은 그것을
+          // "이 대화에서는 이런 요청에 거부하는 것이 정상"이라는 선례로 읽고 거부를 반복한다.
+          // 그래서 사용자가 다시 누르기 전에 서버가 먼저 다시 굴린다.
+          //
+          // 리롤할 때마다 refusalRerollAttempt가 올라가고 buildModelCallOpts가 그 값으로
+          // temperature/topP를 높인다. 같은 샘플링으로 다시 굴리면 같은 거부가 나오기 쉽다.
+          //
+          // 스트리밍이면 이미 델타가 클라이언트로 나갔을 수 있으므로, 리롤 전에 replace로
+          // 화면을 비운다(클라이언트는 replace를 받으면 표시 내용을 통째로 교체한다).
+          {
+            const maxRerolls = (() => {
+              const raw = Number(process.env.AI_REFUSAL_REROLL_MAX ?? 5);
+              return Number.isFinite(raw) ? Math.max(0, Math.min(10, Math.floor(raw))) : 5;
+            })();
+            while (refusalRerollAttempt < maxRerolls) {
+              const check = inspectRefusalOutput(generation.combinedRaw);
+              if (!check.refused) break;
+              // 버려지는 시도도 실제로 과금된 호출이다. 사용량에 합산해 두지 않으면
+              // 리롤 5회를 돌고도 마지막 호출 비용만 청구/표시된다.
+              refusalDiscardedUsage = mergeUsage(refusalDiscardedUsage, generation.combinedUsage);
+              refusalRerollAttempt += 1;
+              try {
+                console.warn(JSON.stringify({
+                  tag: "send.refusal.reroll",
+                  chatId: cid,
+                  reqId,
+                  attempt: refusalRerollAttempt,
+                  maxRerolls,
+                  reason: check.reason,
+                  detail: check.detail,
+                }));
+              } catch {
+                // ignore
+              }
+              debugReasons.push(`refusal:reroll${refusalRerollAttempt}:${check.reason}`);
+              try {
+                safeEnqueue({ type: "replace", text: "" });
+              } catch {
+                // ignore
+              }
+              generation = await runMainGeneration();
+            }
+          }
+
           let usedBufferedTransport = generation.usedBufferedTransport;
           let combinedRaw = generation.combinedRaw;
-          let combinedUsage: any = generation.combinedUsage;
+          let combinedUsage: any = refusalDiscardedUsage
+            ? mergeUsage(refusalDiscardedUsage, generation.combinedUsage)
+            : generation.combinedUsage;
           let finishReason = generation.finishReason;
 
           let raw = combinedRaw;
@@ -4649,6 +4710,32 @@ if (!TRANSPORT_STREAMING) {
           const createdAt = Date.now();
           const assistantId = randomUUID();
 
+          // (2026-08-16) 거부/차단 응답은 기록하지 않는다.
+          //
+          // 리롤을 다 쓰고도 거부가 남으면 화면에는 안내를 띄우되(위 replace/done),
+          // DB에는 남기지 않는다. 저장하면 다음 턴 프롬프트의 [최근 대화]에 실려서,
+          // 모델이 "이 대화에서는 거부하는 게 정상"이라는 선례로 학습하고 거부가 굳어진다.
+          // 장기기억 요약·인물기억도 그 거부문을 근거로 오염된다.
+          const finalRefusal = inspectRefusalOutput(assistantText);
+          if (finalRefusal.refused) {
+            try {
+              console.warn(JSON.stringify({
+                tag: "send.refusal.not_persisted",
+                chatId: cid,
+                reqId,
+                rerolls: refusalRerollAttempt,
+                reason: finalRefusal.reason,
+                detail: finalRefusal.detail,
+              }));
+            } catch {
+              // ignore
+            }
+            debugReasons.push(`refusal:not_persisted:${finalRefusal.reason}`);
+            // 사용자 입력은 지우지 않는다(다시 보낼 수 있어야 한다).
+            // 다만 _assistantPersisted가 false로 남으므로, 이후 cancel/error 경로의
+            // cleanupPendingUserOnFailure가 사용자 메시지를 지워버리지 않도록 해제한다.
+            _pendingUserMsgId = "";
+          } else {
           db.prepare(`INSERT INTO messages (id, chatId, role, content, createdAt, updatedAt, userEmail) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
             assistantId,
             String(chatId),
@@ -4664,6 +4751,7 @@ if (!TRANSPORT_STREAMING) {
             assistantContent: assistantText,
             createdAt,
           });
+          }
           // (스토리/캐릭터 메모리) 기능 제거: 장기기억 요약만 운용
 
 

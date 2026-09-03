@@ -68,6 +68,8 @@ export type RunBufferedOneParams = {
   maxOutputTokensForCall: number;
   metaRequired: string;
   statusRequired: string;
+  /** 거부 응답 자동 리롤 회차. buildModelCallOpts로 그대로 전달된다. */
+  rerollAttempt?: number;
   generateText: (args: { system: string; user: string; opts: any }) => Promise<any>;
   onEmptyRaw?: (tag: string) => void;
 };
@@ -78,12 +80,30 @@ export type BuildModelCallOptsParams = {
   metaRequired: string;
   statusRequired: string;
   mode: "buffered" | "stream";
+  /**
+   * (2026-08-16) 거부/차단 응답 자동 리롤 회차(0 = 최초 호출).
+   * 리롤에서는 샘플링 폭을 넓힌다. 형식 준수를 위해 temperature를 0.15까지 낮춰둔
+   * 상태로 그대로 다시 굴리면 직전과 거의 같은 토큰이 나와서, 같은 거부가 반복된다.
+   */
+  rerollAttempt?: number;
 };
+
+/** 리롤 회차에 따라 샘플링을 넓힌다. 형식 준수보다 "다른 결과"가 우선인 상황이다. */
+function widenSamplingForReroll(base: { temperature: number; topP: number; topK: number }, attempt: number) {
+  if (attempt <= 0) return base;
+  const step = Math.min(4, Math.max(1, Math.floor(attempt)));
+  return {
+    temperature: Math.min(1.1, base.temperature + 0.2 * step),
+    topP: Math.min(0.98, base.topP + 0.04 * step),
+    topK: Math.min(64, base.topK + 8 * step),
+  };
+}
 
 export function buildModelCallOpts(params: BuildModelCallOptsParams): any {
   const refusalFallbackEnabled = String(process.env.AI_REFUSAL_FALLBACK || "0").trim() === "1";
   const required = params.metaRequired === "YES" || params.statusRequired === "YES";
-  const compliance =
+  const attempt = Math.max(0, Math.floor(Number(params.rerollAttempt) || 0));
+  const baseCompliance =
     params.mode === "buffered"
       ? {
           // (compliance) 상태창이 필수인 경우, 샘플링을 보수적으로 조정해 형식 준수 확률을 높인다.
@@ -99,10 +119,12 @@ export function buildModelCallOpts(params: BuildModelCallOptsParams): any {
           topP: 0.8,
           topK: 32,
         };
+  const compliance = widenSamplingForReroll(baseCompliance, attempt);
 
   return {
     ...params.baseOpts,
-    ...(required ? compliance : {}),
+    // 리롤 중에는 상태창 필수 여부와 무관하게 샘플링을 넓혀야 결과가 달라진다.
+    ...(required || attempt > 0 ? compliance : {}),
     maxOutputTokens: params.maxOutputTokensForCall,
     maxOutputTokensRequested: params.baseOpts?.maxOutputTokens,
     // In streaming/DONE-only chat, a refusal fallback can add another slow model call
@@ -123,6 +145,7 @@ export async function runBufferedOne(params: RunBufferedOneParams): Promise<Stre
       metaRequired: params.metaRequired,
       statusRequired: params.statusRequired,
       mode: "buffered",
+      rerollAttempt: params.rerollAttempt,
     }),
   });
 
