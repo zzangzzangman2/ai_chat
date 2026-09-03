@@ -2,7 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const Database = require("better-sqlite3");
 const {
+  chatStatusUpdatedAtSql,
   clearEchoedPromptRegion,
   clearPreviousTerminalRows,
   createInactivityWatchdog,
@@ -19,6 +21,24 @@ const {
 } = require("./dos-chat.js");
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("DOS chat ordering supports DBs both with and without optional status timestamps", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("CREATE TABLE chats (id TEXT PRIMARY KEY, createdAt INTEGER); INSERT INTO chats VALUES ('chat', 100)");
+    const readTime = (alias) => {
+      const expression = chatStatusUpdatedAtSql(db, alias);
+      return db.prepare(`SELECT MAX(COALESCE(${expression}, 0), createdAt) AS time FROM chats c`).get().time;
+    };
+    assert.equal(readTime("c"), 100);
+    assert.equal(readTime(""), 100);
+    db.exec("ALTER TABLE chats ADD COLUMN lastStatusUpdatedAt INTEGER; UPDATE chats SET lastStatusUpdatedAt=200");
+    assert.equal(readTime("c"), 200);
+    assert.equal(readTime(""), 200);
+  } finally {
+    db.close();
+  }
+});
 
 test("response watchdog resets on stream activity and aborts only after inactivity", async () => {
   const watchdog = createInactivityWatchdog(undefined, 40);

@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { getSessionUser } from "@/lib/auth";
 import { decryptIfPossible } from "@/lib/crypto";
 import { generateText } from "@/lib/ai";
+import { GEMINI_3_FLASH_MODEL } from "@/lib/models";
 
 type Role = "user" | "assistant";
 
@@ -340,7 +341,7 @@ export async function POST(req: Request) {
       user,
       opts: {
         // Fast + cheap, but keep enough quality
-        model: "gemini-3.7-flash",
+        model: GEMINI_3_FLASH_MODEL,
         maxOutputTokens: 220,
       } as any,
     });

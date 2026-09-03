@@ -11,10 +11,11 @@ const readline = require("readline/promises");
 const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, "data", "data.sqlite3");
 const ENC_PREFIX = "enc:v1:";
-const MODELS = ["gemini-2.5-pro", "gemini-3.7-flash", "gemini-3.1-pro-preview"];
+const GEMINI_FLASH_MODEL = "gemini-3.8-flash";
+const MODELS = ["gemini-2.5-pro", GEMINI_FLASH_MODEL, "gemini-3.1-pro-preview"];
 const MODEL_OPTIONS = [
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash" },
+  { id: GEMINI_FLASH_MODEL, label: "Gemini 3.8 Flash" },
   { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview" },
 ];
 
@@ -31,6 +32,14 @@ const LEVEL_ALIASES = {
   high: "high", h: "high",
 };
 
+function normalizeDosModelId(model) {
+  const raw = String(model || "").trim().toLowerCase().split("/").pop();
+  // Same legacy Flash family as the web/server model normalizer.
+  return /^gemini-3(?:\.(?:1|5|6|7|8))?-flash(?:-lite)?(?:-preview)?$/i.test(raw)
+    ? GEMINI_FLASH_MODEL
+    : raw;
+}
+
 function isGemini3ProFamilyModel(model) {
   return /gemini-3(?:\.\d+)?-pro/i.test(String(model || ""));
 }
@@ -38,6 +47,7 @@ function isGemini3FlashModel(model) {
   return /^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(String(model || ""));
 }
 function getReasoningPresets(model) {
+  model = normalizeDosModelId(model);
   if (isGemini3ProFamilyModel(model)) return { zero: 0, middle: 768, high: 1536 };
   // Gemini 3.6 Flash supports medium/high thinking levels, not zero/minimal.
   if (/^gemini-3\.6-flash(?:-|$)/i.test(String(model || ""))) return { middle: 640, high: 1024 };
@@ -1306,7 +1316,17 @@ function printTimingDetail(timing = state.lastTiming) {
   }
 }
 
+function chatStatusUpdatedAtSql(db, alias = "") {
+  // Some imported/company DBs have this optional column; fresh local DBs do
+  // not. Keep their status ordering without making it a startup requirement.
+  const hasStatusTime = db.prepare("PRAGMA table_info(chats)").all()
+    .some((column) => column.name === "lastStatusUpdatedAt");
+  if (!hasStatusTime) return "0";
+  return alias === "c" ? "c.lastStatusUpdatedAt" : "lastStatusUpdatedAt";
+}
+
 function listChats(limit = 15) {
+  const statusUpdatedAt = chatStatusUpdatedAtSql(openDb(), "c");
   const rows = dbAll(
     `
     SELECT
@@ -1314,7 +1334,7 @@ function listChats(limit = 15) {
       c.presetId,
       COALESCE(NULLIF(c.title, ''), NULLIF(p.name, ''), NULLIF(p.characterName, ''), '채팅') AS title,
       MAX(
-        COALESCE(c.lastStatusUpdatedAt, 0),
+        COALESCE(${statusUpdatedAt}, 0),
         COALESCE((SELECT MAX(COALESCE(mx.updatedAt, mx.createdAt)) FROM messages mx WHERE mx.chatId = c.id), 0),
         COALESCE(c.createdAt, 0)
       ) AS updatedAt,
@@ -1351,6 +1371,7 @@ function listChats(limit = 15) {
 }
 
 function listChatsForPreset(presetId, limit = 10) {
+  const statusUpdatedAt = chatStatusUpdatedAtSql(openDb(), "c");
   const rows = dbAll(
     `
     SELECT
@@ -1358,7 +1379,7 @@ function listChatsForPreset(presetId, limit = 10) {
       c.presetId,
       COALESCE(NULLIF(c.title, ''), NULLIF(p.name, ''), NULLIF(p.characterName, ''), '채팅') AS title,
       MAX(
-        COALESCE(c.lastStatusUpdatedAt, 0),
+        COALESCE(${statusUpdatedAt}, 0),
         COALESCE((SELECT MAX(COALESCE(mx.updatedAt, mx.createdAt)) FROM messages mx WHERE mx.chatId = c.id), 0),
         COALESCE(c.createdAt, 0)
       ) AS updatedAt,
@@ -1395,6 +1416,7 @@ function listChatsForPreset(presetId, limit = 10) {
 function listPresets(limit = 30) {
   // (변경) 공용 readonly connection 재사용. close 불필요.
   const db = openDb();
+  const statusUpdatedAt = chatStatusUpdatedAtSql(db);
   {
     const rows = db
       .prepare(
@@ -1414,7 +1436,7 @@ function listPresets(limit = 30) {
       SELECT
         id,
         MAX(
-          COALESCE(lastStatusUpdatedAt, 0),
+          COALESCE(${statusUpdatedAt}, 0),
           COALESCE((SELECT MAX(COALESCE(m.updatedAt, m.createdAt)) FROM messages m WHERE m.chatId = chats.id), 0),
           COALESCE(createdAt, 0)
         ) AS updatedAt
@@ -1483,7 +1505,7 @@ const _settingsCache = { chatId: "", at: 0, value: null };
 const SETTINGS_TTL_MS = 60_000;
 
 function applySettings(s) {
-  state.settings = s || null;
+  state.settings = s ? { ...s, model: normalizeDosModelId(s.model) } : null;
   _settingsCache.chatId = state.chatId;
   _settingsCache.at = Date.now();
   _settingsCache.value = state.settings;
@@ -1906,8 +1928,9 @@ function modelByInput(value) {
   if (Number.isInteger(n) && n >= 1 && n <= MODEL_OPTIONS.length) {
     return MODEL_OPTIONS[n - 1].id;
   }
-  const found = MODEL_OPTIONS.find((m) => m.id === raw || m.label.toLowerCase() === raw.toLowerCase());
-  return found ? found.id : raw;
+  const normalized = normalizeDosModelId(raw);
+  const found = MODEL_OPTIONS.find((m) => m.id === normalized || m.label.toLowerCase() === raw.toLowerCase());
+  return found ? found.id : normalized;
 }
 
 function renderModelLauncher(selectedIndex, typed, currentModel) {
@@ -3879,6 +3902,12 @@ if (require.main === module) {
 }
 
 module.exports = {
+  MODELS,
+  MODEL_OPTIONS,
+  modelByInput,
+  normalizeDosModelId,
+  getReasoningPresets,
+  chatStatusUpdatedAtSql,
   textOnly,
   colorNovelText,
   colorNovelInline,

@@ -10,7 +10,7 @@ C:\경로\ai
 원하는 것:
 1. 이 폴더를 열어서 현재 상태를 파악해줘.
 2. 로컬 실행은 run-local.ps1로 하면 돼.
-3. 모델 선택지는 gemini-2.5-pro, gemini-3-flash-preview, gemini-3.1-pro-preview만 유지해줘.
+3. 웹/DOS 모델 선택지는 gemini-2.5-pro, gemini-3.8-flash, gemini-3.1-pro-preview만 유지해줘. 기존 Flash 채팅은 3.8로 자동 전환되며 LOW/MID/HIGH 설정은 유지돼.
 4. Vertex AI/ADC 방식으로 Gemini를 쓰고 있어. .env.local 설정을 확인해줘.
 5. 회사 PC에는 Google Cloud 인증이 없을 수 있으니, Gemini 호출이 인증 오류면 아래를 실행하게 안내해줘.
 

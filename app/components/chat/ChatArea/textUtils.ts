@@ -1,4 +1,4 @@
-import { isReasoningPresetValue, reasoningPresetsForModel } from "@/lib/models";
+import { isReasoningPresetValue, normalizeModelId, reasoningPresetsForModel } from "@/lib/models";
 
 // Remove explicit end markers ONLY.
 //
@@ -381,7 +381,7 @@ function isGemini3ProFamily(model: string): boolean {
 }
 
 export function getReasoningLevelOptions(model: string): ReasoningLevel[] {
-  if (/^gemini-3\.6-flash(?:-|$)/i.test(String(model || ""))) return ["middle", "high"];
+  if (/^gemini-3\.6-flash(?:-|$)/i.test(normalizeModelId(model))) return ["middle", "high"];
   if (isGemini3ProFamily(model)) return ["zero", "middle", "high"];
   return ["low", "middle", "high"];
 }
@@ -404,7 +404,7 @@ export function inferReasoningLevel(model: string, tokens: number): ReasoningLev
   // (2026-08-15) 최근접 반올림 → 하한 밴딩(floor)으로 바꾼다.
   // 서버(lib/ai.ts buildThinkingConfig)는 "t 이하의 가장 높은 구간"을 고르는
   // 임계값 방식인데 여기만 최근접이라, 프리셋 사이에 낀 값에서 UI가 서버보다
-  // 높은 단계를 표시했다. 예) 3.7 Flash에 384가 남아 있으면
+  // 높은 단계를 표시했다. 예) Flash에 384가 남아 있으면
   //   최근접 → MID(640에 더 가까움) / 서버 → low.
   // 이제 프리셋 이하의 최대값을 고르므로 UI가 실제보다 높게 보이지 않는다.
   const entries: [ReasoningLevel, number][] = options.map((k) => [k, p[k]]);
@@ -463,11 +463,10 @@ export function stripLeadingTitleForDisplay(text: string): string {
 }
 
 export function getModelDisplayLabel(rawModel: string): string {
-  const m = String(rawModel || "").replace(/^google\//i, "").trim().toLowerCase();
+  const m = normalizeModelId(rawModel);
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) return "3.1-pro";
-  // 3.6에서 3.7로 올렸다. 기존 대화에 남은 3.6 값도 현재 Flash 뱃지로 표시한다.
-  if (/^gemini-3\.[67]-flash(?:-|$)/i.test(m)) return "3.7-flash";
-  if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) return "3.5-flash";
+  // Display the same normalized ID the provider receives, including old rooms.
+  if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) return m.replace(/^gemini-/, "");
   if (/^gemini-3-pro(?:-|$)/i.test(m)) return "3.1-pro";
   if (/^gemini-2\.5-flash(?:-|$)/i.test(m)) return "2.5-pro";
   if (/^gemini-2\.5-pro(?:-|$)/i.test(m)) return "2.5-pro";
@@ -475,15 +474,12 @@ export function getModelDisplayLabel(rawModel: string): string {
 }
 
 export function getModelBadge(rawModel: string): { label: string; bg: string; fg: string } {
-  const m = String(rawModel || "").replace(/^google\//i, "").trim().toLowerCase();
+  const m = normalizeModelId(rawModel);
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) {
     return { label: "3.1-pro", bg: "rgba(255, 75, 75, 0.22)", fg: "rgba(255, 165, 165, 0.98)" };
   }
-  if (/^gemini-3\.[67]-flash(?:-|$)/i.test(m)) {
-    return { label: "3.7-flash", bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };
-  }
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) {
-    return { label: "3.5-flash", bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };
+    return { label: getModelDisplayLabel(m), bg: "rgba(255, 120, 210, 0.18)", fg: "rgba(255, 190, 230, 0.98)" };
   }
   if (/^gemini-3-pro(?:-|$)/i.test(m)) {
     return { label: "3.1-pro", bg: "rgba(255, 75, 75, 0.18)", fg: "rgba(255, 140, 140, 0.98)" };

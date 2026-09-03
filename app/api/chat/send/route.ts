@@ -5,7 +5,7 @@ import { getSessionUser, isAdminEmail } from "@/lib/auth";
 import { randomUUID } from "crypto";
 import { countTokens, generateText, generateTextStream, summarizeKorean, summarizeLongMemoryKorean, isRefusalText, REFUSAL_FALLBACK_MODEL } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
-import { DEFAULT_CHAT_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini31ProModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
+import { DEFAULT_CHAT_MODEL, GEMINI_3_FLASH_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini31ProModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
 
 import {
   postprocessLongMemorySummary,
@@ -3577,7 +3577,7 @@ const systemRaw = (cacheFriendlyLayout
     // 사용자 입력을 모드에 맞춰 전달한다.
     const userLine = continueMode ? "[이어쓰기]" : buildUserLineForMode(userText, personaName, renderMode);
 
-    // Gemini Flash(현재 3.7): keep the slider level and reserve HIGH for heavy reasoning.
+    // Gemini Flash: keep the slider level and reserve HIGH for heavy reasoning.
     // Raise MID to HIGH only when the *user's current request* asks for reasoning over the heavy context.
     // Otherwise long-memory/status/character-heavy chats would make MID behave like HIGH on every turn.
     if (
@@ -4149,7 +4149,7 @@ let cancelStreamWork: (() => void) | null = null;
             const _metaCompletionModel =
               (process.env.AI_META_COMPLETION_MODEL || "").trim() ||
               ((isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
-                ? "gemini-3.7-flash"
+                ? GEMINI_3_FLASH_MODEL
                 : String((opts as any)?.model || (settings as any)?.model || ""));
             const _metaOverlapTriggerRatio = (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || ""))) ? 0.65 : 0.85;
             const _metaOverlapTriggerChars = Math.max(420, Math.min(promptMaxChars, Math.floor(targetChars * _metaOverlapTriggerRatio)));
@@ -5697,8 +5697,8 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           user: statusUser,
           opts: {
             ...opts,
-            model: "gemini-3.7-flash",
-            // Gemini 3.6 Flash의 공식 최저 단계인 medium을 사용한다.
+            model: GEMINI_3_FLASH_MODEL,
+            // 메타 패널 형식 안정성을 위해 medium을 유지한다(3.8의 최저 지원은 low).
             maxReasoningTokens: 640,
             maxOutputTokens: 640,
           },
@@ -5767,7 +5767,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
           system: systemStatus,
           user: statusUser,
 	          opts: (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
-	            ? { ...opts, model: "gemini-3.7-flash", maxReasoningTokens: 640, maxOutputTokens: 640 }
+	            ? { ...opts, model: GEMINI_3_FLASH_MODEL, maxReasoningTokens: 640, maxOutputTokens: 640 }
 	            : { ...opts, maxOutputTokens: Math.min(1024, maxOutputTokensForCall) },
         });
 

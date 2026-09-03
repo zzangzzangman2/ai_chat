@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import { getSessionUser } from "@/lib/auth";
 import { decryptIfPossible } from "@/lib/crypto";
 import { generateText, isRefusalText } from "@/lib/ai";
+import { GEMINI_3_FLASH_MODEL } from "@/lib/models";
 import {
   buildNovelSourceChunks,
   buildNovelChapterPrompt,
@@ -127,7 +128,7 @@ export async function POST(req: Request) {
                 source: chunk.source,
               }),
               opts: {
-                model: "gemini-3.7-flash",
+                model: GEMINI_3_FLASH_MODEL,
                 maxOutputTokens: 6500,
                 maxOutputTokensRequested: 6500,
                 maxReasoningTokens: 128,

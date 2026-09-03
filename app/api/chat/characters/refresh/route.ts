@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { generateText } from "@/lib/ai";
+import { GEMINI_3_FLASH_MODEL, normalizeModelId } from "@/lib/models";
 import {
   analyzeRelationshipCorrectionDrift,
   buildRelationshipCorrectionGuidance,
@@ -622,7 +623,7 @@ export async function POST(req: Request) {
       "No markdown. No extra text.",
     ].join("\n");
 
-    const model = String(process.env.CHARACTER_TURN_MEMORY_MODEL || "gemini-3.7-flash").trim();
+    const model = normalizeModelId(process.env.CHARACTER_TURN_MEMORY_MODEL || GEMINI_3_FLASH_MODEL);
     let parsed: any = null;
     let generationError = "";
     try {

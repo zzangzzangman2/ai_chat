@@ -1,9 +1,10 @@
 import { GoogleGenAI } from "@google/genai";
 import { createHash } from "crypto";
 import {
+  GEMINI_3_FLASH_MODEL,
   isGemini25ProModel,
   isGemini31ProModel,
-  isGemini36FlashModel,
+  isCurrentGeminiFlashModel,
   isGemini3FlashModel,
   isGemini3Model,
   isGemini3ProModel,
@@ -284,11 +285,9 @@ function buildThinkingConfig(model: string, maxReasoningTokens: number, maxOutpu
     const level = t >= 1280 ? "high" : t >= 640 ? "medium" : lowLevel;
     return { thinkingLevel: level };
   }
-  if (isGemini36FlashModel(model)) {
-    // (2026-08-14) 현재 Flash는 3.7. 실측 결과 3.6과 지원 레벨이 다르다:
-    //   minimal → 400 미지원 / low → OK(1.4s, thoughts 0) / medium → OK(2.0s) / high → OK(2.2s)
-    // 3.6은 medium이 최저여서 LOW 슬라이더도 medium으로 올려 보냈지만,
-    // 3.7은 low를 받으므로 슬라이더 의미를 그대로 살린다. minimal만 피하면 된다.
+  if (isCurrentGeminiFlashModel(model)) {
+    // Gemini 3.8 Flash supports low/medium/high only. Stored legacy IDs
+    // normalize here too, so neither streaming nor summaries send minimal.
     return { thinkingLevel: t >= 1024 ? "high" : t >= 640 ? "medium" : "low" };
   }
   if (isGemini3Flash(model)) {
@@ -1008,8 +1007,8 @@ export async function generateText(params: {
     // Do ONE rescue call on the SAME model to secure visible output.
     // For Gemini 3 Pro, avoid thinkingLevel (some variants reject certain levels).
     // Instead, cap thinking strictly with a small thinkingBudget.
-    const rescueLevel = isGemini36FlashModel(opts.model)
-      ? "medium"
+    const rescueLevel = isCurrentGeminiFlashModel(opts.model)
+      ? "low"
       : isGemini3Flash(opts.model) ? "minimal" : "low";
     const rescueThinkingConfig: any = modelIs3Pro ? { thinkingBudget: 128 } : { thinkingLevel: rescueLevel };
     const rescueHeadroom = modelIs3Pro ? 1024 : thinkingLevelHeadroom(rescueLevel);
@@ -2028,14 +2027,14 @@ ${cleanDialogue}`;
   const summaryModel = noDownshift
     ? String(opts.model || "").trim()
     : opts.model && opts.model.startsWith("gemini-3")
-      ? "gemini-3.7-flash"
+      ? GEMINI_3_FLASH_MODEL
       : opts.model;
 
   const summaryMaxOutputTokens =
     isGemini3Flash(summaryModel) ? 1600 : 900;
   const summaryMaxReasoningTokens =
     // Flash도 thinkingConfig를 완전히 생략하면 hidden thoughts가 과소비되어
-    // MAX_TOKENS로 본문이 짧게 잘리는 케이스가 있다. 최소 thinking(level=minimal)만 고정한다.
+    // MAX_TOKENS로 본문이 짧게 잘리는 케이스가 있다. 현재 Flash의 low를 명시한다.
     (isGemini3Pro(summaryModel) || isGemini25Pro(summaryModel) || isGemini3Flash(summaryModel)) ? 128 : 0;
 
   const summaryOpts: ChatGenOpts = {
@@ -2226,14 +2225,14 @@ ${cleanDialogue}`;
   const summaryModel = noDownshift
     ? String(opts.model || "").trim()
     : opts.model && opts.model.startsWith("gemini-3")
-      ? "gemini-3.7-flash"
+      ? GEMINI_3_FLASH_MODEL
       : opts.model;
 
   const summaryMaxOutputTokens =
     isGemini3Flash(summaryModel) ? 1600 : 900;
   const summaryMaxReasoningTokens =
     // Flash도 thinkingConfig를 완전히 생략하면 hidden thoughts가 과소비되어
-    // MAX_TOKENS로 본문이 짧게 잘리는 케이스가 있다. 최소 thinking(level=minimal)만 고정한다.
+    // MAX_TOKENS로 본문이 짧게 잘리는 케이스가 있다. 현재 Flash의 low를 명시한다.
     (isGemini3Pro(summaryModel) || isGemini25Pro(summaryModel) || isGemini3Flash(summaryModel)) ? 128 : 0;
 
   const summaryOpts: ChatGenOpts = {

@@ -1,7 +1,7 @@
 export const GEMINI_25_PRO_MODEL = "gemini-2.5-pro" as const;
 // Legacy constant name is preserved for callers while the selected Flash model advances.
-// (2026-08-14) 3.6 → 3.7. Vertex(global)에서 gemini-3.7-flash 제공 확인.
-export const GEMINI_3_FLASH_MODEL = "gemini-3.7-flash" as const;
+// (2026-09-03) Gemini API / Vertex(global) GA: low, medium, high; no minimal.
+export const GEMINI_3_FLASH_MODEL = "gemini-3.8-flash" as const;
 export const GEMINI_31_PRO_MODEL = "gemini-3.1-pro-preview" as const;
 export const DEFAULT_CHAT_MODEL = GEMINI_31_PRO_MODEL;
 
@@ -40,9 +40,11 @@ export function normalizeModelId(model: string): string {
     m === "gemini-3.5-flash-preview" ||
     m === "gemini-3.5-flash-lite" ||
     m === "gemini-3.6-flash-preview" ||
-    // 3.6에서 3.7로 올리면서, 기존 대화/설정에 저장된 3.6 값도 현재 Flash로 흡수한다.
+    // 기존 대화/환경설정의 이전 Flash ID도 현재 Flash로 흡수한다.
     m === "gemini-3.6-flash" ||
-    m === "gemini-3.7-flash-preview"
+    m === "gemini-3.7-flash" ||
+    m === "gemini-3.7-flash-preview" ||
+    m === "gemini-3.8-flash-preview"
   ) {
     return GEMINI_3_FLASH_MODEL;
   }
@@ -70,7 +72,7 @@ export function providerModelNameForGemini(model: string): string {
 }
 
 export function defaultReasoningTokensForModel(model?: string): number {
-  if (model && isGemini36FlashModel(model)) return 640;
+  if (model && isCurrentGeminiFlashModel(model)) return 640;
   if (model && isGemini3FlashModel(model)) return 0;
   return 384;
 }
@@ -83,9 +85,12 @@ export function isGemini31ProModel(model: string): boolean {
   return /^gemini-3\.1-pro(?:-|$)/i.test(normalizeModelId(model));
 }
 
-export function isGemini36FlashModel(model: string): boolean {
+export function isCurrentGeminiFlashModel(model: string): boolean {
   return normalizeModelId(model) === GEMINI_3_FLASH_MODEL;
 }
+
+// Backward-compatible export for integrations using the old helper name.
+export const isGemini36FlashModel = isCurrentGeminiFlashModel;
 
 export function isGemini3FlashModel(model: string): boolean {
   return /^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(normalizeModelId(model));
@@ -101,7 +106,7 @@ export function isGemini3Model(model: string): boolean {
 //
 // (2026-08-15) 기존에는 UI(textUtils.getReasoningPresets)와 서버(ai.buildThinkingConfig)가
 // 각자 매핑 테이블을 들고 있었고, 그 사이에 낀 값이 서로 다르게 해석됐다.
-// 실측: 3.1 Pro(LOW=384)에서 3.7 Flash로 모델만 바꾼 방에 384가 그대로 남았는데
+// 실측: 3.1 Pro(LOW=384)에서 Flash로 모델만 바꾼 방에 384가 그대로 남았는데
 //   - UI  : 최근접 반올림 → |0-384|=384 vs |640-384|=256 → "MID"로 표시
 //   - 서버: 하한 밴딩 → t>=256 → thinkingLevel "low"로 전송
 // 화면은 MID(medium)라고 하는데 실제로는 low가 나가고 reasoningTokens=0으로 돌았다.
@@ -113,14 +118,12 @@ export function reasoningPresetsForModel(model: string): Record<ReasoningPresetL
     // zero 슬롯은 UI에서 FAST로 노출되며 공식 지원 레벨인 low에 매핑된다.
     return { zero: 0, low: 384, middle: 768, high: 1536 };
   }
-  // NOTE: isGemini36FlashModel()은 legacy 상수명이라 현재 GEMINI_3_FLASH_MODEL(=3.7)에
-  // 매치된다. 여기서는 "실제 3.6"만 걸러야 하므로 버전을 명시적으로 검사한다.
-  // (기존 UI 표와 동일하게 유지 — 3.7 Flash는 아래 3-flash 분기로 간다.)
+  // Legacy 3.6 values normalize to the current Flash and use its three levels.
   if (/^gemini-3\.6-flash(?:-|$)/i.test(normalizeModelId(model))) {
     return { zero: 640, low: 640, middle: 640, high: 1024 };
   }
   if (isGemini3FlashModel(model)) {
-    // LOW는 latency 우선 minimal, MID/HIGH는 thinkingLevel로 매핑한다.
+    // 0은 로컬 LOW 프리셋 값이다. 3.8에는 minimal/생각 끄기 대신 low로 전송한다.
     return { zero: 0, low: 0, middle: 640, high: 1024 };
   }
   // gemini-2.5-pro
