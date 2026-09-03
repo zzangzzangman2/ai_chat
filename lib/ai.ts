@@ -113,12 +113,12 @@ function recordGemini3ProThoughts(model: string, reasoningTokens: number) {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 거부 응답 자동 감지 + fallback
+// 거부 응답 판별 (표시/진단용; 자동 재호출 없음)
 // ────────────────────────────────────────────────────────────────────
 //
 // 일부 Gemini 모델(특히 3.x preview)은 RP/창작 컨텍스트에서도
 // "죄송합니다. 해당 요청은 수행할 수 없습니다." 류의 거부 응답을 자주 반환한다.
-// 이때 자동으로 gemini-2.5-pro로 한 번만 재시도하고 결과를 반환한다.
+// 판별 결과만 제공한다. generateText()는 모델을 바꾸거나 자동 재호출하지 않는다.
 //
 // false positive를 줄이기 위해:
 //  - 본문이 짧고(<= 320자)
@@ -528,6 +528,16 @@ function resolveCallTimeoutMs(model: string, overrideMs: unknown) {
   return Math.max(5_000, Math.min(300_000, Math.floor(n)));
 }
 
+function generationTimeoutError(model: string, timeoutMs: number): Error {
+  // Keep diagnostics available without CHAT_DEBUG or logging private prompts.
+  console.warn(JSON.stringify({
+    tag: "gemini.timeout", model, timeoutMs, attemptCount: 1, automaticRetry: false,
+  }));
+  return Object.assign(new Error(
+    `Gemini 응답 대기 시간이 초과되었습니다 (${model}, ${timeoutMs / 1000}초). 자동 재호출하지 않았습니다.`
+  ), { name: "GenerationTimeoutError", code: "GENERATION_TIMEOUT", model, timeoutMs, attemptCount: 1 });
+}
+
 function resolveLongMemorySummaryTimeoutMs() {
   const raw = Number(process.env.LONG_MEMORY_SUMMARY_TIMEOUT_MS ?? 120_000);
   if (!Number.isFinite(raw)) return 120_000;
@@ -546,17 +556,24 @@ async function withTimeout<T>(p: Promise<T>, ms: number, onTimeout?: () => void)
   const timeoutP = new Promise<null>((resolve) => {
     timer = setTimeout(() => {
       didTimeout = true;
+      // Settle the timeout first: abort listeners may reject the SDK promise
+      // synchronously, but that must not hide the actual timeout reason.
+      resolve(null);
       try {
         onTimeout?.();
       } catch {
         // ignore
       }
-      resolve(null);
     }, Math.max(0, ms));
   });
 
-  const r = (await Promise.race([p, timeoutP])) as any;
-  if (timer) clearTimeout(timer);
+  let r: any;
+  try {
+    r = await Promise.race([p, timeoutP]);
+  } finally {
+    // Rejections must also clear the timer, otherwise it aborts a completed call later.
+    if (timer) clearTimeout(timer);
+  }
 
   // If we timed out, ensure any eventual rejection is consumed (avoid unhandled rejections).
   if (r === null && didTimeout) {
@@ -722,8 +739,8 @@ export async function generateText(params: {
 
   const t0 = Date.now();
 
-  // 일부 모델/SDK 조합에서 thinkingConfig 또는 stopSequences를 거부하는 케이스가 있어
-  // 여러 조합을 순차적으로 시도한다.
+  // One explicit generation request makes one SDK call. Keep the selected
+  // configuration intact; failures must not trigger another billable request.
   const stopSequences = Array.isArray(opts.stopSequences) ? opts.stopSequences.filter(Boolean) : [];
 
   // (Gemini 3 Pro) 안정적인 서술/대사 순서를 위해 샘플링을 보수적으로 고정.
@@ -776,33 +793,9 @@ export async function generateText(params: {
     },
   };
 
-  const mkNoStop = (req: any) => {
-    const cfg = { ...(req.config || {}) } as any;
-    delete cfg.stopSequences;
-    return { ...req, config: cfg };
-  };
-
-  const withThinking: any = thinkingConfig
-    ? {
-        ...baseReq,
-        config: {
-          ...baseReq.config,
-          thinkingConfig,
-        },
-      }
-    : null;
-
-  const reqs: Array<{ label: string; req: any }> = withThinking
-    ? [
-        { label: "withThinking", req: withThinking },
-        { label: "base", req: baseReq },
-        ...(stopSequences.length ? [{ label: "withThinkingNoStop", req: mkNoStop(withThinking) }] : []),
-        ...(stopSequences.length ? [{ label: "baseNoStop", req: mkNoStop(baseReq) }] : []),
-      ]
-    : [
-        { label: "base", req: baseReq },
-        ...(stopSequences.length ? [{ label: "baseNoStop", req: mkNoStop(baseReq) }] : []),
-      ];
+  const req: any = thinkingConfig
+    ? { ...baseReq, config: { ...baseReq.config, thinkingConfig } }
+    : baseReq;
 
   if (isChatDebug()) {
     console.log(
@@ -828,111 +821,28 @@ export async function generateText(params: {
     );
   }
 
-  let resp: any = null; // accepted response (non-empty)
-  let lastResp: any = null; // last response even if empty
-  let lastErr: any = null;
-  const attempts: Array<{ label: string; ok: boolean; ms: number; err?: string }> = [];
-
-  const extractTextQuick = (r: any): string => {
-    const parts0 = (r?.candidates?.[0]?.content?.parts || []) as any[];
-    const joined0 = parts0.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
-    return typeof r?.text === "string" ? r.text : joined0;
-  };
-
-  const extractOutputTokensQuick = (r: any): number => {
-    const u = r?.usageMetadata || r?.usage || {};
-    return Number(u?.candidatesTokenCount ?? u?.output_tokens ?? 0) || 0;
-  };
-
-  const isLikelyEmptyResponse = (r: any): boolean => {
-    const t = String(extractTextQuick(r) || "");
-    if (t.trim()) return false;
-    const out = extractOutputTokensQuick(r);
-    const noCandidates = !Array.isArray(r?.candidates) || r.candidates.length === 0;
-    // Do not issue another billable request when the provider reports a
-    // completed candidate. Local route guards handle their own over-filtering.
-    return out === 0 || noCandidates;
-  };
-
-  const modelIs3Pro = isGemini3Pro(opts.model);
   const CALL_TIMEOUT_MS = resolveCallTimeoutMs(opts.model, opts.timeoutMs);
-
-  // Gemini 3 Pro must stay strict single-call here: no fallback/retry request.
-  const reqList = modelIs3Pro ? reqs.slice(0, 1) : reqs;
-
-  for (const { label, req } of reqList) {
-    const t1 = Date.now();
-    const linkedAbort = linkedAbortController(opts.signal);
-    try {
-      const reqWithSignal = {
-        ...(req as any),
-        config: { ...((req as any).config || {}), abortSignal: linkedAbort.controller.signal },
-      };
-
-      const r0 = await withTimeout(
-        withRetry(() => genai.models.generateContent(reqWithSignal), {
-          maxRetries: 0,
-          baseDelayMs: 650,
-          label,
-        }),
-        CALL_TIMEOUT_MS,
-        () => {
-          try {
-            linkedAbort.controller.abort();
-          } catch {
-            // ignore
-          }
-        }
-      );
-      throwIfAborted(opts.signal);
-
-      if (!r0) {
-        if (isChatDebug()) {
-          console.debug(JSON.stringify({ tag: "gemini.timeout", model: opts.model, label, timeoutMs: CALL_TIMEOUT_MS }));
-        }
-        attempts.push({ label, ok: false, ms: Date.now() - t1, err: `timeout>${CALL_TIMEOUT_MS}ms` });
-        // Gemini 3 Pro: hard-fail on timeout (no retries) per user request.
-        if (modelIs3Pro) {
-          lastErr = new Error(`timeout>${CALL_TIMEOUT_MS}ms`);
-          break;
-        }
-        continue;
-      }
-
-      const r = (r0 as any)?.value ?? r0;
-      lastResp = r;
-
-      if (isLikelyEmptyResponse(r)) {
-        attempts.push({ label, ok: false, ms: Date.now() - t1, err: "empty_output" });
-        // Empty/blocked responses can still be billable. A successful provider
-        // response ends this attempt; only a thrown config error may fall
-        // through to a compatibility request shape.
-        resp = r;
-        break;
-      }
-
-      resp = r;
-      attempts.push({ label, ok: true, ms: Date.now() - t1 } as any);
-      break;
-    } catch (e: any) {
-      if (opts.signal?.aborted) throw abortError(opts.signal.reason);
-      lastErr = e;
-      attempts.push({ label, ok: false, ms: Date.now() - t1, err: String(e?.message || e) });
-    } finally {
-      linkedAbort.dispose();
-    }
+  const label = thinkingConfig ? "withThinking" : "base";
+  const linkedAbort = linkedAbortController(opts.signal);
+  let resp: any;
+  try {
+    resp = await withTimeout(
+      genai.models.generateContent({
+        ...req,
+        config: { ...req.config, abortSignal: linkedAbort.controller.signal },
+      }),
+      CALL_TIMEOUT_MS,
+      () => linkedAbort.controller.abort()
+    );
+    throwIfAborted(opts.signal);
+    if (!resp) throw generationTimeoutError(requestModel, CALL_TIMEOUT_MS);
+  } catch (error) {
+    if (opts.signal?.aborted) throw abortError(opts.signal.reason);
+    throw error;
+  } finally {
+    linkedAbort.dispose();
   }
-
-  // Gemini 3 Pro: do not perform any fallback retries here.
-
-  if (!resp) {
-    // If we only got empty responses, keep the last one so the rescue path can run.
-    resp = lastResp;
-  }
-
-  if (!resp) {
-    throw lastErr || new Error("gemini generateContent failed");
-  }
+  const attempts = [{ label, ok: true, ms: Date.now() - t0 }];
 
   const latencyMs = Date.now() - t0;
 
@@ -982,156 +892,17 @@ export async function generateText(params: {
   }
   const totalTokens = totalFromUsage || (promptTokens + outputTokens + (typeof reasoningTokens === "number" ? reasoningTokens : 0));
 
-  let finalText = String(text || "");
-  let finalUsage: any = {
+  const finalText = String(text || "");
+  const finalUsage: any = {
     promptTokens,
     outputTokens,
     reasoningTokens,
     totalTokens,
   };
-  let finalFinishReason = finishReason;
+  const finalFinishReason = finishReason;
 
-  // (Gemini 3) Fail-safe:
-  // 모델이 thinking에 maxOutputTokens를 전부 써버리면 outputTokens=0이 되며 화면엔 빈 응답이 나타난다.
-  // 이 경우 1회만 'output 자리'를 확보해 재시도한다.
-  const isG3 = isGemini3(opts.model);
-  const fr = String(finalFinishReason || "").toUpperCase();
-  const isEmptyG3 = isG3 && !finalText.trim();
-  const isEmptyMax =
-    isEmptyG3 &&
-    (fr.includes("MAX") || Number(finalUsage.outputTokens || 0) === 0 || !Array.isArray(resp?.candidates) || resp.candidates.length === 0);
-
-  const emptyOutputRescueEnabled = String(process.env.AI_EMPTY_OUTPUT_RESCUE || "").trim() === "1";
-  if (emptyOutputRescueEnabled && isEmptyMax && !modelIs3Pro) {
-    // Gemini 3 Pro can sometimes spend the entire budget on thinking and return empty visible text.
-    // Do ONE rescue call on the SAME model to secure visible output.
-    // For Gemini 3 Pro, avoid thinkingLevel (some variants reject certain levels).
-    // Instead, cap thinking strictly with a small thinkingBudget.
-    const rescueLevel = isCurrentGeminiFlashModel(opts.model)
-      ? "low"
-      : isGemini3Flash(opts.model) ? "minimal" : "low";
-    const rescueThinkingConfig: any = modelIs3Pro ? { thinkingBudget: 128 } : { thinkingLevel: rescueLevel };
-    const rescueHeadroom = modelIs3Pro ? 1024 : thinkingLevelHeadroom(rescueLevel);
-
-    // Give the model enough room for BOTH thinking + visible text.
-    const rescueUser = `${user}\n\n(중요) 직전 시도에서 출력이 비었습니다. 반드시 출력 규칙을 지키며 1문장 이상 가시 텍스트를 출력하세요.`;
-
-    // We keep the user's requested maxOutputTokens as the 'visible-output budget' and add a headroom.
-    const rescueMaxOut = Math.min(8192, Math.max(512, (maxOutputTokensRequested || 0) + rescueHeadroom + 512));
-
-    const rescueReq: any = {
-      ...baseReq,
-      contents: [{ role: "user", parts: [{ text: rescueUser }] }],
-      config: {
-        ...baseReq.config,
-        maxOutputTokens: rescueMaxOut,
-        thinkingConfig: rescueThinkingConfig,
-      },
-    };
-
-    const t2 = Date.now();
-    try {
-      // Rescue should be bounded, but Gemini 3 Pro can legitimately take longer than Flash.
-      const RESCUE_TIMEOUT_MS = modelIs3Pro ? CALL_TIMEOUT_MS : 12000;
-      let rr0: any = null;
-      try {
-        rr0 = await withTimeout(
-          withRetry(() => genai.models.generateContent(rescueReq), {
-            maxRetries: 1,
-            baseDelayMs: 650,
-            label: "rescueEmptyOutput",
-          }),
-          RESCUE_TIMEOUT_MS
-        );
-      } catch (e: any) {
-        const msg = String(e?.message || e || "");
-        // Gemini 3 Pro: some variants reject thinking config fields. Retry once without thinkingConfig.
-        if (modelIs3Pro && /thinking/i.test(msg) && /(not supported|only set|invalid)/i.test(msg)) {
-          const rescueReqNoThinking: any = {
-            ...rescueReq,
-            config: { ...(rescueReq.config || {}) },
-          };
-          try {
-            delete rescueReqNoThinking.config.thinkingConfig;
-          } catch {}
-          rr0 = await withTimeout(
-            withRetry(() => genai.models.generateContent(rescueReqNoThinking), {
-              maxRetries: 1,
-              baseDelayMs: 650,
-              label: "rescueEmptyOutputNoThinking",
-            }),
-            RESCUE_TIMEOUT_MS
-          );
-        } else {
-          throw e;
-        }
-      }
-
-      if (!rr0) {
-        attempts.push({
-          label: "rescueEmptyOutput",
-          ok: false,
-          ms: Date.now() - t2,
-          err: `timeout>${RESCUE_TIMEOUT_MS}ms`,
-        });
-        // timeout이면 원본 결과(빈 응답)를 그대로 두고, route.ts의 이어쓰기 로직에 맡긴다.
-        // Update rolling stats for Gemini 3 Pro headroom tuning.
-        if (typeof (finalUsage as any)?.reasoningTokens === "number") {
-          recordGemini3ProThoughts(opts.model, Number((finalUsage as any).reasoningTokens));
-        }
-
-        return {
-          text: finalText,
-          usage: {
-            ...finalUsage,
-            latencyMs,
-            model: opts.model,
-            finishReason: finalFinishReason,
-          },
-        };
-      }
-
-      const rescueResp: any = (rr0 as any)?.value ?? rr0;
-      attempts.push({ label: "rescueEmptyOutput", ok: true, ms: Date.now() - t2 });
-
-      const rParts = (rescueResp.candidates?.[0]?.content?.parts || []) as any[];
-      const rJoined = rParts.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
-      const rText = typeof rescueResp.text === "string" ? rescueResp.text : rJoined;
-
-      const rUsage = rescueResp.usageMetadata || rescueResp.usage || {};
-      const rFinish = String(rescueResp.candidates?.[0]?.finishReason || rescueResp.finishReason || "");
-
-      const rPrompt = Number(rUsage?.promptTokenCount ?? rUsage?.prompt_tokens ?? 0) || 0;
-      const rOut = Number(rUsage?.candidatesTokenCount ?? rUsage?.output_tokens ?? 0) || 0;
-      const rTotalRaw = Number(rUsage?.totalTokenCount ?? rUsage?.total_tokens ?? 0) || 0;
-      let rReason =
-        Number(
-          rUsage?.thoughtsTokenCount ??
-            rUsage?.thoughts_token_count ??
-            rUsage?.thoughtsTokens ??
-            rUsage?.thoughts_tokens ??
-            rUsage?.reasoningTokens ??
-            rUsage?.reasoning_tokens ??
-            0
-        ) || 0;
-      const rReasonInferred = rTotalRaw - rPrompt - rOut;
-      if (rReason <= 0 && rReasonInferred > 0) rReason = rReasonInferred;
-      const rTotal = rTotalRaw || (rPrompt + rOut + rReason);
-
-      if (String(rText || "").trim()) {
-        finalText = String(rText || "");
-        finalUsage = {
-          promptTokens: rPrompt,
-          outputTokens: rOut,
-          reasoningTokens: rReason,
-          totalTokens: rTotal,
-        };
-        finalFinishReason = rFinish;
-      }
-    } catch (e: any) {
-      attempts.push({ label: "rescueEmptyOutput", ok: false, ms: Date.now() - t2, err: String(e?.message || e) });
-    }
-  }
+  // Empty, blocked or truncated responses retain their original text and usage.
+  // No automatic rescue, configuration retry or model fallback is allowed.
 
   if (isChatDebug()) {
     console.log(
@@ -1152,82 +923,6 @@ export async function generateText(params: {
     recordGemini3ProThoughts(opts.model, Number((finalUsage as any).reasoningTokens));
   }
 
-  // (자동 fallback) 거부 응답이면 gemini-2.5-pro로 한 번만 재시도.
-  // - opts.disableRefusalFallback === true 면 비활성화 (재귀/특수 호출 방지).
-  // (자동 fallback 1) MAX_TOKENS로 응답이 잘려서 본문이 비어버린 경우.
-  // - thinking이 너무 많이 써서 visible output이 남지 않은 케이스 (gemini-3.x flash high 단계에서 가끔 발생).
-  // - 같은 모델로 1회만 재호출 (output 한도 2배 + thinking 한 단계 낮춤) → 본문 보존.
-  // - disableMaxTokensFallback flag로 재귀 가드.
-  const maxTokensFallbackDisabled = Boolean((opts as any)?.disableMaxTokensFallback);
-  const finishWasMaxTokens = String(finalFinishReason || "").toUpperCase() === "MAX_TOKENS";
-  const visibleBodyShort = String(finalText || "").trim().length < 100;
-  if (!maxTokensFallbackDisabled && finishWasMaxTokens && visibleBodyShort) {
-    try {
-      const expandedOut = Math.min(5000, Math.max(2000, Math.floor(Number(opts.maxOutputTokens || 1200) * 2)));
-      const reducedReason = Math.max(384, Math.floor(Number(opts.maxReasoningTokens || 768) / 2));
-      const fb = await generateText({
-        system,
-        user,
-        opts: {
-          ...opts,
-          maxOutputTokens: expandedOut,
-          maxReasoningTokens: reducedReason,
-          disableMaxTokensFallback: true,
-          // refusal fallback도 같이 막아 무한 체인 방지 (이미 본문이 비었으면 refusal 감지 X)
-          disableRefusalFallback: true,
-        },
-      });
-      return {
-        text: (fb as any).text,
-        usage: {
-          ...(fb as any).usage,
-          maxTokensFallback: {
-            from: { maxOutputTokens: opts.maxOutputTokens, maxReasoningTokens: opts.maxReasoningTokens },
-            to: { maxOutputTokens: expandedOut, maxReasoningTokens: reducedReason },
-            reason: "max_tokens_truncation",
-          },
-        },
-      };
-    } catch {
-      // fallback 실패 시 원본 결과 그대로 반환 (사용자가 적어도 빈 응답이라도 봄)
-    }
-  }
-
-  // (자동 fallback 2) 거부 응답 감지 시 gemini-2.5-pro로 1회 재시도.
-  // - 이미 fallback 모델이면 재시도해도 무의미하므로 건너뛴다.
-  const fallbackDisabled = Boolean((opts as any)?.disableRefusalFallback);
-  const alreadyFallback = String(opts.model || "").trim() === REFUSAL_FALLBACK_MODEL;
-  if (!fallbackDisabled && !alreadyFallback && isRefusalText(finalText)) {
-    try {
-      const fb = await generateText({
-        system,
-        user,
-        opts: {
-          ...opts,
-          model: REFUSAL_FALLBACK_MODEL,
-          // 사용자 요청: 2.5 pro fallback 시 추론을 "최대한" 쓰도록.
-          // maxReasoningTokens=-1 이면 buildThinkingConfig(25pro 분기)가 thinkingBudget=-1(=dynamic/auto)로
-          // 보내고, 모델이 필요한 만큼 자율적으로 thoughts 토큰을 사용한다. (HIGH 한계 초과 가능)
-          maxReasoningTokens: -1,
-          disableRefusalFallback: true,
-        },
-      });
-      return {
-        text: (fb as any).text,
-        usage: {
-          ...(fb as any).usage,
-          modelFallback: {
-            from: opts.model,
-            to: REFUSAL_FALLBACK_MODEL,
-            reason: "refusal_detected",
-            originalText: finalText.slice(0, 200),
-          },
-        },
-      };
-    } catch {
-      // fallback 자체가 실패하면 원래 결과를 그대로 반환 (사용자가 적어도 거부 메시지를 볼 수 있게)
-    }
-  }
 
   return {
     text: finalText,
@@ -1358,6 +1053,8 @@ export async function generateTextStream(params: {
         }
       }
     );
+
+    if (!s0) throw generationTimeoutError(requestModel, CALL_TIMEOUT_MS);
 
     // withRetry returns { value, retries }. Unwrap here so the stream normalizer
     // can see the actual SDK stream shape.
