@@ -454,6 +454,20 @@ function computeEffectiveMaxOutputTokens(
     }
   }
 
+  if (isCurrentGeminiFlashModel(model) && (tl === "medium" || tl === "high")) {
+    // Flash MID used 4,967 thought tokens on a ~20k-token chat prompt, leaving
+    // only 206 answer tokens under the old 1,536-token headroom cap. Reasoning
+    // effort is not a hard token limit, and must not scale down with body length.
+    // Keep req (the existing body + status token allowance) unchanged and add
+    // bounded room for thoughts. This neither changes thinkingLevel nor the
+    // character budgets / output-length instructions supplied by the route.
+    const thoughtReserveFloor = tl === "high" ? 8192 : 6144;
+    const thoughtReserve = Math.min(8192, Math.max(thoughtReserveFloor, headroom));
+    // Covers the route's maximum 12,288 answer tokens plus the full reserve,
+    // while retaining a finite safety cap for unusually large direct callers.
+    return Math.min(24576, req + thoughtReserve + 64);
+  }
+
 
   // Gemini 3 Pro: prevent "thoughts eat the whole budget" cutoffs without inflating latency too much.
 // - thinkingBudget caps thoughts tokens (preferred)
