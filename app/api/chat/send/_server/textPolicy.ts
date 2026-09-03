@@ -62,6 +62,29 @@ export function selectMessagesBeforeCurrentUser(messages: any[], currentUserMess
   return currentIndex >= 0 ? list.slice(0, currentIndex) : list.slice();
 }
 
+export function selectMessagesBeforeContinuationTurn(
+  messages: any[],
+  assistantMessageId: string
+) {
+  const list = Array.isArray(messages) ? messages : [];
+  const targetId = String(assistantMessageId || "").trim();
+  if (!targetId) return list.slice();
+  const assistantIndex = list.findIndex(
+    (message) => String(message?.id || "") === targetId
+  );
+  if (assistantIndex < 0) return list.slice();
+
+  // The target answer itself is supplied separately as the continuation tail.
+  // Also omit its paired user turn so the model cannot mistake that already
+  // answered instruction for the active request and answer it a second time.
+  for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+    if (String(list[index]?.role || "").toLowerCase() === "user") {
+      return list.slice(0, index);
+    }
+  }
+  return list.slice(0, assistantIndex);
+}
+
 // lastN 메시지는 그대로 전달하고, 그 이전은 요약으로 대체하는 용도
 export function formatStoryTurns(messages: any[], personaName: string, npcName: string) {
   return messages
@@ -1325,12 +1348,57 @@ function _stripStatusBlocks(meta: string): string {
   return src.trimEnd();
 }
 
+function _cleanNarrativeForMetaSummary(body: string): string {
+  return String(body ?? "")
+    .replace(/```[^\n]*\n[\s\S]*?\n```/gu, " ")
+    .replace(/```[^\n]*(?:\n|$)[\s\S]*$/gu, " ")
+    .replace(/!\[[^\]]*\]\([^)]*\)/gu, " ")
+    .replace(/\{\{\s*img\s*:[^}]+\}\}/giu, " ")
+    .replace(/<[^>]+>/gu, " ")
+    .split(/\r?\n/u)
+    .map((line) =>
+      line
+        .trim()
+        .replace(/^[*`"“”‘’]+/u, "")
+        .replace(/[*`"“”‘’]+$/u, "")
+        .trim()
+    )
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+/**
+ * Builds a readable local summary without copying a raw tail from the story.
+ * Prefer one complete recent sentence; only use an ellipsis fallback when every
+ * available sentence is longer than the panel budget.
+ */
+export function summarizeNarrativeForMetaFallback(body: string, maxChars = 90): string {
+  const limit = Math.max(24, Math.floor(Number(maxChars) || 90));
+  const plain = _cleanNarrativeForMetaSummary(body);
+  if (!plain) return "";
+
+  const completeSentences = plain.match(/[^.!?。！？…]+(?:[.!?。！？]+|…+)/gu) || [];
+  for (let index = completeSentences.length - 1; index >= 0; index -= 1) {
+    const sentence = String(completeSentences[index] || "").trim();
+    if (sentence && sentence.length <= limit) return sentence;
+  }
+
+  if (plain.length <= limit) return plain;
+  const prefix = plain.slice(0, Math.max(1, limit - 1)).trimEnd();
+  const wordBoundary = prefix.lastIndexOf(" ");
+  const clipped = wordBoundary >= Math.floor(limit * 0.55) ? prefix.slice(0, wordBoundary) : prefix;
+  return `${clipped.replace(/[,:;\-–—]+$/u, "").trimEnd()}…`;
+}
+
 function _summarizeForInfo(body: string, statusContent?: string): string {
   const prefer = String(statusContent ?? "").trim();
-  let raw = prefer && !/상태창\s*정보\s*없음/.test(prefer) ? prefer : String(body ?? "");
-  raw = raw.replace(/```/g, "").replace(/\s+/g, " ").trim();
+  let raw = prefer && !/상태창\s*정보\s*없음/.test(prefer)
+    ? _cleanNarrativeForMetaSummary(prefer)
+    : summarizeNarrativeForMetaFallback(body, 120);
   if (!raw) return "(상황 요약 없음)";
-  if (raw.length > 120) raw = raw.slice(0, 120).trimEnd() + "…";
+  if (raw.length > 120) raw = summarizeNarrativeForMetaFallback(raw, 120);
   return raw;
 }
 
@@ -1414,15 +1482,23 @@ export type LocalMetaFallbackContext = {
 };
 
 function _sanitizeFenceLabel(labelHint?: string): string {
-  const raw = String(labelHint || "INFO").trim().toUpperCase();
-  const safe = raw.replace(/[^A-Z0-9_-]/g, "");
-  return safe || "INFO";
+  const raw = String(labelHint || "INFO")
+    .trim()
+    .split(/\s+/u)[0]
+    ?.replace(/`+/gu, "") || "";
+  const safe = raw.match(/^[A-Za-z0-9_\-ㄱ-ㅎㅏ-ㅣ가-힣]{1,32}/u)?.[0] || "";
+  if (!safe) return "INFO";
+  // Preserve the previous normalization for ASCII labels while allowing the
+  // creator's Korean label to survive unchanged.
+  return /^[\x00-\x7F]+$/u.test(safe) ? safe.toUpperCase() : safe;
 }
 
 function _firstFenceBlockOrEmpty(text?: string): string {
-  const s = String(text || "");
-  const m = s.match(/```[A-Za-z0-9_-]{1,32}[\s\S]*?```/);
-  return m ? m[0] : "";
+  const s = String(text || "").replace(/\r\n/g, "\n");
+  const m = s.match(
+    /(?:^|\n)[ \t]*```[ \t]*[A-Za-z0-9_\-ㄱ-ㅎㅏ-ㅣ가-힣]{1,32}[^\n]*\n[\s\S]*?\n[ \t]*```/u
+  );
+  return m ? m[0].replace(/^\n/u, "").trim() : "";
 }
 
 function _stripHeadingsInsideFence(fence: string): string {
@@ -1490,7 +1566,10 @@ export function buildLocalFallbackMetaFence(args: {
   } else {
     // Ensure label matches hint if possible.
     base = normalizeAnyFenceOpen(base);
-    base = base.replace(/^```\s*[A-Za-z0-9_-]{1,32}/, "```" + label);
+    base = base.replace(
+      /^```\s*[A-Za-z0-9_\-ㄱ-ㅎㅏ-ㅣ가-힣]{1,32}/u,
+      "```" + label
+    );
   }
 
   // Patch bracket/place/summary lines (best-effort, keep structure).

@@ -62,6 +62,32 @@ function hasSecondPersonReference(text: string) {
   return /(?:당신|너는|네가|넌|너를|너에게|자네|그쪽)/u.test(text);
 }
 
+function hasContextualSubjectReference(text: string) {
+  return /(?:그놈|그\s*자|그\s*사람|그는|그가|그에게|범인은|용의자는|놈은|자는)/u.test(text);
+}
+
+function isBareStatusPredicate(text: string) {
+  return /^[\s"“”'‘’*]*(?:1급\s*)?(?:피의자|피고인|수배자|수배\s*중|구속\s*(?:상태|중)|수형자|복역\s*중)/u.test(
+    text
+  );
+}
+
+function lastMentionedIdentity(text: string, identities: LegalStatusIdentity[]) {
+  let result: LegalStatusIdentity | undefined;
+  let resultIndex = -1;
+  for (const identity of identities) {
+    for (const name of identityNames(identity)) {
+      if (name.length < 2) continue;
+      const index = text.lastIndexOf(name);
+      if (index > resultIndex) {
+        result = identity;
+        resultIndex = index;
+      }
+    }
+  }
+  return result;
+}
+
 function splitLineSentences(line: string) {
   const marked = String(line || "").replace(
     /([.!?。！？](?:["”']|\*+)?)(\s+)/gu,
@@ -127,7 +153,15 @@ function collectTrustedTexts(input: {
   trustedNarrationTexts?: string[];
 }) {
   return [
-    ...(input.trustedUserTexts || []),
+    ...(input.trustedUserTexts || []).filter(
+      (value) =>
+        !/(?:하지도\s*않|한\s*적(?:이|도)?\s*없|아닌데|아니라고|지어내|잘못(?:된|했|됐)|오류|날조)/u.test(
+          String(value || "")
+        ) &&
+        !/(?:수배자|피의자|피고인|구속|기소|유죄|복역)[^.!?。！？\n]{0,40}(?:라고\s*(?:말|해)|설명(?:해|하라)|말(?:해|하라)|알려(?:줘|달라)|나열(?:해|하라))/u.test(
+          String(value || "")
+        )
+    ),
     ...(input.trustedNarrationTexts || []),
   ]
     .map((value) => String(value || ""))
@@ -151,24 +185,38 @@ export function removeUnsupportedLegalStatusClaims(input: {
   const removedStatuses = new Set<string>();
   const removedCharacters = new Set<string>();
   let removed = 0;
-  let inFence = false;
+  let contextIdentity: LegalStatusIdentity | undefined;
 
   const lines = source.split(/\r?\n/u).map((line) => {
     if (/^\s*```/u.test(line)) {
-      inFence = !inFence;
       return line;
     }
-    if (inFence || !line.trim()) return line;
+    if (!line.trim()) return line;
 
     const kept = splitLineSentences(line).filter((sentence) => {
+      const mentionedInSentence = lastMentionedIdentity(sentence, identities);
       const definitions = LEGAL_STATUSES.filter((definition) =>
         definition.claim.test(sentence)
       );
-      if (definitions.length === 0) return true;
+      if (definitions.length === 0) {
+        if (mentionedInSentence) contextIdentity = mentionedInSentence;
+        return true;
+      }
 
       let targets = identities.filter((identity) => mentionsIdentity(sentence, identity));
       if (targets.length === 0 && hasSecondPersonReference(sentence)) {
         targets = identities.filter((identity) => identity.isPersona);
+      }
+      if (
+        targets.length === 0 &&
+        contextIdentity &&
+        (hasContextualSubjectReference(sentence) || isBareStatusPredicate(sentence))
+      ) {
+        targets = [contextIdentity];
+      }
+      if (targets.length === 0 && isBareStatusPredicate(sentence)) {
+        const personas = identities.filter((identity) => identity.isPersona);
+        if (personas.length === 1) targets = personas;
       }
       if (targets.length === 0) return true;
 
@@ -178,11 +226,15 @@ export function removeUnsupportedLegalStatusClaims(input: {
             !hasTrustedEvidence(definition, identity, trustedTexts, identities)
         )
       );
-      if (!unsupported) return true;
+      if (!unsupported) {
+        if (mentionedInSentence) contextIdentity = mentionedInSentence;
+        return true;
+      }
 
       removed += 1;
       for (const definition of definitions) removedStatuses.add(definition.id);
       for (const identity of targets) removedCharacters.add(identity.name);
+      if (mentionedInSentence) contextIdentity = mentionedInSentence;
       return false;
     });
     return restoreOuterNarrationMarkers(line, kept.join(" "));

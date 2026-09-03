@@ -58,6 +58,7 @@ export async function GET(request: Request) {
             `SELECT
               id, name, background, characterName,
               SUBSTR(COALESCE(character,''), 1, 800) AS character,
+              CASE WHEN systemPrompt LIKE '%빠른 명령: 능력치 보기%' THEN 1 ELSE 0 END AS supportsAbilityView,
               image, tags, target, createdAt,
               COALESCE(userEmail,'') AS userEmail,
               COALESCE(isPublic,1) AS isPublic,
@@ -72,6 +73,7 @@ export async function GET(request: Request) {
             `SELECT
               id, name, background, characterName,
               SUBSTR(COALESCE(character,''), 1, 800) AS character,
+              CASE WHEN systemPrompt LIKE '%빠른 명령: 능력치 보기%' THEN 1 ELSE 0 END AS supportsAbilityView,
               image, tags, target, createdAt,
               COALESCE(userEmail,'') AS userEmail,
               COALESCE(isPublic,1) AS isPublic,

@@ -7,6 +7,9 @@ const {
   clearPreviousTerminalRows,
   createInactivityWatchdog,
   isCtrlGShortcut,
+  isShiftEnterKeypress,
+  insertReadlineLineBreak,
+  installShiftEnterLineBreak,
   buildContinueInstruction,
   continuationDelta,
   pickNextMaintenanceEntry,
@@ -42,6 +45,42 @@ test("Ctrl+G is recognized as the continue shortcut", () => {
   assert.equal(isCtrlGShortcut("\x07", undefined), true);
   assert.equal(isCtrlGShortcut("", { ctrl: true, name: "g" }), true);
   assert.equal(isCtrlGShortcut("g", { ctrl: false, name: "g" }), false);
+});
+
+test("Shift+Enter recognizes readline, CSI-u, and Windows Terminal key forms", () => {
+  assert.equal(isShiftEnterKeypress("\r", { name: "return", shift: true }), true);
+  assert.equal(isShiftEnterKeypress(undefined, { sequence: "\x1b[13;2u" }), true);
+  assert.equal(isShiftEnterKeypress(undefined, { sequence: "\x1b[13;28;13;1;16;1_" }), true);
+  assert.equal(isShiftEnterKeypress("\r", { name: "return", shift: false }), false);
+});
+
+test("Shift+Enter inserts a newline without submitting the readline question", () => {
+  const ttyWrite = Symbol("_ttyWrite");
+  let submitted = 0;
+  const rl = {
+    line: "첫째둘째",
+    cursor: 2,
+    [ttyWrite]() { submitted += 1; },
+  };
+
+  const remove = installShiftEnterLineBreak(rl, { enableProtocol: false });
+  rl[ttyWrite](undefined, { sequence: "\x1b[13;2u" });
+  assert.equal(rl.line, "첫째\n둘째");
+  assert.equal(rl.cursor, 3);
+  assert.equal(submitted, 0);
+
+  rl[ttyWrite]("\r", { name: "return", shift: false });
+  assert.equal(submitted, 1);
+  remove();
+});
+
+test("multiline insertion also uses readline native editing when available", () => {
+  const inserted = [];
+  const rl = {
+    _insertString(value) { inserted.push(value); },
+  };
+  assert.equal(insertReadlineLineBreak(rl), true);
+  assert.deepEqual(inserted, ["\n"]);
 });
 
 test("continue instruction includes the latest answer tail", () => {

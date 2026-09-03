@@ -398,7 +398,16 @@ function dynamicThinkingHeadroomForGemini3(thinkingLevel: string, estimatedPromp
     768;
 
   const dyn = Math.max(floor, Math.round(pt * ratio));
-  return Math.min(2304, dyn);
+  // Gemini 3.1 Pro can spend 5k+ thought tokens on a ~30k-token Korean
+  // continuity prompt even at thinkingLevel=medium. A 2304 cap starves the
+  // visible answer and produces MAX_TOKENS after only a few sentences. This
+  // headroom does not force extra thinking; it only stops thoughts already
+  // being generated from consuming the answer budget.
+  const dynamicCapRaw = Number(process.env.GEMINI3_DYNAMIC_HEADROOM_CAP ?? 6144);
+  const dynamicCap = Number.isFinite(dynamicCapRaw)
+    ? Math.min(8192, Math.max(2304, Math.floor(dynamicCapRaw)))
+    : 6144;
+  return Math.min(dynamicCap, dyn);
 }
 
 function computeEffectiveMaxOutputTokens(
@@ -1968,6 +1977,8 @@ export async function summarizeLongMemoryKorean(params: {
 - 사실 신뢰도는 [사용자]의 명시적 설정·정정 > 제공된 인물별 정본 사실 > 검증된 사건 결과 > [어시스턴트] 지문 순서다.
 - [어시스턴트]가 임의로 붙인 체형·외모·나이·직업·정체 형용사는 사용자 설정이나 정본 사실을 변경하는 근거가 아니다.
 - [어시스턴트] 지문에만 나온 정적인 신체·프로필 묘사는 사건 요약에 승격하지 마라. 필요한 인물 사실은 별도의 구조화 기억이 담당한다.
+- 키·체중·체형·외모를 요약해야 할 때는 반드시 같은 문장에 그 속성 소유자의 고유명사를 쓴다. 현재 화자·장면 초점·기억 대상·가장 가까운 인물에게 다른 참여자의 신체를 옮기지 마라.
+- 인물별 사건 기억은 그 인물의 관계·감정 연속성을 위한 기억이지, 사건 문장 속 모든 신체 속성이 그 인물 것이라는 뜻이 아니다.
 - 키·체중·나이 등 수치와 정반대인 표현을 동의어·비유로 새로 만들지 마라.
 - [사용자]가 직접 확정·정정하거나 '기억해'라고 지정한 설정은 해당 요약에서 생략하지 마라.
 - 확정 설정의 인물 고유명사, 별칭, 가족관계의 대상과 세대, 나이·날짜·횟수·수치는 원문 그대로 보존해라.
@@ -2192,6 +2203,8 @@ export async function summarizeLongMemorySectionKorean(params: {
 - 사실 신뢰도는 [사용자]의 명시적 설정·정정 > 제공된 인물별 정본 사실 > 검증된 사건 결과 > [어시스턴트] 지문 순서로 적용할 것
 - [어시스턴트]가 임의로 붙인 체형·외모·나이·직업·정체 형용사는 사용자 설정이나 정본 사실을 변경하는 근거로 쓰지 말 것
 - [어시스턴트] 지문에만 나온 정적인 신체·프로필 묘사는 사건 요약에 승격하지 말 것. 필요한 인물 사실은 별도의 구조화 기억이 담당함
+- 키·체중·체형·외모를 보존할 때는 같은 문장에 속성 소유자의 고유명사를 반드시 쓸 것. 현재 화자·장면 초점·기억 대상에게 다른 참여자의 신체를 옮기지 말 것
+- 인물별 사건 기억의 대상은 기억 소유자일 뿐, 사건 문장 속 모든 신체 속성의 소유자가 아님
 - 키·체중·나이 등 수치와 정반대인 표현을 동의어·비유로 새로 만들지 말 것
 - 본문(2번째 줄)은 약 ${soft}자 이내로 최대한 압축(필요하면 과감히 생략)
 - ${soft}자는 최소 분량이 아니라 상한 목표이며, 핵심 정보가 적으면 훨씬 짧아도 됨${extraGuide}

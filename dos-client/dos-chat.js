@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const readlineCore = require("readline");
 const readline = require("readline/promises");
@@ -207,7 +208,16 @@ function createInactivityWatchdog(parentSignal, timeoutMs = SEND_INACTIVITY_TIME
   };
 }
 
+let kittyKeyboardProtocolActive = false;
+
+function restoreKeyboardProtocol(output = process.stdout) {
+  if (!kittyKeyboardProtocolActive) return;
+  kittyKeyboardProtocolActive = false;
+  try { output.write("\x1b[<u"); } catch {}
+}
+
 function restoreTerminal() {
+  restoreKeyboardProtocol();
   try {
     process.stdout.write(`${ANSI.mouseOff}${ANSI.showCursor}${ANSI.reset}${ANSI.alternateOff}`);
   } catch {}
@@ -249,6 +259,88 @@ function requestPromptShortcut(action) {
 
 function isCtrlGShortcut(str, key) {
   return Boolean((key && key.ctrl && key.name === "g") || str === "\x07");
+}
+
+function isShiftEnterKeypress(str, key) {
+  const name = String((key && key.name) || "").toLowerCase();
+  if (key && key.shift && (name === "return" || name === "enter")) return true;
+
+  const sequence = String((key && key.sequence) || str || "");
+  // Kitty keyboard protocol: CSI 13 ; 2 [ : event ] [ ; text ] u
+  if (/^\x1b\[13;2(?::[123])?(?:;[0-9:]+)?u$/u.test(sequence)) return true;
+  // Compatibility with terminals that encode modified Enter using CSI ~.
+  if (/^\x1b\[13;2~$/u.test(sequence)) return true;
+
+  // Windows Terminal win32-input-mode:
+  // CSI Vk;Sc;Uc;Kd;Cs;Rc_ (VK_RETURN=13, SHIFT_PRESSED=0x10).
+  const win32 = sequence.match(/^\x1b\[(\d+);(\d+);(\d+);(\d+);(\d+);(\d+)_$/u);
+  if (!win32) return false;
+  const virtualKey = Number(win32[1]);
+  const keyDown = Number(win32[4]);
+  const controlKeyState = Number(win32[5]);
+  return virtualKey === 13 && keyDown === 1 && (controlKeyState & 0x10) !== 0;
+}
+
+function insertReadlineLineBreak(rl) {
+  if (!rl) return false;
+  if (typeof rl._insertString === "function") {
+    rl._insertString("\n");
+    return true;
+  }
+
+  if (typeof rl.line !== "string") return false;
+  const cursor = Math.max(0, Math.min(rl.line.length, Number(rl.cursor) || 0));
+  rl.line = `${rl.line.slice(0, cursor)}\n${rl.line.slice(cursor)}`;
+  rl.cursor = cursor + 1;
+  if (typeof rl._refreshLine === "function") rl._refreshLine();
+  return true;
+}
+
+function findReadlineTtyWriteSymbol(rl) {
+  let current = rl;
+  while (current) {
+    const symbol = Object.getOwnPropertySymbols(current).find(
+      (candidate) => candidate.description === "_ttyWrite" && typeof rl[candidate] === "function"
+    );
+    if (symbol) return symbol;
+    current = Object.getPrototypeOf(current);
+  }
+  return null;
+}
+
+function installShiftEnterLineBreak(rl, options = {}) {
+  const ttyWriteSymbol = findReadlineTtyWriteSymbol(rl);
+  if (!ttyWriteSymbol) return () => {};
+
+  const original = rl[ttyWriteSymbol];
+  rl[ttyWriteSymbol] = function patchedTtyWrite(str, key) {
+    if (isShiftEnterKeypress(str, key)) {
+      insertReadlineLineBreak(this);
+      return;
+    }
+    return original.call(this, str, key);
+  };
+
+  const output = options.output || rl.output || process.stdout;
+  const enableProtocol =
+    options.enableProtocol !== false &&
+    process.stdin.isTTY &&
+    output &&
+    output.isTTY &&
+    typeof output.write === "function";
+  if (enableProtocol) {
+    // Ask modern terminals (including Windows Terminal) to report modified
+    // Enter distinctly as CSI-u. Unsupported terminals safely ignore it.
+    try {
+      output.write("\x1b[>1u");
+      kittyKeyboardProtocolActive = true;
+    } catch {}
+  }
+
+  return () => {
+    if (rl[ttyWriteSymbol] !== original) rl[ttyWriteSymbol] = original;
+    if (enableProtocol) restoreKeyboardProtocol(output);
+  };
 }
 
 // Ctrl+C 처리:
@@ -3470,6 +3562,94 @@ async function continueLatestAssistant() {
   }
 }
 
+async function exportNovelPdf(rl) {
+  if (!state.chatId) {
+    throw new Error("열린 채팅이 없습니다. /open 또는 /new로 채팅을 먼저 여세요.");
+  }
+
+  console.log("");
+  hr("소설로 만들기");
+  console.log("현재 채팅 전체를 읽어 한국식 웹소설로 재구성하고 PDF로 저장합니다.");
+  console.log("긴 채팅은 장마다 AI를 호출하므로 시간이 걸릴 수 있습니다.");
+  console.log("작품 제목은 채팅방 제목을 복사하지 않고 원고 내용에 맞춰 새로 정합니다.");
+  console.log(`${ANSI.yellow}진행 중 이 DOS 창을 닫거나 나가면 취소됩니다. 완료될 때까지 그대로 기다려 주세요.${ANSI.reset}`);
+  console.log("원본 채팅과 장기기억 DB는 변경되지 않습니다.");
+  const answer = String(await rl.question("계속할까요? [y/N] ")).trim().toLowerCase();
+  if (!["y", "yes", "예", "ㅇ"].includes(answer)) {
+    console.log("취소했습니다.");
+    return;
+  }
+
+  const res = await fetch(`${API_BASE}/api/chat/novel/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId: state.chatId }),
+    signal: state.activeController ? state.activeController.signal : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text;
+    try {
+      const json = JSON.parse(text);
+      message = String(json && (json.error || json.detail) || text);
+    } catch {}
+    throw new Error(message || `HTTP ${res.status}`);
+  }
+  if (!res.body) throw new Error("진행률 스트림을 열지 못했습니다.");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let completed = null;
+  let progressPrinted = false;
+  const printProgress = (percent, message) => {
+    const line = `소설 PDF: ${String(Math.max(0, Math.min(100, Number(percent) || 0))).padStart(3, " ")}% · ${String(message || "만드는 중")}`;
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r\x1b[2K${line}`);
+      progressPrinted = true;
+    } else {
+      console.log(line);
+    }
+  };
+  const acceptLine = (line) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    if (event && event.type === "progress") {
+      printProgress(event.percent, event.message);
+    } else if (event && event.type === "error") {
+      throw new Error(String(event.error || "소설 PDF 생성 실패"));
+    } else if (event && event.type === "done") {
+      completed = event;
+      printProgress(100, "다운로드 준비 완료");
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      pending += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = pending.split("\n");
+      pending = lines.pop() || "";
+      for (const line of lines) acceptLine(line);
+      if (done) break;
+    }
+    if (pending.trim()) acceptLine(pending);
+  } finally {
+    if (progressPrinted) process.stdout.write("\n");
+  }
+
+  if (!completed || !completed.pdfBase64) {
+    throw new Error("완성된 PDF 데이터가 없습니다.");
+  }
+  const downloadsDir = path.join(os.homedir(), "Downloads");
+  fs.mkdirSync(downloadsDir, { recursive: true });
+  const filename = path.basename(String(completed.filename || "소설.pdf"));
+  const outputPath = path.join(downloadsDir, filename);
+  fs.writeFileSync(outputPath, Buffer.from(String(completed.pdfBase64), "base64"));
+  console.log(`${ANSI.green}완료: ${outputPath}${ANSI.reset}`);
+  console.log(`${Number(completed.chapters || 0)}장 · ${Number(completed.sourceMessages || 0)}개 메시지 반영`);
+}
+
 function help() {
   hr("ARCA DOS CHAT — 명령어");
   console.log("");
@@ -3480,6 +3660,7 @@ function help() {
   console.log("  /new          작품으로 새 채팅 시작");
   console.log("  /history      대화 보기");
   console.log("  /continue     직전 AI 답변 이어서 생성 (Ctrl+G)");
+  console.log("  /novel        전체 채팅을 웹소설 PDF로 만들기 (로컬 전용)");
   console.log("  /delete       최근 user+assistant 한 쌍 삭제");
   console.log("");
   console.log(`${ANSI.bold}${ANSI.title}■ 설정${ANSI.reset}`);
@@ -3522,6 +3703,7 @@ async function handleCommand(line, rl) {
   else if (cmd === "/new" || cmd === "/n") await createChat(arg);
   else if (cmd === "/history" || cmd === "/hi" || cmd === "/hist") await showHistory(Number(arg) || 20);
   else if (cmd === "/continue" || cmd === "/cont" || cmd === "/g") await continueLatestAssistant();
+  else if (cmd === "/novel" || cmd === "/pdf") await exportNovelPdf(rl);
   else if (cmd === "/panel" || cmd === "/ui" || cmd === "/config") await openSettingsPanel(rl);
   else if (cmd === "/settings" || cmd === "/set" || cmd === "/s") await showSettings();
   else if (cmd === "/model" || cmd === "/md") await chooseModelSetting(arg, rl);
@@ -3581,7 +3763,9 @@ async function main() {
     output: process.stdout,
     historySize: 100,
   });
+  const removeShiftEnterLineBreak = installShiftEnterLineBreak(rl);
   installPromptShortcuts(rl);
+  console.log(`${ANSI.gray}입력: Shift+Enter 줄바꿈 · Enter 전송${ANSI.reset}`);
 
   try {
     while (true) {
@@ -3679,6 +3863,7 @@ async function main() {
     }
   } finally {
     pauseBackgroundMaintenance({ abortRunning: true });
+    removeShiftEnterLineBreak();
     rl.close();
   }
   console.log("종료했습니다.");
@@ -3709,6 +3894,9 @@ module.exports = {
   promptPersonaFields,
   createInactivityWatchdog,
   isCtrlGShortcut,
+  isShiftEnterKeypress,
+  insertReadlineLineBreak,
+  installShiftEnterLineBreak,
   buildContinueInstruction,
   continuationDelta,
   pickNextMaintenanceEntry,

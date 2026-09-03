@@ -18,7 +18,7 @@ type SafeTableParsed = { rows: string[][]; headerRows: number };
 
 function tryParseQuestWidget(lang: string, value: string): QuestWidget | null {
   const l = String(lang || "").trim().toLowerCase();
-  if (l !== "info") return null;
+  if (l !== "info" && l !== "quest") return null;
 
   const s = String(value || "").trim();
   if (!s || s[0] !== "{") return null;

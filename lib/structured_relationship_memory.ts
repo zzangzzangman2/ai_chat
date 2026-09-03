@@ -3,10 +3,7 @@ import { randomUUID } from "crypto";
 import { generateText } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { db } from "@/lib/db";
-import {
-  inferCharacterOccupation,
-  isValidDescriptiveRelationship,
-} from "@/lib/relationship_context";
+import { inferCharacterOccupation } from "@/lib/relationship_context";
 import { parseRelationshipKnownBy } from "@/lib/character_knowledge";
 import {
   CANONICAL_FACT_KEYS,
@@ -79,6 +76,12 @@ export const STRUCTURED_RELATION_TYPES = [
 const ROLE_LIKE_NAME_PATTERN =
   /^[가-힣A-Za-z]{1,8}(?:대표|사장|교수|박사|원장|팀장|실장|과장|부장|대리|비서|선생)$/u;
 const RELATION_TYPE_SET = new Set<string>(STRUCTURED_RELATION_TYPES);
+const IMMUTABLE_FAMILY_RELATION_SET = new Set<string>([
+  "아버지", "어머니", "부모", "딸", "아들", "자녀",
+  "할아버지", "할머니", "조부모", "손녀", "손자", "손자녀",
+  "언니", "누나", "오빠", "형", "동생", "여동생", "남동생",
+  "자매", "형제", "형제자매", "배우자",
+]);
 const PERSON_NAME_PATTERN = /^(?:[가-힣]{2,8}|[A-Za-z][A-Za-z0-9._-]{1,39})$/u;
 const NON_CHARACTER_NAMES = new Set([
   "사용자",
@@ -554,7 +557,7 @@ export async function extractStructuredCharacterGraph(params: {
     "3) 직업·배경·기억 결합: 대화뿐 아니라 기존 레지스트리의 job, role, background, relationship_memory, recent_individual_memory를 함께 보고 관계를 추론한다.",
     "4) 관계 정의: 직접 대화가 없어도 제3자 언급, 직업, 배경 상황으로 확인되는 관계를 relationships에 기록한다.",
     "5) 지식 범위: 관계 사실을 직접 목격·경험했거나 명시적으로 전달받아 실제로 아는 인물만 known_by_ids에 기록한다.",
-    "6) 정본 사실 추출: 인물마다 다음 대화에서도 유지되어야 할 나이·성별·키·체중·체형·외모·직업·배경·정체·말투·거주지만 facts에 구조화한다.",
+    "6) 정본 사실 추출: 인물마다 다음 대화에서도 유지되어야 할 나이·성별·키·체중·체형·외모·직업·배경·정체·말투·의사소통 능력·거주지만 facts에 구조화한다.",
     "7) 검증: 기존 인물 레지스트리와 같은 인물은 반드시 기존 id와 main_name을 그대로 재사용한다.",
     "8) 출력: 지정된 JSON 스키마만 출력한다. 코드펜스, 설명, 분석문은 금지한다.",
     "",
@@ -577,7 +580,8 @@ export async function extractStructuredCharacterGraph(params: {
     "- 예: '아이돌과 경비원'이 사귀기 시작하면 '연인', 결혼하면 '배우자', 이혼하면 '이혼한 전 배우자'로 갱신한다.",
     "- 각 character의 job에는 대화와 배경에서 확인되는 직업만 간결하게 기록한다. 확인되지 않으면 빈 문자열을 쓴다.",
     "- relation에 '미확인', '알 수 없음', '관계 미정', '중립'을 쓰는 것은 엄격히 금지한다.",
-    "- 명확한 가족·학교·직장 관계가 없으면 '아이돌과 소속사 경비원', '이제 막 통성명을 한 초면', '현재 사건으로 얽힌 당사자'처럼 직업과 현재 상황을 조합한 서술형 관계를 쓴다.",
+    "- 명확한 구조적 관계가 없으면 relationships에 넣지 않는다. '현재 사건으로 얽힌 당사자', '대화를 나누며 알아가는 사이', 감정·행동·일시적 상황을 관계 라벨로 만들지 않는다.",
+    "- 기존 레지스트리에 이미 있던 두 인물 사이의 가족·혼인 관계는 [어시스턴트] 출력만으로 새로 만들지 않는다. 사용자 설정·수동 관계도에 확정되었거나 기존 동일 관계를 유지하는 경우만 기록한다.",
     "- 감정(공포, 호감, 분노, 경계)은 relation이 아니다. 감정은 details에만 쓰고 relation에는 가족·학교·직장·사회적 지위 또는 현재 상황 관계를 쓴다.",
     "- aliases에는 원문에 실제 등장한 표현만 쓴다. '너/당신/그/그녀/우리' 같은 문맥 의존 대명사는 aliases에 넣지 않는다.",
     "- aliases는 evidence 한 구절 안에 main_name과 alias가 함께 있어 동일 인물임이 직접 증명될 때만 넣는다. 근거가 분리되거나 추측이면 aliases를 비운다.",
@@ -585,12 +589,16 @@ export async function extractStructuredCharacterGraph(params: {
     "- evidence는 반드시 원문에서 글자 그대로 복사한 짧은 구절이어야 한다.",
     "- 동일 인물을 여러 character로 쪼개지 말고, 서로 다른 인물을 같은 호칭만으로 합치지 않는다.",
     "- facts에는 일회성 자세·표정·옷차림·현재 위치·방문 장소·순간 감정·비유를 넣지 않는다. 여러 턴 뒤에도 유지될 정체성·신체·직업·배경·거주지 사실만 넣는다.",
+    "- 말을 하지 못함, 음성 발화 불가, 실어증, 수어·필담·스케치북 같은 지속적 의사소통 방식은 communication fact로 저장한다. 청각장애만으로 발화 불가를 추론하지 않는다.",
     "- residence는 그 인물이 평소 사는 집·자택·거처만 뜻한다. 방문·잠입·숙박·현재 장면의 위치를 residence로 저장하지 않는다.",
     "- 'A의 아랫집/윗집'은 A의 거주지를 기준으로 한 별도 공간 관계다. 다른 인물의 집과 같은 건물이라고 사용자가 명시하지 않았다면 절대 합치지 않는다.",
     "- facts의 source_role은 근거 문장이 [사용자]면 user, [어시스턴트]면 assistant로 정확히 기록한다. 발화 내용이 아니라 원문 역할 태그를 따른다.",
     "- [사용자]가 직접 확정·정정한 사실은 기존 사실과 달라도 최신 값으로 추출한다.",
     "- 단, 등장인물의 대사 속 주장·욕설·질문·추측·거짓말은 사용자 태그에 있어도 정본 사실 근거가 아니다. OOC/설정/서술로 확정된 내용만 user 사실로 인정한다.",
     "- [어시스턴트] 지문은 새 NPC의 아직 없는 사실을 처음 세우는 근거로만 쓸 수 있다. 기존 정본 사실을 덮어쓰거나 모순시키는 AI 형용사·추측은 facts에 넣지 않는다.",
+    "- 예외 없이 [어시스턴트] 지문만으로 키·체중·체형·외모 facts를 새로 만들지 않는다. 신체 facts는 페르소나 최우선 설정, 기존 사용자 정본, [사용자]의 명시적 OOC/설정/서술만 근거로 삼는다.",
+    "- 키·체중·체형·외모의 evidence에는 그 신체 속성의 소유자 실명이 같은 문장에 직접 있어야 한다. 직전 문장의 화자, 현재 장면 초점, character_id/기억 소유자, 가장 가까운 다른 인물로 소유자를 추정하지 않는다.",
+    "- 사건 문장에 여러 인물이 있으면 신체 수치와 체형은 정확히 이름 붙은 참여자에게만 귀속한다. 페르소나와 NPC가 함께 나온 사건에서 한쪽의 신체를 다른 쪽 facts로 복사하지 않는다.",
     "- 특히 키·체중 수치와 반대되는 체형 표현을 만들지 않는다. 기존 설정이 100kg 이상인 인물을 왜소한 몸집·마른 체구·가녀린 체격으로 추출하지 않는다.",
     "- 사실 근거는 반드시 한 개의 짧은 exact evidence로 직접 확인되어야 하며, 추론한 수치나 외형은 저장하지 않는다.",
     `페르소나 최우선 설정: ${JSON.stringify(params.authoritativePersona || {})}`,
@@ -803,7 +811,7 @@ export async function extractStructuredCharacterGraph(params: {
       !source ||
       !target ||
       source.mainName === target.mainName ||
-      (!RELATION_TYPE_SET.has(relation) && !isValidDescriptiveRelationship(relation)) ||
+      !RELATION_TYPE_SET.has(relation) ||
       !evidence ||
       !sourceRole ||
       declaredSourceRole !== sourceRole ||
@@ -1193,7 +1201,7 @@ export function applyStructuredCharacterGraph(params: {
       if (
         !subjectName ||
         !objectName ||
-        (!RELATION_TYPE_SET.has(relation) && !isValidDescriptiveRelationship(relation))
+        !RELATION_TYPE_SET.has(relation)
       ) {
         continue;
       }
@@ -1275,6 +1283,19 @@ export function applyStructuredCharacterGraph(params: {
         addressTargetName?: string;
         addressTerm?: string;
       } | undefined;
+      const subjectAlreadyKnown =
+        subjectKey === "persona" || existingByName.has(normalizedKey(subjectName));
+      const objectAlreadyKnown =
+        objectKey === "persona" || existingByName.has(normalizedKey(objectName));
+      if (
+        sourceRole === "assistant" &&
+        IMMUTABLE_FAMILY_RELATION_SET.has(relation) &&
+        subjectAlreadyKnown &&
+        objectAlreadyKnown &&
+        !existingRelation?.id
+      ) {
+        continue;
+      }
       const knownByNames = [
         ...new Set([
           ...parseRelationshipKnownBy(existingRelation?.knownBy),

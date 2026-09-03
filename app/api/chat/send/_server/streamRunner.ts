@@ -1,3 +1,5 @@
+import { assessTurnCompletion } from "../../../../../lib/turn_completion_guard";
+
 export type StreamRunOneResult = {
   raw: string;
   usage: any;
@@ -11,7 +13,7 @@ export type RunStreamMainGenerationParams = {
   runOneBuffered: StreamRunOne;
   runOneStream: StreamRunOne;
   mergeUsage: (base: any, add: any) => any;
-  makeContinueUser: (combined: string) => string;
+  makeContinueUser: (combined: string, reasons?: readonly string[]) => string;
   endsWithCompleteFence: (text: string) => boolean;
   userPrompt: string;
   maxContinues: number;
@@ -22,6 +24,7 @@ export type RunStreamMainGenerationResult = {
   combinedRaw: string;
   combinedUsage: any;
   finishReason: string;
+  continuationCount: number;
 };
 
 export type RunOptionalShortContinueParams = {
@@ -33,7 +36,7 @@ export type RunOptionalShortContinueParams = {
   maxOutputTokensForCall: number;
   raw: string;
   combinedUsage: any;
-  makeContinueUser: (combined: string) => string;
+  makeContinueUser: (combined: string, reasons?: readonly string[]) => string;
   generateText: (args: { system: string; user: string; opts: any }) => Promise<any>;
   systemForContinuation: string;
   opts: any;
@@ -44,11 +47,15 @@ export type RunOptionalShortContinueParams = {
   stripUrlsAndMediaMarkdown: (s: string) => string;
   streamDebug: boolean;
   streamTag: string;
+  currentUserText?: string;
+  allowBoundedRecovery?: boolean;
 };
 
 export type RunOptionalShortContinueResult = {
   raw: string;
   combinedUsage: any;
+  replaced: boolean;
+  reasons: string[];
 };
 
 export type RunBufferedOneParams = {
@@ -142,6 +149,7 @@ export async function runStreamMainGeneration(
   let combinedRaw = "";
   let combinedUsage: any = null;
   let finishReason = "";
+  let continuationCount = 0;
 
   // 1) initial generation
   {
@@ -165,6 +173,7 @@ export async function runStreamMainGeneration(
     combinedRaw += r.raw;
     combinedUsage = params.mergeUsage(combinedUsage, r.usage);
     finishReason = r.finishReason;
+    continuationCount += 1;
   }
 
   // Preserve final finishReason in usage for logging/UI.
@@ -181,6 +190,7 @@ export async function runStreamMainGeneration(
     combinedRaw,
     combinedUsage,
     finishReason,
+    continuationCount,
   };
 }
 
@@ -189,6 +199,8 @@ export async function runOptionalShortContinue(
 ): Promise<RunOptionalShortContinueResult> {
   let raw = params.raw;
   let combinedUsage = params.combinedUsage;
+  let replaced = false;
+  let reasons: string[] = [];
 
   try {
     const strlenLocal = (s: string) => Array.from(String(s || "")).length;
@@ -199,40 +211,72 @@ export async function runOptionalShortContinue(
         .replace(/```/g, " ");
     const narrativeForLen = (s: string) =>
       params.stripUrlsAndMediaMarkdown(stripAllFenceBlocks(params.stripEndMarker(String(s || ""))));
-    const curLenNarr = strlenLocal(narrativeForLen(raw).trim());
+    const assessment = assessTurnCompletion({
+      text: raw,
+      currentUserText: params.currentUserText,
+      minNarrativeChars: params.promptMinForGuide,
+      finishReason: combinedUsage?.finishReason,
+    });
+    const curLenNarr = strlenLocal(narrativeForLen(assessment.body).trim());
     // When we reserve a meta tail budget, the *narrative* minimum should not exceed the narrative budget.
     // (Otherwise the server might try to "continue" to reach a min length that the prompt will later forbid.)
     const gap = params.promptMinForGuide - curLenNarr;
 
     // Only when we have *some* content but are clearly under target.
-    if (
+    const legacyShortContinue =
       params.allowSecondCalls &&
       process.env.CHAT_ENABLE_SHORT_CONTINUE === "1" &&
       !params.oneShot &&
-      !params.disallowG3ProContinue &&
-      curLenNarr > 0 &&
-      gap > 50 &&
-      strlenLocal(raw) < params.promptMaxChars
+      !params.disallowG3ProContinue;
+    // A normal STOP is authoritative. Do not spend a second request merely
+    // because prose is shorter than the prompt target or a plural-response
+    // heuristic thinks another line would be useful. Recovery is reserved for
+    // objective provider failure: empty output or a MAX_TOKENS truncation.
+    const hardRecovery = assessment.reasons.some(
+      (reason) => reason === "EMPTY_BODY" || reason === "MAX_TOKENS"
+    );
+    const boundedRecovery = Boolean(
+      !params.oneShot && params.allowBoundedRecovery && hardRecovery
+    );
+    if (
+      (legacyShortContinue || boundedRecovery) &&
+      (curLenNarr > 0 || boundedRecovery) &&
+      (gap > 50 || assessment.reasons.some((reason) => reason !== "SHORT_BODY")) &&
+      (boundedRecovery || strlenLocal(raw) < params.promptMaxChars)
     ) {
+      reasons = assessment.reasons;
       const maxTok = Math.min(2048, Math.max(384, Math.floor(gap * 3)));
-      const contUser = params.makeContinueUser(raw);
+      const contUser = params.makeContinueUser(assessment.body, assessment.reasons);
       const more = await params.generateText({
         system: params.systemForContinuation,
         user: contUser,
-        opts: { ...params.opts, maxOutputTokens: Math.min(params.maxOutputTokensForCall, maxTok) } as any,
+        opts: {
+          ...params.opts,
+          maxReasoningTokens: Math.min(384, Math.max(0, Number(params.opts?.maxReasoningTokens) || 0)),
+          maxOutputTokens: Math.min(params.maxOutputTokensForCall, maxTok),
+        } as any,
       });
 
-      let add = params.stripStandaloneSeparatorLines(params.stripEndMarker(String((more as any)?.text || "")));
-      // Enforce the same max char headroom at append-time.
-      const remaining = Math.max(0, Math.floor(params.promptMaxChars - strlenLocal(raw)));
+      const addAssessment = assessTurnCompletion({
+        text: params.stripEndMarker(String((more as any)?.text || "")),
+        minNarrativeChars: 0,
+      });
+      let add = params.stripStandaloneSeparatorLines(stripAllFenceBlocks(addAssessment.body));
+      // Recovery must never expand a turn beyond the same total display budget
+      // used by the first call.
+      const remaining = Math.max(
+        0,
+        Math.floor(params.promptMaxChars - strlenLocal(raw) - 1)
+      );
       if (remaining > 0 && add) {
         if (strlenLocal(add) > remaining) {
           add = Array.from(add).slice(0, remaining).join("");
         }
         if (add.trim()) {
-          raw = raw + add;
+          const panels = assessment.panels.length ? `\n\n${assessment.panels[0].fence}` : "";
+          raw = `${assessment.body.trimEnd()}\n${add.trimStart()}${panels}`.trim();
           combinedUsage = params.mergeUsage(combinedUsage, (more as any)?.usage ?? null);
-          params.safeEnqueue({ type: "delta", text: add });
+          replaced = true;
         }
       }
     }
@@ -240,5 +284,5 @@ export async function runOptionalShortContinue(
     if (params.streamDebug) console.debug(`${params.streamTag} short-continue skipped`, e);
   }
 
-  return { raw, combinedUsage };
+  return { raw, combinedUsage, replaced, reasons };
 }

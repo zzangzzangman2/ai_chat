@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { buildMemorySearchIndex, type MemorySearchIndex } from "./memory_search_index";
+import { applyMedicalQuestPresetUiMigration } from "./medical_quest_preset_migration";
 
 const dataDir = path.join(process.cwd(), "data");
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -318,7 +319,7 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_chat_role_createdAt_desc ON mes
 
       thinkingBudget INTEGER NOT NULL DEFAULT 1024,
 
-      narrationColor TEXT NOT NULL DEFAULT '#666666',
+      narrationColor TEXT NOT NULL DEFAULT '#CCC7C7',
 
       -- 렌더링 모드: chat(기존 채팅) / novel(소설형)
       renderMode TEXT NOT NULL DEFAULT 'novel',
@@ -361,7 +362,7 @@ if (!hasColumn("chat_settings", "longMemoryPerTurnChars")) {
 }
 
 if (!hasColumn("chat_settings", "narrationColor")) {
-    db.exec(`ALTER TABLE chat_settings ADD COLUMN narrationColor TEXT NOT NULL DEFAULT '#666666'`);
+    db.exec(`ALTER TABLE chat_settings ADD COLUMN narrationColor TEXT NOT NULL DEFAULT '#CCC7C7'`);
   }
 
   // chat_settings: renderMode (채팅/소설 렌더링 모드)
@@ -1153,6 +1154,15 @@ if (!hasColumn("chat_settings", "narrationColor")) {
     }
   } catch {
     // ignore
+  }
+
+  try {
+    const result = applyMedicalQuestPresetUiMigration(db);
+    if (result.applied) {
+      console.log("[db] medical quest UI policy migrated", result);
+    }
+  } catch (error) {
+    console.warn("[db] medical quest UI policy migration skipped", error);
   }
 }
 

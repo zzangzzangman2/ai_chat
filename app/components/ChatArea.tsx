@@ -47,6 +47,7 @@ import RelationshipGraphPanel from "@/app/components/RelationshipGraphPanel";
 import { CHAT_MODEL_IDS, type ChatModelId, coerceChatModelId } from "@/lib/models";
 import { mergeStreamFinalContent } from "@/app/components/chat/ChatArea/streamMerge";
 import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
+import { supportsAbilityViewQuickCommand } from "@/lib/meta_panel_policy";
 
 const LOCAL_POINTS_DISABLED = true;
 
@@ -685,6 +686,13 @@ export default function ChatArea(props: {
 
   // 설정 Drawer 내부 뷰(홈 -> 각 설정) 전환
   const [settingsView, setSettingsView] = useState<"home" | "persona" | "userNote" | "model" | "room" | "memory" | "relations">("home");
+  const [novelExportAvailable, setNovelExportAvailable] = useState(false);
+  const [novelExportState, setNovelExportState] = useState({
+    running: false,
+    percent: 0,
+    message: "",
+  });
+  const novelExportAbortRef = useRef<AbortController | null>(null);
 
   // Drawer 모드라도 "장기기억/관계도" 화면은 더 넓게 보이도록 도킹한다.
   // - 모바일(좁은 화면)에서는 기존처럼 drawer(overlay)로 유지
@@ -1632,6 +1640,12 @@ const loadOlder = useCallback(async () => {
     if (!presetId) return null;
     return presets.find((p) => p.id === presetId) || null;
   }, [presetId, presets]);
+  const showAbilityViewQuickCommand = useMemo(
+    () =>
+      Number(selectedPreset?.supportsAbilityView || 0) === 1 ||
+      supportsAbilityViewQuickCommand(selectedPreset?.systemPrompt),
+    [selectedPreset?.supportsAbilityView, selectedPreset?.systemPrompt]
+  );
   const effectiveChatTitle = useMemo(() => {
     const t = (chatTitle || "").trim();
     if (t) return t;
@@ -1639,6 +1653,36 @@ const loadOlder = useCallback(async () => {
     const presetName = String(selectedPreset?.name || "").trim();
     return presetName || "채팅";
   }, [chatTitle, selectedPreset]);
+
+  useEffect(() => {
+    const hostname = String(window.location.hostname || "").toLowerCase();
+    setNovelExportAvailable(hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1");
+  }, []);
+
+  // 소설 만들기는 현재 화면과 연결된 작업이다. 다른 채팅/작품으로 이동하거나
+  // 컴포넌트를 나가면 서버 호출도 즉시 중단한다.
+  useEffect(() => {
+    return () => {
+      novelExportAbortRef.current?.abort();
+    };
+  }, [chatId, presetId]);
+
+  useEffect(() => {
+    if (!novelExportState.running) return;
+    const warnBeforeLeave = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeave);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeave);
+  }, [novelExportState.running]);
+
+  useEffect(() => {
+    if (!novelExportState.running) return;
+    if (!effectiveSettingsOpen || settingsView !== "home") {
+      novelExportAbortRef.current?.abort();
+    }
+  }, [effectiveSettingsOpen, novelExportState.running, settingsView]);
 
 
 
@@ -1713,6 +1757,10 @@ const loadOlder = useCallback(async () => {
 
   const npcName = (selectedPreset?.characterName || "상대").trim() || "상대";
   const userName = (settings?.personaName || selectedProfile?.personaName || "나").trim() || "나";
+  const configuredNarrationColor = String(settings?.narrationColor || "").trim();
+  const resolvedNarrationColor = /^#[0-9a-fA-F]{6}$/.test(configuredNarrationColor)
+    ? configuredNarrationColor
+    : "#CCC7C7";
 
   // Chat UI theme (dark, novel-focused). 다른 화면(작업실 등) 테마는 추후 분리 가능.
   // (성능) 렌더마다 객체가 새로 생성되면 하위 콜백/컴포넌트가 매번 새 타입으로 인식될 수 있으므로 고정한다.
@@ -1735,14 +1783,13 @@ const loadOlder = useCallback(async () => {
     accent: "#a78bfa",
     iconBg: "rgba(255,255,255,0.06)",
     iconBorder: "rgba(255,255,255,0.14)",
-    // 기본 지문 색상(요청): rgb(204,199,199)
-    // (헌법) 소설 지문은 항상 흰색 고정 (회색 금지)
-    narration: "#ffffff",
+    // 채팅별 지문 색상 설정을 사용하고, 값이 없으면 기본 회색으로 폴백한다.
+    narration: resolvedNarrationColor,
     speech: "#e5e7eb",
     thought: "#c7d2fe",
     name: "#a78bfa",
     }),
-    []
+    [resolvedNarrationColor]
   );
 
   const renderInline = useCallback(
@@ -2350,8 +2397,8 @@ const loadOlder = useCallback(async () => {
             return out.join("\n").trimEnd();
           };
 
-          // 소설 모드 UI: 지문은 항상 흰색(회색/기울임 금지)
-					const NOVEL_NARRATION = "#ffffff";
+          // 채팅 설정의 지문 색상을 실제 소설 렌더러에도 적용한다.
+					const NOVEL_NARRATION = CHAT_THEME.narration;
           const NOVEL_BASE_FONT_SIZE = Math.max(12, Math.min(24, Number(chatFontSizePx || 18)));
           const NOVEL_LINE_HEIGHT = 1.85;
 
@@ -3069,6 +3116,15 @@ const normalizeNovelLine = (lineRaw: string) => {
 								const body = inner.replace(/^[“”‘’]/, '"').replace(/[“”‘’]$/, '"');
 								return { kind: "dialogue" as const, text: cleanDialogueText(body) };
 							}
+							const orphanDialogueClose =
+								!["\"", "“", "”", "＂"].some((quote) => innerNoWs.startsWith(quote)) &&
+								(innerNoWs.match(/["“”＂]/g) || []).length === 1 &&
+								/["”＂]$/.test(innerNoWs);
+							if (orphanDialogueClose) {
+								const close = innerNoWs.slice(-1);
+								const open = close === "”" ? "“" : close === "＂" ? "＂" : '"';
+								return { kind: "dialogue" as const, text: cleanDialogueText(`${open}${innerNoWs}`) };
+							}
 							return { kind: "narration" as const, text: inner };
 						}
 
@@ -3094,7 +3150,16 @@ const normalizeNovelLine = (lineRaw: string) => {
 							const hasQuote = rest.startsWith('"') || rest.startsWith("“") || rest.startsWith("”");
 							if (hasQuote) return { kind: "dialogue" as const, text: cleanDialogueText(rawProbe) };
 						}
-							const rawEnd = rawProbe.trimEnd();
+						const rawEnd = rawProbe.trimEnd();
+						const orphanDialogueClose =
+							!["\"", "“", "”", "＂"].some((quote) => rawProbe.startsWith(quote)) &&
+							(rawEnd.match(/["“”＂]/g) || []).length === 1 &&
+							/["”＂]$/.test(rawEnd);
+						if (orphanDialogueClose) {
+							const close = rawEnd.slice(-1);
+							const open = close === "”" ? "“" : close === "＂" ? "＂" : '"';
+							return { kind: "dialogue" as const, text: cleanDialogueText(`${open}${rawEnd}`) };
+						}
 							const isDialogue = introStrictQuotes
 								? (() => {
 										// 첫(인트로) 메시지는 '쌍따옴표로 감싼 문장만' 대사로 인정한다.
@@ -3605,14 +3670,13 @@ const normalizeNovelLine = (lineRaw: string) => {
 													const buf: string[] = [first];
 													i++;
 													let closed = false;
-													while (i < ls.length) {
-														const r = String(ls[i] ?? "").trimEnd();
-														if (!r.trim()) {
-															// 빈 줄을 만났는데 아직 닫히지 않았다면, 스트리밍 중(혹은 모델 실수)로 보고 지문을 계속 이어간다.
-															buf.push("");
-															i++;
-															continue;
-														}
+							while (i < ls.length) {
+								const r = String(ls[i] ?? "").trimEnd();
+								if (!r.trim()) {
+									// 빈 줄은 문단 경계다. 닫는 *가 누락돼도 다음 대사/지문까지
+									// 같은 지문 색으로 삼키지 않고 현재 문단에서 종료한다.
+									break;
+								}
 														const rTrim = normalizeStarVariants(r.trim());
 														if (rTrim.endsWith("*") && !rTrim.endsWith("**") && rTrim.length >= 2) {
 															// 마지막 줄의 종료 '*' 제거
@@ -3828,7 +3892,7 @@ return (
         const ls = String(rawUser || "").replace(/\r\n/g, "\n").split("\n");
 
         // user(내 메시지) 소설 모드 규칙
-        // - 지문(*...* / **...**) => 회색 + italic
+        // - 지문(*...* / **...**) => 채팅별 지문 색상 + italic
         // - 대사 => 흰색 (막대/박스 없음)
         const userDialogueStyle: React.CSSProperties = { color: "#ffffff", lineHeight: 1.85, fontStyle: "normal" };
 
@@ -3908,7 +3972,7 @@ return (
               if (g.kind === "blank") return <div key={j} style={{ height: 6 }} />;
               if (g.kind === "narration") {
                 return (
-                  <div key={j} style={{ color: "rgba(229,231,235,0.72)", lineHeight: 1.85, fontStyle: "italic" }}>
+                  <div key={j} style={{ color: CHAT_THEME.narration, lineHeight: 1.85, fontStyle: "italic" }}>
                     {renderInline(g.text)}
                   </div>
                 );
@@ -4216,6 +4280,118 @@ return (
       }
     } catch {
       // ignore
+    }
+  }
+
+  function cancelNovelExport() {
+    novelExportAbortRef.current?.abort();
+    setNovelExportState({ running: false, percent: 0, message: "취소됨" });
+    showToast("소설 만들기 취소", "PDF를 만들지 않았습니다.", "error", 2500);
+  }
+
+  async function startNovelExport() {
+    if (!chatId) {
+      showToast("채팅이 없습니다", "먼저 채팅을 생성해 주세요.", "error");
+      return;
+    }
+    if (novelExportState.running) return;
+    const confirmed = window.confirm(
+      [
+        "현재 채팅의 처음부터 끝까지 모두 읽어 한국식 웹소설 PDF로 재구성합니다.",
+        "",
+        "긴 채팅은 여러 장으로 나누어 장마다 AI를 호출하므로 시간이 걸릴 수 있습니다.",
+        "작품 제목은 채팅방 제목을 복사하지 않고 원고 내용에 맞춰 새로 정합니다.",
+        "진행 중 설정 화면을 닫거나 다른 채팅으로 이동하거나 페이지를 나가면 작업이 취소됩니다.",
+        "완료될 때까지 이 화면에서 그대로 기다려 주세요.",
+        "",
+        "원본 채팅과 장기기억 DB는 변경되지 않습니다. 계속할까요?",
+      ].join("\n")
+    );
+    if (!confirmed) return;
+
+    const controller = new AbortController();
+    novelExportAbortRef.current = controller;
+    setNovelExportState({ running: true, percent: 1, message: "전체 대화 불러오는 중" });
+
+    try {
+      const res = await fetch("/api/chat/novel/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const json = await safeJson(res);
+        throw new Error(json?.error || `소설 만들기 실패 (${res.status})`);
+      }
+      if (!res.body) throw new Error("진행률 스트림을 열지 못했습니다.");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      let completed: any = null;
+      const acceptLine = (line: string) => {
+        if (!line.trim()) return;
+        const event = JSON.parse(line);
+        if (event?.type === "progress") {
+          setNovelExportState({
+            running: true,
+            percent: Math.max(0, Math.min(99, Number(event.percent || 0))),
+            message: String(event.message || "소설 만드는 중"),
+          });
+        } else if (event?.type === "error") {
+          throw new Error(String(event.error || "소설 PDF 생성 실패"));
+        } else if (event?.type === "done") {
+          completed = event;
+          setNovelExportState({ running: true, percent: 100, message: "다운로드 준비 완료" });
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const lines = pending.split("\n");
+        pending = lines.pop() || "";
+        for (const line of lines) acceptLine(line);
+        if (done) break;
+      }
+      if (pending.trim()) acceptLine(pending);
+      if (!completed?.pdfBase64) throw new Error("완성된 PDF 데이터가 없습니다.");
+
+      const base64 = String(completed.pdfBase64);
+      const blobParts: BlobPart[] = [];
+      const sliceSize = 1024 * 1024;
+      for (let offset = 0; offset < base64.length; offset += sliceSize) {
+        const binary = window.atob(base64.slice(offset, offset + sliceSize));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        blobParts.push(bytes as unknown as BlobPart);
+      }
+      const url = URL.createObjectURL(new Blob(blobParts, { type: "application/pdf" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = String(completed.filename || "소설.pdf");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setNovelExportState({ running: false, percent: 100, message: "완료" });
+      showToast(
+        "소설 PDF 완성",
+        `${Number(completed.chapters || 0)}장 · ${Number(completed.sourceMessages || 0)}개 메시지 반영`,
+        "success",
+        4500
+      );
+    } catch (error: any) {
+      if (controller.signal.aborted || error?.name === "AbortError") {
+        setNovelExportState({ running: false, percent: 0, message: "취소됨" });
+      } else {
+        const message = String(error?.message || "소설 PDF 생성 실패");
+        setNovelExportState({ running: false, percent: 0, message: "실패" });
+        showToast("소설 만들기 실패", message, "error", 5000);
+      }
+    } finally {
+      if (novelExportAbortRef.current === controller) novelExportAbortRef.current = null;
     }
   }
 
@@ -4700,6 +4876,16 @@ async function send(overrideText?: unknown) {
 
             // 델타는 버퍼에만 누적하고, 화면 반영은 pacer가 담당
             streamTargetRef.current = stripEndMarkerClient(streamTargetRef.current + d);
+            continue;
+          }
+
+          if (obj.type === "replace") {
+            const replacement = stripEndMarkerClient(String(obj.text || ""));
+            streamTargetRef.current = replacement;
+            streamShownRef.current = replacement;
+            setMessages((prev) =>
+              prev.map((m) => (m.id === tempAssistantId ? { ...m, content: replacement } : m))
+            );
             continue;
           }
 
@@ -5208,6 +5394,16 @@ async function send(overrideText?: unknown) {
                 continue;
               }
 
+              if (obj.type === "replace") {
+                const replacement = stripEndMarkerClient(String(obj.text || ""));
+                streamTargetRef.current = replacement;
+                streamShownRef.current = replacement;
+                setMessages((prev) =>
+                  prev.map((m) => (m.id === assistantMessageId ? { ...m, content: replacement } : m))
+                );
+                continue;
+              }
+
               if (obj.type === "ping") {
                 streamLastPingAtRef.current = Date.now();
                 continue;
@@ -5330,19 +5526,11 @@ setMessages((prev) =>
         personaInfo: String(settings?.personaInfo || selectedProfile?.personaInfo || "").trim(),
       };
 
-      const tailForGuide = cleanTextForSuggest(baseText).slice(-900);
-      const continueInstruction = [
-        "직전 답변의 마지막 문장 다음부터 그대로 이어서 작성해줘.",
-        "이미 작성한 문장/표현은 반복하지 말고, 이어지는 본문만 출력해.",
-        "메타/INFO/STATUS/코드블록은 출력하지 마.",
-        "",
-        "[직전 출력 끝부분]",
-        tailForGuide,
-      ].join("\n");
-
       const payload = {
         chatId,
-        userText: continueInstruction,
+        // The server reads the selected assistant message from the database.
+        // Do not send its tail again as a synthetic user turn.
+        userText: "[이어쓰기]",
         personaOverride,
         runtime: {
           model: settings?.model,
@@ -6211,6 +6399,91 @@ const insertNarrationMarkers = useCallback(() => {
                 </div>
               </div>
             </button>
+
+            {novelExportAvailable ? (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: 12,
+                  borderRadius: 14,
+                  border: `1px solid ${CHAT_THEME.borderStrong}`,
+                  background: CHAT_THEME.panel,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 900 }}>소설로 만들기</div>
+                    <div style={{ fontSize: 12, opacity: 0.65, marginTop: 3, lineHeight: 1.35 }}>
+                      전체 대화를 한국식 웹소설로 재구성해 PDF로 저장합니다.
+                    </div>
+                  </div>
+                  {novelExportState.running ? (
+                    <button
+                      type="button"
+                      onClick={cancelNovelExport}
+                      style={{
+                        flex: "0 0 auto",
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: "none",
+                        background: "rgba(239,68,68,0.16)",
+                        color: "#fca5a5",
+                        cursor: "pointer",
+                        fontWeight: 900,
+                      }}
+                    >
+                      취소
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={!chatId || busy}
+                      onClick={startNovelExport}
+                      style={{
+                        flex: "0 0 auto",
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: "none",
+                        background: !chatId || busy ? "rgba(255,255,255,0.08)" : CHAT_THEME.bg2,
+                        color: !chatId || busy ? "rgba(229,231,235,0.45)" : "#fff",
+                        cursor: !chatId || busy ? "not-allowed" : "pointer",
+                        fontWeight: 900,
+                      }}
+                    >
+                      PDF 만들기
+                    </button>
+                  )}
+                </div>
+                {novelExportState.running ? (
+                  <div style={{ marginTop: 12 }}>
+                    <div
+                      style={{
+                        height: 8,
+                        borderRadius: 999,
+                        overflow: "hidden",
+                        background: "rgba(255,255,255,0.09)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${novelExportState.percent}%`,
+                          height: "100%",
+                          borderRadius: 999,
+                          background: CHAT_THEME.accent,
+                          transition: "width 220ms ease",
+                        }}
+                      />
+                    </div>
+                    <div style={{ marginTop: 7, fontSize: 12, fontWeight: 800 }}>
+                      {novelExportState.percent}% · {novelExportState.message}
+                    </div>
+                    <div style={{ marginTop: 4, fontSize: 11, color: "#fca5a5", lineHeight: 1.35 }}>
+                      이 화면을 닫거나 다른 채팅으로 나가면 취소됩니다. 완료될 때까지 그대로 기다려 주세요.
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
 
             {!settings ? (
               <div style={{ fontSize: 12, opacity: 0.65, marginTop: 10 }}>
@@ -7480,6 +7753,30 @@ boxSizing: "border-box",
 	              >
 	                <Icon name="paperPlane" size={16} />
 	              </button>
+	            )}
+
+	            {showAbilityViewQuickCommand && (
+	              <div style={{ display: "flex", gap: 8, marginBottom: 8, paddingRight: 44 }}>
+	                <button
+	                  type="button"
+	                  disabled={busy || !!editingAssistantId || !chatId}
+	                  onClick={() => sendRef.current("능력치 보기")}
+	                  style={{
+	                    padding: "6px 11px",
+	                    borderRadius: 999,
+	                    border: "1px solid rgba(96,165,250,0.28)",
+	                    background: "rgba(37,99,235,0.16)",
+	                    color: "#bfdbfe",
+	                    cursor: busy || editingAssistantId || !chatId ? "not-allowed" : "pointer",
+	                    fontSize: 12,
+	                    fontWeight: 800,
+	                    opacity: busy || editingAssistantId || !chatId ? 0.45 : 1,
+	                  }}
+	                  title="서사를 진행하지 않고 현재 능력치만 확인합니다."
+	                >
+	                  능력치 보기
+	                </button>
+	              </div>
 	            )}
 
 	            {(suggestions.length > 0 || suggestLoading) && (

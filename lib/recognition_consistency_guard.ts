@@ -34,7 +34,12 @@ export type ScenePresenceContradiction = {
   characterName: string;
   matchedText: string;
   index: number;
-  kind: "duplicate_entry" | "duplicate_introduction";
+  kind:
+    | "duplicate_entry"
+    | "duplicate_introduction"
+    | "unauthorized_incapacitation"
+    | "unauthorized_exit"
+    | "unauthorized_reentry";
 };
 
 const FIRST_MEETING_PATTERNS = [
@@ -68,19 +73,40 @@ const SCENE_RESET_PATTERN =
   /(?:\[?\s*장면\s*전환\s*\]?|다음\s*날|며칠\s*후|몇\s*(?:분|시간|주|달|년)\s*후|장소를\s*(?:옮기|이동)|새로운\s*장소로\s*(?:이동|향))/u;
 
 const ENTRY_CUE_PATTERN =
-  /(?:새로\s*|다시\s*|뒤이어\s*|다음으로\s*)?(?:들어왔|들어온|들어섰|입장했|입장한|도착했|도착한|합류했|합류한|나타났|나타난|등장했|등장한|끌려\s*(?:들어왔|들어온|들어가|내려왔|내려온|왔|온|와)|데려왔|데려온|불려왔|불려온|호송(?:되어|돼)?\s*(?:들어|왔|온)|모습을\s*드러냈|모습을\s*드러낸)/u;
+  /(?:새로\s*|다시\s*|뒤이어\s*|다음으로\s*)?(?:들어\s*왔|들어\s*온|들어섰|입장했|입장한|도착했|도착한|합류했|합류한|나타났|나타난|등장했|등장한|끌려\s*(?:들어\s*왔|들어\s*온|들어가|내려왔|내려온|왔|온|와)|데려왔|데려온|불려왔|불려온|호송(?:되어|돼)?\s*(?:들어|왔|온)|모습을\s*드러냈|모습을\s*드러낸)/u;
 
 const EXIT_CUE_PATTERN =
-  /(?:나갔|나간|떠났|떠난|퇴장했|퇴장한|사라졌|사라진|돌아갔|돌아간|자리를\s*떴|자리를\s*뜬|끌려\s*(?:나갔|나간|나가|갔|간)|호송(?:되어|돼)?\s*나갔|밖으로\s*(?:나갔|나간|끌려갔|끌려간)|내보냈|내보낸|쫓아냈|쫓아낸)/u;
+  /(?:나갔|나간|떠났|떠난|퇴장했|퇴장한|사라졌|사라진|자취를\s*감췄|자취를\s*감춘|모습을\s*감췄|모습을\s*감춘|돌아갔|돌아간|자리를\s*떴|자리를\s*뜬|도망(?:쳤|친|갔|간|가버렸|가버린|쳐버렸|쳐버린)|방으로\s*(?:도망|달아)|끌려\s*(?:나갔|나간|나가|갔|간)|호송(?:되어|돼)?\s*나갔|밖으로\s*(?:나갔|나간|끌려갔|끌려간)|내보냈|내보낸|쫓아냈|쫓아낸)/u;
 
 const ACTIVE_CUE_PATTERN =
   /(?:무릎을\s*꿇고\s*있|앉아\s*있|서\s*있|누워\s*있|기대어\s*있|머물고\s*있|남아\s*있|붙잡혀\s*있|포박(?:되어|돼)\s*있|묶여\s*있|갇혀\s*있|바라봤|바라보며|말했|물었|대답했|외쳤|고개를\s*(?:들|끄덕|저))/u;
 
 const ENTRY_MODIFIER_CUE_PATTERN =
-  /(?:들어온|입장한|도착한|합류한|나타난|등장한|끌려\s*(?:들어온|내려온|온)|데려온|불려온|호송(?:되어|돼)?\s*온|모습을\s*드러낸)/u;
+  /(?:들어\s*온|입장한|도착한|합류한|나타난|등장한|끌려\s*(?:들어\s*온|내려온|온)|데려온|불려온|호송(?:되어|돼)?\s*온|모습을\s*드러낸)/u;
 
 const EXIT_MODIFIER_CUE_PATTERN =
-  /(?:나간|떠난|퇴장한|사라진|돌아간|자리를\s*뜬|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+  /(?:나간|떠난|퇴장한|사라진|자취를\s*감춘|모습을\s*감춘|돌아간|자리를\s*뜬|도망(?:친|간|가버린|쳐버린)|끌려\s*(?:나간|간)|호송(?:되어|돼)?\s*나간|내보낸|쫓아낸)/u;
+
+const INCAPACITATION_CUE_PATTERN =
+  /(?:기절(?:했|해버렸|하고\s*말았|한\s*채)|혼절(?:했|해버렸|하고\s*말았|한\s*채)|실신(?:했|해버렸|하고\s*말았|한\s*채)|의식을\s*잃(?:었|어버렸|고\s*말았|은\s*채)|정신을\s*잃(?:었|어버렸|고\s*말았|은\s*채)|의식불명(?:이\s*됐|이\s*되었|인\s*채)|잠들어버렸|마비(?:됐|되어버렸)|발화\s*불능(?:이\s*됐|인\s*채))/u;
+
+const INCAPACITATION_MODIFIER_CUE_PATTERN =
+  /(?:기절한|혼절한|실신한|의식을\s*잃은|정신을\s*잃은|의식불명인|잠들어버린|마비된|발화\s*불능인)/u;
+
+const GENERIC_SCENE_SUBJECT_PATTERN =
+  /(?:곁에\s*(?:있|엎드려|서|앉아)[^.!?。！？\n]{0,35})?(?:작은\s*)?(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명)(?:은|는|이|가)?/u;
+
+const RELATIONAL_GENERIC_SCENE_SUBJECT_PATTERN =
+  /(?:(?:곁|옆|반대편|바로\s*옆|주변)[^.!?。！？\n]{0,55}(?:다른|또\s*다른|나머지)?\s*(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명)|(?:다른|또\s*다른|나머지)\s*(?:형체|인물|사람|아이|소녀|소년|친구|그녀|그|한\s*명))/u;
+
+const CURRENT_GROUP_REFERENCE_PATTERN =
+  /(?:둘\s*다|둘이|두\s*(?:사람|명|아이|소녀|소년)|서로|얘들|너희들|다\s*같이|모두)/u;
+
+const USER_EXCLUSION_CUE_PATTERN =
+  /(?:문\s*밖|바깥|밖으로)[^.!?。！？\n]{0,70}(?:내?쫓|쫒|보냈|보낸|밀어냈|끌어냈)|(?:내?쫓|쫒|내보내|보내)[^.!?。！？\n]{0,50}(?:문\s*밖|바깥|밖으로)|(?:못|다시는?)\s*들어오|들어오지\s*못|출입\s*금지|접근\s*금지/u;
+
+const USER_RETURN_CUE_PATTERN =
+  /(?:다시\s*)?(?:들어와|들어오|돌아와|돌아오|불러와|데려와|합류해|복귀해|재입장)|(?:들여보내|들여보냈|입장시켜)/u;
 
 function compactEvidence(value: string) {
   return value.replace(/\s+/g, " ").trim().slice(0, 220);
@@ -254,10 +280,13 @@ export function deriveCurrentScenePresence(args: {
     : 14;
   const recent = (args.messages || []).slice(-maxMessages);
   const states = new Map<string, ScenePresenceFact>();
+  let latestUserText = "";
 
   recent.forEach((message, messageIndex) => {
     const story = stripFencedBlocks(message?.content || "");
     if (!story.trim()) return;
+    const isUserMessage = normalized(message?.role) === "user";
+    if (isUserMessage) latestUserText = story;
 
     for (const passage of splitStoryPassages(story)) {
       if (SCENE_RESET_PATTERN.test(passage)) states.clear();
@@ -271,7 +300,15 @@ export function deriveCurrentScenePresence(args: {
         // Exit wins when a compact sentence contains both movement directions;
         // a later passage in the same turn can still establish a true re-entry.
         if (findNamedExitCue(passage, names)) {
-          states.delete(normalized(identity.characterName));
+          // An assistant draft cannot erase a character from scene canon by
+          // inventing a flight/disappearance. It only confirms an exit when
+          // the immediately preceding user turn actually directed one.
+          if (
+            isUserMessage ||
+            currentTurnAllowsExit(latestUserText, names)
+          ) {
+            states.delete(normalized(identity.characterName));
+          }
           continue;
         }
 
@@ -289,6 +326,114 @@ export function deriveCurrentScenePresence(args: {
   });
 
   return [...states.values()];
+}
+
+function findNamedIncapacitationCue(passage: string, names: string[]) {
+  return findNamedDirectionalCue({
+    passage,
+    names,
+    cue: INCAPACITATION_CUE_PATTERN,
+    modifierCue: INCAPACITATION_MODIFIER_CUE_PATTERN,
+  });
+}
+
+/**
+ * Reconstructs user-authoritative exclusions from the recent raw scene.
+ * Assistant prose is deliberately unable to clear this state: a character the
+ * user expelled or banned stays outside until the user explicitly calls that
+ * same character back or starts a new scene.
+ */
+export function deriveCurrentSceneExclusions(args: {
+  messages: ScenePresenceMessage[];
+  identities: ScenePresenceIdentity[];
+  maxMessages?: number;
+}): ScenePresenceFact[] {
+  const identities = args.identities
+    .map((identity) => ({
+      characterName: String(identity.name || "").trim(),
+      characterAliases: usableEntityNames(identity.aliases || []),
+    }))
+    .filter((identity) => normalized(identity.characterName).length >= 2);
+  if (!identities.length) return [];
+
+  const requestedMax = Number(args.maxMessages || 18);
+  const maxMessages = Number.isFinite(requestedMax)
+    ? Math.max(2, Math.floor(requestedMax))
+    : 18;
+  const recent = (args.messages || []).slice(-maxMessages);
+  const states = new Map<string, ScenePresenceFact>();
+
+  recent.forEach((message, messageIndex) => {
+    const story = stripFencedBlocks(message?.content || "");
+    if (!story.trim()) return;
+
+    for (const passage of splitStoryPassages(story)) {
+      if (normalized(message?.role) !== "user") continue;
+      if (SCENE_RESET_PATTERN.test(passage)) states.clear();
+
+      for (const identity of identities) {
+        const names = usableEntityNames([
+          identity.characterName,
+          ...identity.characterAliases,
+        ]);
+        if (!passageMentionsName(passage, names)) continue;
+
+        if (
+          USER_RETURN_CUE_PATTERN.test(passage) &&
+          !USER_EXCLUSION_CUE_PATTERN.test(passage)
+        ) {
+          states.delete(normalized(identity.characterName));
+          continue;
+        }
+
+        if (
+          findNamedExitCue(passage, names) ||
+          USER_EXCLUSION_CUE_PATTERN.test(passage)
+        ) {
+          states.set(normalized(identity.characterName), {
+            characterName: identity.characterName,
+            characterAliases: identity.characterAliases,
+            evidence: compactEvidence(passage),
+            messageIndex,
+          });
+        }
+      }
+    }
+  });
+
+  return [...states.values()];
+}
+
+function currentTurnAllowsExit(value: unknown, names: string[]) {
+  const text = String(value || "");
+  if (!text.trim()) return false;
+  if (
+    /(?:나가|꺼져|떠나|사라져|도망가|방으로\s*가|돌아가|퇴장|내보내|쫓아내|쫒아내|밖으로\s*보내)/u.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  return passageMentionsName(text, names) && Boolean(findNamedExitCue(text, names));
+}
+
+function currentTurnAllowsIncapacitation(value: unknown, names: string[]) {
+  const text = String(value || "");
+  if (!text.trim() || !passageMentionsName(text, names)) return false;
+  if (/(?:기절|혼절|실신|의식|정신|잠|마비|발화)[^.!?。！？\n]{0,18}(?:하지\s*마|말고|아니|않)/u.test(text)) {
+    return false;
+  }
+  return Boolean(findNamedIncapacitationCue(text, names)) ||
+    /(?:기절해|기절시켜|재워|의식을\s*잃게\s*해|정신을\s*잃게\s*해)/u.test(text);
+}
+
+function currentTurnAllowsReentry(value: unknown, names: string[]) {
+  const text = String(value || "");
+  if (!passageMentionsName(text, names)) return false;
+  return (
+    USER_RETURN_CUE_PATTERN.test(text) ||
+    currentTurnOverridesScenePresence(text, names)
+  );
 }
 
 function currentTurnOverridesScenePresence(value: unknown, names: string[]) {
@@ -323,9 +468,16 @@ export function findScenePresenceContradiction(args: {
   text: string;
   currentUserText?: string;
   presentCharacters: ScenePresenceFact[];
+  excludedCharacters?: ScenePresenceFact[];
 }): ScenePresenceContradiction | null {
   const story = stripFencedBlocks(args.text);
-  if (!story.trim() || !args.presentCharacters.length) return null;
+  const excludedCharacters = args.excludedCharacters || [];
+  if (
+    !story.trim() ||
+    (!args.presentCharacters.length && !excludedCharacters.length)
+  ) {
+    return null;
+  }
   let searchOffset = 0;
 
   for (const passage of splitStoryPassages(story)) {
@@ -350,6 +502,30 @@ export function findScenePresenceContradiction(args: {
         };
       }
 
+      if (!currentTurnAllowsExit(args.currentUserText, names)) {
+        const exit = findNamedExitCue(passage, names);
+        if (exit) {
+          return {
+            characterName: fact.characterName,
+            matchedText: exit[0],
+            index: Math.max(0, passageIndex) + exit.index,
+            kind: "unauthorized_exit",
+          };
+        }
+      }
+
+      if (!currentTurnAllowsIncapacitation(args.currentUserText, names)) {
+        const incapacitation = findNamedIncapacitationCue(passage, names);
+        if (incapacitation) {
+          return {
+            characterName: fact.characterName,
+            matchedText: incapacitation[0],
+            index: Math.max(0, passageIndex) + incapacitation.index,
+            kind: "unauthorized_incapacitation",
+          };
+        }
+      }
+
       // A bare self-introduction is a second independent backstop. It catches
       // the next streamed paragraph even when the duplicate-arrival paragraph
       // immediately before it was already removed.
@@ -363,6 +539,54 @@ export function findScenePresenceContradiction(args: {
             kind: "duplicate_introduction",
           };
         }
+      }
+    }
+
+    // The model sometimes evades a name-bound guard by replacing a known
+    // person with "the small figure / the other person beside her" and
+    // immediately making that anonymous referent disappear. The current scene
+    // roster itself is authoritative: a relational subject such as "the other
+    // figure beside her" cannot bypass the guard merely because the latest
+    // user sentence omitted an explicit "both of you" phrase.
+    const currentUserReferencesGroup = CURRENT_GROUP_REFERENCE_PATTERN.test(
+      String(args.currentUserText || "")
+    );
+    const relationalCurrentSubject =
+      args.presentCharacters.length >= 2 &&
+      RELATIONAL_GENERIC_SCENE_SUBJECT_PATTERN.test(passage);
+    if (
+      args.presentCharacters.length > 0 &&
+      (currentUserReferencesGroup || relationalCurrentSubject) &&
+      GENERIC_SCENE_SUBJECT_PATTERN.test(passage)
+    ) {
+      const genericExit = EXIT_CUE_PATTERN.exec(passage);
+      if (genericExit && !currentTurnAllowsExit(args.currentUserText, [])) {
+        return {
+          characterName: args.presentCharacters[0].characterName,
+          matchedText: genericExit[0],
+          index: Math.max(0, passageIndex) + genericExit.index,
+          kind: "unauthorized_exit",
+        };
+      }
+    }
+
+
+    for (const fact of excludedCharacters) {
+      const names = usableEntityNames([
+        fact.characterName,
+        ...(fact.characterAliases || []),
+      ]);
+      if (!passageMentionsName(passage, names)) continue;
+      if (currentTurnAllowsReentry(args.currentUserText, names)) continue;
+
+      const entry = findNamedEntryCue(passage, names);
+      if (entry) {
+        return {
+          characterName: fact.characterName,
+          matchedText: entry[0],
+          index: Math.max(0, passageIndex) + entry.index,
+          kind: "unauthorized_reentry",
+        };
       }
     }
   }
@@ -646,6 +870,7 @@ export function removeScenePresenceContradictionPassages(args: {
   text: string;
   currentUserText?: string;
   presentCharacters: ScenePresenceFact[];
+  excludedCharacters?: ScenePresenceFact[];
 }) {
   const originalText = String(args.text || "");
   let text = originalText;
@@ -658,8 +883,89 @@ export function removeScenePresenceContradictionPassages(args: {
       text,
       currentUserText: args.currentUserText,
       presentCharacters: args.presentCharacters,
+      excludedCharacters: args.excludedCharacters,
     });
     if (!contradiction) break;
+
+    if (
+      contradiction.kind === "unauthorized_incapacitation" ||
+      contradiction.kind === "unauthorized_exit" ||
+      contradiction.kind === "unauthorized_reentry"
+    ) {
+      const before = text.slice(0, contradiction.index);
+      const paragraphStartBreak = before.lastIndexOf("\n\n");
+      const paragraphStart = paragraphStartBreak >= 0 ? paragraphStartBreak + 2 : 0;
+      const after = text.slice(contradiction.index);
+      const paragraphEndBreak = after.indexOf("\n\n");
+      const paragraphEnd =
+        paragraphEndBreak >= 0 ? contradiction.index + paragraphEndBreak : text.length;
+      const localParagraph = text.slice(paragraphStart, paragraphEnd);
+      const implicatedFact = args.presentCharacters.find(
+        (fact) => fact.characterName === contradiction.characterName
+      );
+      const implicatedNames = implicatedFact
+        ? usableEntityNames([
+            implicatedFact.characterName,
+            ...(implicatedFact.characterAliases || []),
+          ])
+        : [];
+      const isRelationalAnonymousExit = Boolean(
+        contradiction.kind === "unauthorized_exit" &&
+          RELATIONAL_GENERIC_SCENE_SUBJECT_PATTERN.test(localParagraph) &&
+          !passageMentionsName(localParagraph, implicatedNames)
+      );
+
+      if (
+        contradiction.kind === "unauthorized_incapacitation" ||
+        contradiction.kind === "unauthorized_exit" ||
+        isRelationalAnonymousExit
+      ) {
+        // Keep the one-shot provider output intact. A previous implementation
+        // deleted the offending paragraph (and, for named exits, sometimes the
+        // entire suffix), wasting already-generated tokens and turning a full
+        // answer into a few hundred characters. Replace only the contradictory
+        // local beat with a deterministic continuity-preserving beat; later
+        // prose and the status panel remain untouched.
+        const rosterNames = args.presentCharacters
+          .map((fact) => fact.characterName.trim())
+          .filter(Boolean);
+        const subject = isRelationalAnonymousExit
+          ? rosterNames.join(", ") || contradiction.characterName
+          : contradiction.characterName;
+        const replacement =
+          contradiction.kind === "unauthorized_incapacitation"
+            ? `*${subject} 역시 깨어 있는 채 현재 장면에 그대로 남아, 이어지는 상황에 반응했다.*`
+            : `*${subject} 역시 자리를 벗어나지 않고 현재 장면에 그대로 남아, 이어지는 상황에 반응했다.*`;
+        text = `${text.slice(0, paragraphStart).trimEnd()}\n\n${replacement}\n\n${text
+          .slice(paragraphEnd)
+          .trimStart()}`.trim();
+        removed += 1;
+        characters.add(contradiction.characterName);
+        kinds.add(contradiction.kind);
+        continue;
+      }
+
+      // Once a draft changes the cast without user authority, every later
+      // action/speaker can depend on that invalid substitution. Discard the
+      // contaminated story suffix rather than leaving orphaned dialogue from
+      // the wrong character. Preserve fenced status metadata independently.
+      const paragraphBoundary = before.lastIndexOf("\n\n");
+      const lineBoundary = before.lastIndexOf("\n");
+      const cutAt = Math.max(
+        0,
+        paragraphBoundary >= 0 ? paragraphBoundary + 2 : lineBoundary + 1
+      );
+      const preservedFences = [
+        ...text.slice(cutAt).matchAll(/```[^\n]*\n[\s\S]*?```/g),
+      ].map((match) => match[0].trim());
+      text = [text.slice(0, cutAt).trim(), ...preservedFences]
+        .filter(Boolean)
+        .join("\n\n");
+      removed += 1;
+      characters.add(contradiction.characterName);
+      kinds.add(contradiction.kind);
+      break;
+    }
 
     const filtered = removeRecognitionContradictionAtIndex({
       text,

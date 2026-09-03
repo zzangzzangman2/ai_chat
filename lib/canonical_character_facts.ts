@@ -15,6 +15,7 @@ export const CANONICAL_FACT_KEYS = [
   "background",
   "identity",
   "speech_style",
+  "communication",
   "residence",
 ] as const;
 
@@ -306,6 +307,7 @@ const FACT_LABELS: Record<CanonicalFactKey, string> = {
   background: "배경",
   identity: "정체",
   speech_style: "말투",
+  communication: "의사소통",
   residence: "거주지",
 };
 
@@ -324,6 +326,16 @@ export function formatCanonicalCharacterFactsBlock(params: {
 
   const selected = params.facts.filter((fact) => {
     if (canonicalFactConflictsWithPersona(fact, persona)) return false;
+    // Repetition does not make an assistant-invented body description true.
+    // Only user-authored NPC physical facts may enter the hard canon prompt;
+    // the persona's authoritative settings are rendered separately below.
+    if (
+      fact.subjectKey !== "persona" &&
+      fact.sourceRole !== "user" &&
+      ["height", "weight", "body_build", "appearance"].includes(fact.factKey)
+    ) {
+      return false;
+    }
     if (!focus.size) return true;
     const name = normalizedKey(fact.subjectName);
     const key = normalizedKey(fact.subjectKey);
@@ -334,6 +346,7 @@ export function formatCanonicalCharacterFactsBlock(params: {
     "# [인물별 정본 사실 — AI 지문·사건 요약보다 우선]",
     "- 페르소나/프리셋 설정과 사용자가 직접 확정·정정한 사실이 최우선이다. AI가 이전 답변에서 임의로 붙인 형용사·추측·비유는 정본을 변경하지 못한다.",
     "- 아래 수치·직업·외형·정체·거주지를 뜻이 바뀌는 동의어로 바꾸지 말고, 모순되는 묘사를 새로 만들지 않는다.",
+    "- 특히 AI가 반복해서 쓴 키·체중·체형·외모는 사용자 확정 없이 정본이 되지 않는다.",
     "- 관계·나이·직업·신체·거주지가 실제로 변한 경우에만 최신 사용자의 명시적 서술/OOC로 갱신한다.",
   ];
   if (persona.name) {
@@ -360,7 +373,7 @@ export function formatCanonicalCharacterFactsBlock(params: {
         `(근거: ${fact.sourceRole === "user" ? "사용자 확정" : "검증된 이전 서술"}, ${fact.turnNo}턴)`
     );
   }
-  return rows.length > 4 ? rows.join("\n") : "";
+  return rows.length > 5 ? rows.join("\n") : "";
 }
 
 function taggedUserText(sourceText: string) {
