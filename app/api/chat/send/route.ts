@@ -3577,46 +3577,10 @@ const systemRaw = (cacheFriendlyLayout
     // 사용자 입력을 모드에 맞춰 전달한다.
     const userLine = continueMode ? "[이어쓰기]" : buildUserLineForMode(userText, personaName, renderMode);
 
-    // Gemini Flash: keep the slider level and reserve HIGH for heavy reasoning.
-    // Raise MID to HIGH only when the *user's current request* asks for reasoning over the heavy context.
-    // Otherwise long-memory/status/character-heavy chats would make MID behave like HIGH on every turn.
-    if (
-      isGemini3FlashModel(chosenModel) &&
-      opts.maxReasoningTokens > 0 &&
-      opts.maxReasoningTokens <= 640 &&
-      String(process.env.CHAT_FLASH_AUTO_REASONING ?? "1").trim() !== "0"
-    ) {
-      const longMemoryChars = strlen(historySummaryForPrompt);
-      const recentChars = strlen(context);
-      const rosterChars = strlen(
-        dynamicCharacterContext.block || manualCharacterRosterFallback
-      );
-      const contextHits: string[] = [];
-      const intentHits: string[] = [];
-
-      if (authorWantsStatus) contextHits.push("status");
-      if (longMemoryChars >= 8000) contextHits.push("longMemory");
-      if (recentChars >= 6500) contextHits.push("recentTurns");
-      if (rosterChars >= 900) contextHits.push("characters");
-      if (userTurnCount >= 40) contextHits.push("longChat");
-
-      if (/관계|기억|정리|요약|지난|이전|누가|누구|왜|모순|규칙|순서/.test(userText)) intentHits.push("memory");
-      if (/계산|결과|판정|보고|비교|선택|추리|계획|전략|작전|상태/.test(userText)) intentHits.push("reasoning");
-      if (/며칠|몇\s*주|일주일|다음날|시간\s*후|개월|년\s*후|스킵|경과/.test(userText)) intentHits.push("timeskip");
-      if ((userText.match(/[가-힣A-Za-z0-9]{2,}/g) || []).length >= 12) intentHits.push("denseInput");
-
-      // (2026-08-14) denseInput은 승격 근거에서 제외한다.
-      // "입력에 단어가 12개 이상"이라는 뜻일 뿐 추론 요청이 아닌데, 대화가 길어지면
-      // contextHits(longMemory/longChat 등)는 항상 2개를 넘으므로 조금만 길게 써도
-      // 매 턴 HIGH로 올라갔다. 3.7 실측(동일 프롬프트): low 7.8s / medium 4.7s / high 15.3s
-      // (thoughts 0 / 142 / 1416) — 승격 한 번에 3배 느려지고, 그 지연이 요청 취소로 이어졌다.
-      // 주석에 적힌 원래 의도대로 "사용자가 실제로 추론을 요구할 때만" 올린다.
-      const reasoningIntents = intentHits.filter((hit) => hit !== "denseInput");
-      if (reasoningIntents.length > 0 && contextHits.length >= 2) {
-        opts.maxReasoningTokens = 1024;
-        debugReasons.push(`reason:auto_flash_high(intent=${reasoningIntents.join("+")};ctx=${contextHits.join("+")})`);
-      }
-    }
+    // Respect the selected reasoning level (runtime > saved setting > model default).
+    // Time-skips, memory/status complexity and the legacy CHAT_FLASH_AUTO_REASONING
+    // flag must not silently promote LOW/MID to HIGH. Flash defaults to MID only
+    // when no level was supplied; explicit LOW and HIGH remain valid choices.
 
     const continueBody = continueMode
       ? stripUrlsAndMediaMarkdown(
