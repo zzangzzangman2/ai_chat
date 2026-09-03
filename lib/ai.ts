@@ -181,7 +181,8 @@ export type ChatGenOpts = {
   // Thinking controls (Gemini Thinking / 3 Pro Preview)
   thinkingBudget?: number | null;
   thinkingLevel?: "low" | "medium" | "high" | null;
-  // Optional per-call timeout override (ms). If omitted, model defaults are used.
+  // Optional per-call timeout override (ms). Zero disables the application deadline.
+  // Flash has no default deadline; caller cancellation is still forwarded.
   timeoutMs?: number;
   // Cancels local SDK/network consumption when the caller disconnects or leaves the chat.
   signal?: AbortSignal;
@@ -517,14 +518,16 @@ function defaultCallTimeoutMs(model: string) {
   const modelIs3Pro = isGemini3Pro(model);
   const modelIs3Flash = isGemini3Flash(model);
   const modelIs25Pro = isGemini25Pro(model);
-  return modelIs31Pro ? 110_000 : modelIs3Pro ? 75_000 : modelIs3Flash ? 30_000 : modelIs25Pro ? 75_000 : 60_000;
+  return modelIs31Pro ? 110_000 : modelIs3Pro ? 75_000 : modelIs3Flash ? 0 : modelIs25Pro ? 75_000 : 60_000;
 }
 
 function resolveCallTimeoutMs(model: string, overrideMs: unknown) {
   const base = defaultCallTimeoutMs(model);
+  if (overrideMs == null) return base;
   const n = Number(overrideMs);
   if (!Number.isFinite(n)) return base;
-  // Keep bounds conservative to avoid accidental near-infinite waits.
+  if (n === 0) return 0;
+  // Explicit positive deadlines (for background maintenance, etc.) remain bounded.
   return Math.max(5_000, Math.min(300_000, Math.floor(n)));
 }
 
@@ -550,6 +553,9 @@ function sleep(ms: number) {
 }
 
 async function withTimeout<T>(p: Promise<T>, ms: number, onTimeout?: () => void): Promise<T | null> {
+  // Zero means no application timeout, not an immediate cancellation.
+  // The SDK still receives the caller's AbortSignal for manual cancellation.
+  if (ms === 0) return await p;
   let timer: any = null;
   let didTimeout = false;
 
