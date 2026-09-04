@@ -7,6 +7,7 @@ const os = require("os");
 const crypto = require("crypto");
 const readlineCore = require("readline");
 const readline = require("readline/promises");
+const { generationProgressAfterEvent } = require("../lib/generation_progress.js");
 
 const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, "data", "data.sqlite3");
@@ -1204,7 +1205,7 @@ function colorLine(text, color) {
   return `${color}${text}${ANSI.reset}`;
 }
 
-function startResponseStatus(started) {
+function startResponseStatus(started, message = "응답 생성 중...", write = (s) => process.stdout.write(s)) {
   const frames = ["-", "\\", "|", "/"];
   let frame = 0;
   let active = true;
@@ -1212,19 +1213,24 @@ function startResponseStatus(started) {
   const render = () => {
     if (!active) return;
     const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
-    const text = `${ANSI.gray}${frames[frame % frames.length]} 응답 생성 중... ${elapsed}초${ANSI.reset}`;
+    const text = `${ANSI.gray}${frames[frame % frames.length]} ${message} ${elapsed}초${ANSI.reset}`;
     frame += 1;
-    process.stdout.write(`\r\x1b[2K${text}`);
+    write(`\r\x1b[2K${text}`);
     visible = true;
   };
   render();
   const timer = setInterval(render, 1000);
   return {
+    setMessage(nextMessage) {
+      if (!active) return;
+      message = String(nextMessage || "응답 생성 중...");
+      render();
+    },
     stop(clearLine = true) {
       if (!active) return;
       active = false;
       clearInterval(timer);
-      if (clearLine && visible) process.stdout.write("\r\x1b[2K");
+      if (clearLine && visible) write("\r\x1b[2K");
     },
   };
 }
@@ -3361,11 +3367,14 @@ async function postSend(text) {
     // fence/색상 안전을 위해 줄·펜스 단위 게이트 렌더러로 정리한 뒤,
     // 터미널 페이서로 몇 글자씩 흘려보내 자연스러운 타이핑 체감을 만든다.
     // (렌더러=정확성 담당, 페이서=연출 담당)
-    const pacer = createTerminalPacer((s) => process.stdout.write(s));
-    pacer.onFirstEmit(() => {
-      if (!timing.firstOutputAt) timing.firstOutputAt = Date.now();
+    const pacer = createTerminalPacer((s) => {
+      // A retry may restart the waiting line after an earlier attempt emitted text.
       status?.stop(true);
       status = null;
+      process.stdout.write(s);
+    });
+    pacer.onFirstEmit(() => {
+      if (!timing.firstOutputAt) timing.firstOutputAt = Date.now();
     });
     const renderer = createStreamRenderer((s) => pacer.push(s));
     try {
@@ -3393,7 +3402,18 @@ async function postSend(text) {
             renderer.push(obj.text || "");
           } else if (obj.type === "ping") {
             // keep-alive ping: the status line already shows elapsed time.
+          } else if (obj.type === "retry") {
+            const retryMessage = generationProgressAfterEvent("", obj);
+            if (retryMessage) {
+              if (status) status.setMessage(retryMessage);
+              else {
+                process.stdout.write("\n");
+                status = startResponseStatus(started, retryMessage);
+              }
+            }
           } else if (obj.type === "done") {
+            status?.stop(true);
+            status = null;
             timing.doneAt = Date.now();
             doneObj = obj;
           } else if (obj.type === "error") {
@@ -3902,6 +3922,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  startResponseStatus,
   MODELS,
   MODEL_OPTIONS,
   modelByInput,

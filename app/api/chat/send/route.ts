@@ -4322,6 +4322,12 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
               debugReasons.push(`refusal:reroll${refusalRerollAttempt}:${check.reason}`);
               try {
                 safeEnqueue({ type: "replace", text: "" });
+                // Progress is out-of-band: do not put retry notices in story text/history.
+                safeEnqueue({
+                  type: "retry",
+                  attempt: refusalRerollAttempt,
+                  maxAttempts: maxRerolls,
+                });
               } catch {
                 // ignore
               }

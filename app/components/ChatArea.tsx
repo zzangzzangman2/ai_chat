@@ -8,6 +8,7 @@ import remarkGfm from "remark-gfm";
 import type { Preset } from "@/app/page";
 import { labelTokenKey } from "@/app/components/chat/utils/tokenUi";
 import { useChatStreamPacer } from "@/app/components/chat/hooks/useChatStream";
+import { generationProgressAfterEvent } from "@/lib/generation_progress";
 import {
   KRW_PER_FRIENDFEE,
   calcFriendFee,
@@ -645,6 +646,7 @@ export default function ChatArea(props: {
     );
   // stream pacer와 분리된 수동 thinking 타겟(이어쓰기 등 JSON 응답 대기용)
   const [manualThinkingTargetId, setManualThinkingTargetId] = useState<string>("");
+  const [generationProgress, setGenerationProgress] = useState("");
   const [confirmModal, setConfirmModal] = useState<{
     open: boolean;
     title: string;
@@ -4425,6 +4427,7 @@ return (
   // (UX) When "재생성(리롤)" is clicked during generation, abort the current request
   // and ignore any late-arriving stream chunks from the cancelled request.
   const bumpSendSeq = useCallback(() => {
+    setGenerationProgress("");
     const next = sendSeqGenRef.current + 1;
     sendSeqGenRef.current = next;
     sendActiveSeqRef.current = next;
@@ -4867,6 +4870,13 @@ async function send(overrideText?: unknown) {
             continue;
           }
 
+          if (sendActiveSeqRef.current !== reqSeq) return;
+          setGenerationProgress((current) => generationProgressAfterEvent(current, obj));
+          if (obj.type === "retry") {
+            streamLastPingAtRef.current = Date.now();
+            continue;
+          }
+
           if (obj.type === "delta") {
             const d = String(obj.text || "");
             if (!d) continue;
@@ -5101,6 +5111,7 @@ async function send(overrideText?: unknown) {
     setSendError(err?.message || "요청 처리 중 오류가 발생했습니다.");
     alert(`요청 처리 중 오류가 발생했습니다.\n${err?.message ? `(${err.message})` : ""}`);
   } finally {
+    if (sendActiveSeqRef.current === reqSeq) setGenerationProgress("");
     stopStreamPacer();
 
     // 리셋(기존 동작 유지)
@@ -5382,6 +5393,13 @@ async function send(overrideText?: unknown) {
                 continue;
               }
 
+              if (sendActiveSeqRef.current !== reqSeq) return;
+              setGenerationProgress((current) => generationProgressAfterEvent(current, obj));
+              if (obj.type === "retry") {
+                streamLastPingAtRef.current = Date.now();
+                continue;
+              }
+
               if (obj.type === "delta") {
                 const d = String(obj.text || "");
                 if (!d) continue;
@@ -5488,6 +5506,7 @@ setMessages((prev) =>
       } catch {}
       showToast("재생성 실패", (e?.message || "오류"), "error", 3500);
     } finally {
+      if (sendActiveSeqRef.current === reqSeq) setGenerationProgress("");
       if (sendAbortRef.current === abortCtl) sendAbortRef.current = null;
       if (sendActiveSeqRef.current === reqSeq) setBusy(false);
     }
@@ -7689,6 +7708,11 @@ boxSizing: "border-box",
 	          }}
 	        >
 	          <div style={{ width: "100%", maxWidth: CHAT_COLUMN_MAX, padding: "0 14px", pointerEvents: "auto" }}>
+              {busy && generationProgress && (
+                <div role="status" aria-live="polite" style={{ color: "#fbbf24", fontSize: 13, marginBottom: 8 }}>
+                  {generationProgress}
+                </div>
+              )}
 	            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
 	          <div
 	            style={{

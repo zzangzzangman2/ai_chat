@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 const {
+  startResponseStatus,
   chatStatusUpdatedAtSql,
   clearEchoedPromptRegion,
   clearPreviousTerminalRows,
@@ -21,6 +22,26 @@ const {
 } = require("./dos-chat.js");
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("DOS waiting line shows retry count and clears on completion or cancellation", () => {
+  const output = [];
+  const status = startResponseStatus(Date.now(), "응답 생성 중...", (text) => output.push(text));
+  try {
+    assert.match(output.at(-1), /응답 생성 중/);
+    status.setMessage("응답 생성 실패 · 재시도 중… (1/5)");
+    assert.match(output.at(-1), /재시도 중… \(1\/5\)/);
+    status.setMessage("응답 생성 실패 · 재시도 중… (2/5)");
+    assert.match(output.at(-1), /재시도 중… \(2\/5\)/);
+    status.stop(true);
+    assert.equal(output.at(-1), "\r\x1b[2K");
+    const stoppedCount = output.length;
+    status.setMessage("should not return");
+    status.stop(true);
+    assert.equal(output.length, stoppedCount);
+  } finally {
+    status.stop(true);
+  }
+});
 
 test("DOS chat ordering supports DBs both with and without optional status timestamps", () => {
   const db = new Database(":memory:");
