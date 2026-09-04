@@ -1,4 +1,5 @@
 import { assessTurnCompletion } from "../../../../../lib/turn_completion_guard";
+import { widenSamplingForReroll } from "./refusalGuard";
 
 export type StreamRunOneResult = {
   raw: string;
@@ -87,17 +88,6 @@ export type BuildModelCallOptsParams = {
    */
   rerollAttempt?: number;
 };
-
-/** 리롤 회차에 따라 샘플링을 넓힌다. 형식 준수보다 "다른 결과"가 우선인 상황이다. */
-function widenSamplingForReroll(base: { temperature: number; topP: number; topK: number }, attempt: number) {
-  if (attempt <= 0) return base;
-  const step = Math.min(4, Math.max(1, Math.floor(attempt)));
-  return {
-    temperature: Math.min(1.1, base.temperature + 0.2 * step),
-    topP: Math.min(0.98, base.topP + 0.04 * step),
-    topK: Math.min(64, base.topK + 8 * step),
-  };
-}
 
 export function buildModelCallOpts(params: BuildModelCallOptsParams): any {
   const refusalFallbackEnabled = String(process.env.AI_REFUSAL_FALLBACK || "0").trim() === "1";

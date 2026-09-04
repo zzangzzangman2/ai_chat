@@ -106,3 +106,42 @@ export function inspectRefusalOutput(text: string): RefusalCheck {
 export function isRefusalLikeOutput(text: string): boolean {
   return inspectRefusalOutput(text).refused;
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// 리롤 정책 — 스트리밍/비스트리밍이 공유하는 단일 출처
+// ──────────────────────────────────────────────────────────────────────
+//
+// (2026-09-04) 리롤 루프가 스트리밍 경로 안에만 있어서, Flash처럼 항상 버퍼드로
+// 도는 모델은 거부가 나와도 한 번도 다시 굴리지 않고 그대로 저장했다.
+// 실측: chat c502ce10의 gemini-3.8-flash 턴에서 "…생성할 수 없습니다."가 그대로 저장됨.
+// 판정(inspectRefusalOutput)은 정상이었고, 호출하는 쪽이 없었던 게 원인이다.
+// 회차 상한과 샘플링 확장 규칙을 여기 한 곳에 두고 두 경로가 같이 참조한다.
+
+/** 거부 자동 리롤 최대 회차. */
+export function refusalRerollMax(): number {
+  const raw = Number(process.env.AI_REFUSAL_REROLL_MAX ?? 5);
+  return Number.isFinite(raw) ? Math.max(0, Math.min(10, Math.floor(raw))) : 5;
+}
+
+/**
+ * 리롤 회차에 따라 샘플링을 넓힌다.
+ * 같은 temperature로 다시 굴리면 같은 거부가 그대로 재현되므로, 회차마다 넓혀야 한다.
+ */
+export function widenSamplingForReroll(
+  base: { temperature: number; topP: number; topK: number },
+  attempt: number
+): { temperature: number; topP: number; topK: number } {
+  if (attempt <= 0) return base;
+  const step = Math.min(4, Math.max(1, Math.floor(attempt)));
+  return {
+    temperature: Math.min(1.1, base.temperature + 0.2 * step),
+    topP: Math.min(0.98, base.topP + 0.04 * step),
+    topK: Math.min(64, base.topK + 8 * step),
+  };
+}
+
+/** 비스트리밍 본생성 호출에 얹을 리롤 샘플링 오버라이드. 0회차면 아무것도 바꾸지 않는다. */
+export function refusalRerollSamplingOverride(attempt: number): Record<string, number> {
+  if (!(attempt > 0)) return {};
+  return widenSamplingForReroll({ temperature: 0.18, topP: 0.82, topK: 32 }, attempt);
+}

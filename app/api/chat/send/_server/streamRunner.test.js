@@ -16,9 +16,19 @@ Function("exports", "module", "require", transpile("lib/turn_completion_guard.ts
   guardModule,
   require
 );
+const refusalGuardModule = { exports: {} };
+Function("exports", "module", "require", transpile(path.join(__dirname, "refusalGuard.ts")))(
+  refusalGuardModule.exports,
+  refusalGuardModule,
+  require
+);
 const runnerModule = { exports: {} };
-const localRequire = (id) =>
-  id.endsWith("lib/turn_completion_guard") ? guardModule.exports : require(id);
+const localRequire = (id) => {
+  if (id.endsWith("lib/turn_completion_guard")) return guardModule.exports;
+  // streamRunner는 리롤 샘플링 규칙을 refusalGuard와 공유한다(단일 출처).
+  if (id === "./refusalGuard") return refusalGuardModule.exports;
+  return require(id);
+};
 Function("exports", "module", "require", transpile(path.join(__dirname, "streamRunner.ts")))(
   runnerModule.exports,
   runnerModule,
