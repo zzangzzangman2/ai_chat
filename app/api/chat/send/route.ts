@@ -6363,6 +6363,11 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       suggestions,
       usage: usageForClient,
       memoryRefresh,
+      // (2026-09-04) 재시도 진행 표시.
+      // 스트리밍은 `retry` 이벤트로 회차를 실시간 통지하지만, 버퍼드는 응답이 JSON 한 번이라
+      // 도중에 알릴 채널이 없다. 최종 응답에 회차를 실어 보내 클라이언트가 알리게 한다.
+      refusalRerolls: refusalRerollAttempt,
+      refusalBlocked: bufferedRefusal.refused,
       ...(canViewDeveloper ? { debugReasons } : {}),
     });
   } catch (e: any) {

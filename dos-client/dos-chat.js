@@ -7,7 +7,7 @@ const os = require("os");
 const crypto = require("crypto");
 const readlineCore = require("readline");
 const readline = require("readline/promises");
-const { generationProgressAfterEvent } = require("../lib/generation_progress.js");
+const { generationProgressAfterEvent, refusalRerollNotice } = require("../lib/generation_progress.js");
 
 const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, "data", "data.sqlite3");
@@ -3444,6 +3444,9 @@ async function postSend(text) {
   const finalText = textOnly(doneObj && doneObj.assistant ? doneObj.assistant.content : "");
   status?.stop(true);
   status = null;
+  // 버퍼드 응답은 도중에 retry 이벤트를 받지 못한다. 서버가 실어 보낸 회차를 여기서 알린다.
+  const rerollNotice = refusalRerollNotice(doneObj);
+  if (rerollNotice) console.log(`${ANSI.yellow}${rerollNotice}${ANSI.reset}`);
   if (finalText && !printed.trim()) {
     timing.firstOutputAt = timing.firstOutputAt || Date.now();
     printWrapped(finalText);
