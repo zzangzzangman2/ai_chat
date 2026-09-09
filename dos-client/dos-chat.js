@@ -128,7 +128,10 @@ const ANSI = {
   bold: "\x1b[1m",
   dim: "\x1b[2m",
   gray: "\x1b[38;5;244m",
-  narration: "\x1b[38;5;242m",
+  // 256색 팔레트 242는 터미널/색상표에 따라 기본 흰색처럼 보일 수 있다.
+  // 90m을 하위 호환 폴백으로 먼저 지정하고, 지원되는 터미널에는 같은 의도의
+  // 명시적 RGB 회색을 적용해 대사색과 확실히 구분한다.
+  narration: "\x1b[90m\x1b[38;2;108;108;108m",
   dialogue: "\x1b[38;5;250m",
   meta: "\x1b[38;5;247m",
   soft: "\x1b[38;5;248m",
@@ -944,7 +947,10 @@ function colorNovelText(text, options = {}) {
       if (!narrState.inNarration && looksLikeDialogueLine(bodyLine) && !bodyLine.includes("*")) {
         return `${ANSI.dialogue}${bodyLine}${ANSI.reset}`;
       }
-      if (defaultPlainNarration && !narrState.inNarration && !bodyLine.includes("*") && shouldDefaultToNarration(bodyLine)) {
+      // 부분 강조용 * / **가 들어 있어도, 대사로 판정되지 않은 일반 응답 줄은
+      // 줄 전체의 기본 채널이 지문이다. 별표 포함 여부로 이 분기를 건너뛰면
+      // 강조 바깥 텍스트가 ANSI.soft(거의 흰색)로 빠진다.
+      if (defaultPlainNarration && !narrState.inNarration && shouldDefaultToNarration(bodyLine)) {
         return colorNovelInline(bodyLine, narrState, true);
       }
       return colorNovelInline(bodyLine, narrState, false);
@@ -957,6 +963,10 @@ function colorNovelText(text, options = {}) {
 function colorNovelInline(text, state, defaultNarration = false) {
   const src = String(text || "");
   if (!src) return "";
+  // **...**는 Markdown 강조로도 쓰인다. 줄 전체가 이 기호로 감싸진 경우에만
+  // 지문 래퍼로 취급해야 `**강조**: 설명` 같은 줄이 다음 줄의 색상 상태까지
+  // 오염시키지 않는다.
+  const fullyDoubleStarWrapped = /^\s*\*{2,}(?=\S)[\s\S]*?\S\*{2,}\s*$/.test(src);
   let out = "";
   let buf = "";
   let inNarration = state ? Boolean(state.inNarration) : false;
@@ -977,7 +987,7 @@ function colorNovelInline(text, state, defaultNarration = false) {
       const count = end - i;
       if (count === 1) {
         inNarration = !inNarration;
-      } else {
+      } else if (fullyDoubleStarWrapped) {
         const atStart = src.slice(0, i).trim().length === 0;
         const atEnd = src.slice(end).trim().length === 0;
         if (!inNarration && atStart) inNarration = true;

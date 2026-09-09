@@ -15,11 +15,18 @@ const {
   installShiftEnterLineBreak,
   buildContinueInstruction,
   continuationDelta,
+  colorNovelText,
+  createStreamRenderer,
   pickNextMaintenanceEntry,
   displayWidth,
   promptPersonaFields,
   terminalRowsForLine,
 } = require("./dos-chat.js");
+
+const ANSI_NARRATION = "\x1b[90m\x1b[38;2;108;108;108m";
+const ANSI_DIALOGUE = "\x1b[38;5;250m";
+const ANSI_SOFT = "\x1b[38;5;248m";
+const stripAnsi = (value) => String(value || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -133,6 +140,29 @@ test("continue instruction includes the latest answer tail", () => {
 test("continuationDelta prints only newly appended content", () => {
   assert.equal(continuationDelta("기존 답변", "기존 답변\n새 문장"), "새 문장");
   assert.equal(continuationDelta("기존 답변", "완전히 교체된 답변"), "완전히 교체된 답변");
+});
+
+test("DOS keeps prose narration-colored when partial emphasis markers are present", () => {
+  const source = "**앞쪽 강조**: 뒤쪽까지 이어지는 지문\n다음 지문도 같은 색";
+  const rendered = colorNovelText(source, { defaultPlainNarration: true });
+
+  assert.equal(stripAnsi(rendered), source.replace(/\*/g, ""));
+  assert.equal(rendered.includes(ANSI_NARRATION), true);
+  assert.equal(rendered.includes(ANSI_SOFT), false);
+  assert.equal(rendered.includes(ANSI_DIALOGUE), false);
+});
+
+test("streamed DOS prose with partial emphasis never falls back to near-white", () => {
+  const chunks = [];
+  const renderer = createStreamRenderer((chunk) => chunks.push(chunk));
+  renderer.push("첫 지문 *부분 강조* 뒤 지문\n");
+  renderer.push('"대사는 밝게 유지한다."');
+  renderer.finish();
+
+  const rendered = chunks.join("");
+  assert.equal(rendered.includes(ANSI_NARRATION), true);
+  assert.equal(rendered.includes(ANSI_DIALOGUE), true);
+  assert.equal(rendered.includes(ANSI_SOFT), false);
 });
 
 test("background maintenance prioritizes memory and newest character work", () => {
