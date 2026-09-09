@@ -44,6 +44,9 @@ function normalizeDosModelId(model) {
 function isGemini3ProFamilyModel(model) {
   return /gemini-3(?:\.\d+)?-pro/i.test(String(model || ""));
 }
+function isDoneOnlyDosModel(model) {
+  return /^gemini-3\.1-pro(?:-|$)/i.test(normalizeDosModelId(model));
+}
 function isGemini3FlashModel(model) {
   return /^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(String(model || ""));
 }
@@ -949,7 +952,9 @@ function colorNovelText(text, options = {}) {
       // 부분 강조용 * / **가 들어 있어도, 대사로 판정되지 않은 일반 응답 줄은
       // 줄 전체의 기본 채널이 지문이다. 별표 포함 여부로 이 분기를 건너뛰면
       // 강조 바깥 텍스트가 ANSI.soft(거의 흰색)로 빠진다.
-      if (defaultPlainNarration && !narrState.inNarration && shouldDefaultToNarration(bodyLine)) {
+      // 미완성 초안에서 이전 문단의 닫는 *가 빠져도 다음 지문은 회색이어야 한다.
+      // 이전 inNarration 값 때문에 기본 지문색 적용을 건너뛰지 않는다.
+      if (defaultPlainNarration && shouldDefaultToNarration(bodyLine)) {
         return colorNovelInline(bodyLine, narrState, true);
       }
       return colorNovelInline(bodyLine, narrState, false);
@@ -3298,6 +3303,52 @@ async function backfillCharacters(arg) {
   await showCharacters("");
 }
 
+// Gemini 3.1 Pro는 서버에서도 done-only다. NDJSON은 진행/재시도 알림용이며,
+// delta는 아직 문단 기호가 정리되지 않은 초안일 수 있다. 최종 저장본과 같은
+// done 본문을 반환해 printWrapped가 한 번만 출력하도록 한다.
+async function readDoneOnlyChatResponse(response, { onActivity = () => {}, onEvent = () => {} } = {}) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let replacementText = null;
+  let done = null;
+  const consume = (line) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    if (event.type === "error") throw new Error(String(event.error || "stream error"));
+    if (event.type === "replace") {
+      replacementText = String(event.text ?? "");
+    } else if (event.type === "done") {
+      done = event;
+      if (typeof event.assistant?.content !== "string") {
+        if (replacementText === null) throw new Error("완료 응답에 본문이 없습니다.");
+        done = { ...event, assistant: { ...event.assistant, content: replacementText } };
+      }
+      onEvent(event);
+    } else if (event.type === "ping" || event.type === "retry") {
+      onEvent(event);
+    }
+  };
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      onActivity();
+      pending += decoder.decode(chunk.value, { stream: true });
+      let newline;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        consume(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+      }
+    }
+    consume(pending + decoder.decode());
+    if (!done) throw new Error("응답이 완료되기 전에 연결이 끊겼습니다. /history로 저장 여부를 확인해 주세요.");
+    return done;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function postSend(text) {
   if (!state.chatId) {
     throw new Error("열린 채팅이 없습니다. /chats, /open, /presets, /new 를 먼저 사용하세요.");
@@ -3371,7 +3422,22 @@ async function postSend(text) {
   let doneObj = null;
   let printed = "";
 
-  if (ct.includes("application/x-ndjson") && res.body && typeof res.body.getReader === "function") {
+  const isNdjson = ct.includes("application/x-ndjson") && res.body && typeof res.body.getReader === "function";
+  if (isNdjson && isDoneOnlyDosModel(modelName)) {
+    doneObj = await readDoneOnlyChatResponse(res, {
+      onActivity: () => responseWatchdog.touch(),
+      onEvent: (event) => {
+        if (!timing.firstSignalAt) timing.firstSignalAt = Date.now();
+        if (event.type === "retry") {
+          const message = generationProgressAfterEvent("", event);
+          if (message) status?.setMessage(message);
+        } else if (event.type === "done") {
+          timing.doneAt = Date.now();
+        }
+      },
+    });
+    responseWatchdog.stop();
+  } else if (isNdjson) {
     // (2026-07) 서버가 gemini-3-pro 실시간 델타를 다시 보내므로,
     // fence/색상 안전을 위해 줄·펜스 단위 게이트 렌더러로 정리한 뒤,
     // 터미널 페이서로 몇 글자씩 흘려보내 자연스러운 타이핑 체감을 만든다.
@@ -3934,6 +4000,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  isDoneOnlyDosModel,
+  readDoneOnlyChatResponse,
   startResponseStatus,
   MODELS,
   MODEL_OPTIONS,

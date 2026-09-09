@@ -17,6 +17,9 @@ const {
   continuationDelta,
   colorNovelText,
   createStreamRenderer,
+  isDoneOnlyDosModel,
+  readDoneOnlyChatResponse,
+  textOnly,
   pickNextMaintenanceEntry,
   displayWidth,
   promptPersonaFields,
@@ -163,6 +166,143 @@ test("streamed DOS prose with partial emphasis never falls back to near-white", 
   assert.equal(rendered.includes(ANSI_NARRATION), true);
   assert.equal(rendered.includes(ANSI_DIALOGUE), true);
   assert.equal(rendered.includes(ANSI_SOFT), false);
+});
+
+test("a missing closing marker in a draft cannot turn the next narration paragraph bright", () => {
+  const chunks = [];
+  const renderer = createStreamRenderer((chunk) => chunks.push(chunk));
+  renderer.push("*첫 문단의 닫는 기호가 빠졌다.\n\n");
+  renderer.push("*다음 문단도 지문이다. 문장이 계속 이어진다.*\n\n");
+  renderer.push('"확인했습니다."');
+  renderer.finish();
+
+  const rendered = chunks.join("");
+  assert.ok(rendered.includes(`${ANSI_NARRATION}다음 문단도 지문이다.`));
+  assert.equal(rendered.includes(ANSI_SOFT), false);
+  assert.ok(rendered.includes(`${ANSI_DIALOGUE}"확인했습니다."`));
+});
+
+function ndjsonResponse(events) {
+  // 마지막 줄바꿈이 없고 한글 UTF-8 바이트 중간에서 잘린 네트워크 조각도 처리한다.
+  const bytes = new TextEncoder().encode(events.map((event) => JSON.stringify(event)).join("\n"));
+  let offset = 0;
+  return new Response(new ReadableStream({
+    pull(controller) {
+      if (offset >= bytes.length) return controller.close();
+      controller.enqueue(bytes.slice(offset, offset + 7));
+      offset += 7;
+    },
+  }), { headers: { "Content-Type": "application/x-ndjson" } });
+}
+
+test("DOS uses done-only output for Gemini 3.1, including provider-prefixed IDs", () => {
+  assert.equal(isDoneOnlyDosModel("gemini-3.1-pro-preview"), true);
+  assert.equal(isDoneOnlyDosModel("google/gemini-3.1-pro-preview"), true);
+  assert.equal(isDoneOnlyDosModel("gemini-3-pro-preview"), false);
+  assert.equal(isDoneOnlyDosModel("gemini-3.8-flash"), false);
+});
+
+test("done-only output keeps progress events and renders the saved final text once, never a malformed draft", async () => {
+  const draft = '*첫 문단의 닫는 기호가 빠졌다.\n\n*다음 문단은 지문이다.*';
+  const canonical = '*첫 문단의 기호를 정리했다.*\n\n*다음 문단은 지문이다.*\n\n"확인했습니다."';
+  const displayed = [];
+  const progress = [];
+  let activity = 0;
+  const done = await readDoneOnlyChatResponse(ndjsonResponse([
+    { type: "ping" },
+    { type: "delta", text: draft },
+    { type: "replace", text: "" },
+    { type: "retry", attempt: 1 },
+    { type: "delta", text: draft },
+    { type: "replace", text: canonical },
+    { type: "done", assistant: { content: canonical }, usage: { outputTokens: 50 } },
+  ]), {
+    onActivity: () => { activity += 1; },
+    onEvent: (event) => {
+      assert.equal(displayed.length, 0);
+      progress.push(event.type);
+    },
+  });
+  displayed.push(colorNovelText(textOnly(done.assistant.content)));
+  assert.equal(done.assistant.content, canonical);
+  assert.equal(done.usage.outputTokens, 50);
+  assert.deepEqual(progress, ["ping", "retry", "done"]);
+  assert.ok(activity > 1);
+  assert.equal(displayed.length, 1);
+  assert.equal(displayed[0], colorNovelText(textOnly(canonical)));
+  assert.equal(displayed[0].includes(ANSI_SOFT), false);
+});
+
+test("done content wins over replacements, including an explicitly empty final body", async () => {
+  const done = await readDoneOnlyChatResponse(ndjsonResponse([
+    { type: "replace", text: "이전 초안" },
+    { type: "done", assistant: { content: "" } },
+  ]));
+  assert.equal(done.assistant.content, "");
+  const fallback = await readDoneOnlyChatResponse(ndjsonResponse([
+    { type: "replace", text: "이전 초안" },
+    { type: "replace", text: "*최종 수정본*" },
+    { type: "done" },
+  ]));
+  assert.equal(fallback.assistant.content, "*최종 수정본*");
+});
+
+test("done-only output reports an incomplete connection or server error instead of presenting a draft as final", async () => {
+  await assert.rejects(readDoneOnlyChatResponse(ndjsonResponse([
+    { type: "delta", text: "미완성 초안" },
+    { type: "replace", text: "아직 저장 완료가 확인되지 않은 본문" },
+  ])), /완료되기 전에 연결이 끊겼습니다/);
+  await assert.rejects(readDoneOnlyChatResponse(ndjsonResponse([
+    { type: "delta", text: "미완성 초안" },
+    { type: "error", error: "test upstream error" },
+  ])), /test upstream error/);
+});
+
+test("postSend prints the canonical done body once through the real DOS output path", async () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const vm = require("node:vm");
+  const source = fs.readFileSync(path.join(__dirname, "dos-chat.js"), "utf8");
+  const canonical = '*문단 기호를 정리한 최종 지문이다.*\n\n*다음 지문이다.*\n\n"확인했습니다."';
+  const writes = [];
+  let calls = 0;
+  const sandbox = {
+    require, __dirname, module: { exports: {} },
+    Buffer, TextDecoder, AbortController,
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    process: {
+      argv: ["node", "dos-chat.js"], env: {}, on() {},
+      stdin: { isTTY: false },
+      stdout: { isTTY: false, columns: 80, write: (s) => writes.push(s) },
+    },
+    console: { log: (...args) => writes.push(args.join(" ") + "\n"), error() {} },
+    fetch: async (_url, options) => {
+      calls += 1;
+      assert.equal(JSON.parse(options.body).stream, true); // 진행 알림 연결 유지
+      return ndjsonResponse([
+        { type: "ping" },
+        { type: "delta", text: "*수정 전 초안이다.\n\n*다음 지문이다.*\n" },
+        { type: "replace", text: canonical },
+        { type: "done", assistant: { id: "test", content: canonical } },
+      ]);
+    },
+  };
+  // API/설정/유지보수만 격리한다. postSend와 화면 출력 함수는 실제 코드를 실행한다.
+  vm.runInNewContext(source + `
+    state.chatId = "test-chat";
+    loadSettings = async () => ({ model: "gemini-3.1-pro-preview" });
+    pauseBackgroundMaintenance = () => {};
+    resumeBackgroundMaintenance = () => {};
+    queueBackgroundMaintenance = () => {};
+    module.exports.sendForTest = postSend;
+  `, sandbox);
+  await sandbox.module.exports.sendForTest("다음 장면");
+  const output = writes.join("");
+  const expectedBody = colorNovelText(textOnly(canonical));
+  assert.equal(calls, 1);
+  assert.equal(output.split(expectedBody).length - 1, 1);
+  assert.equal(output.includes("수정 전 초안"), false);
+  assert.equal(output.includes(ANSI_SOFT), false);
 });
 
 test("background maintenance prioritizes memory and newest character work", () => {
