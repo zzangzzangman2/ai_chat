@@ -41,6 +41,30 @@ function nameVariants(value: unknown) {
     .sort((a, b) => b.length - a.length);
 }
 
+function isNameAddress(term: string, names: string[]) {
+  const value = key(term).replace(/\s+/gu, "");
+  return names.some((name) =>
+    nameVariants(name).some((variant) =>
+      ["", "아", "야", "씨", "님", "군", "양"].some(
+        (suffix) => value === key(variant + suffix).replace(/\s+/gu, "")
+      )
+    )
+  );
+}
+
+function namePattern(name: string, knownNames: string[]) {
+  const variants = nameVariants(name).filter((variant) =>
+    !knownNames.some((other) =>
+      key(other) !== key(name) && nameVariants(other).some((alias) => key(alias) === key(variant))
+    )
+  );
+  // A shared short name (two different people named 도훈) is not an identity.
+  // An empty pattern must never match a standalone Korean subject particle.
+  if (!variants.length) return null;
+  // A short name may follow punctuation/whitespace, not another name's prefix.
+  return `(?<![\\p{L}\\p{N}_])(?:${variants.map(escapeRegExp).join("|")})`;
+}
+
 function sanitizeOutsideFences(source: string, sanitize: (text: string) => string) {
   let output = "";
   let cursor = 0;
@@ -125,9 +149,11 @@ export function formatAddressDirectionGuard(values: Array<Partial<AddressDirecti
     "# [호칭 발화 방향 정사 — 관계 자유문장보다 우선]",
     "- `A → B: 호칭`은 A가 B를 그 호칭으로 부른다는 뜻이다. B가 A를 그렇게 부르는 것이 아니다.",
     "- 호칭은 발화자와 수신자를 뒤집거나 실제 혈연·혼인 관계로 자동 승격하지 않는다.",
+    "- 각 기록은 해당 두 인물 사이의 방향만 뜻한다. 다른 인물도 같은 이름·호칭을 사용할 수 있으며, 모든 대사의 수신자가 주인공인 것은 아니다.",
+    "- 이름·이름+아/야/씨/님은 불리는 사람을 가리킨다. 다른 인물이 사용했다는 이유로 주인공이나 발화자의 이름으로 치환하지 않는다.",
     ...directions.map(
       (direction) =>
-        `- ${direction.speakerName} → ${direction.targetName}: “${direction.term}” (역방향 사용 금지)`
+        `- ${direction.speakerName} → ${direction.targetName}: “${direction.term}” (${isNameAddress(direction.term, [direction.targetName]) ? "이름 호명; 다른 인물도 같은 대상을 부를 수 있음" : "이 두 인물 사이의 역방향 사용 금지"})`
     ),
   ].join("\n");
 }
@@ -136,9 +162,11 @@ export function formatAddressDirectionGuard(values: Array<Partial<AddressDirecti
  * Deterministic output backstop for directed titles.
  *
  * Prompt instructions and structured-memory conflict checks keep the canon
- * clean, but a provider can still emit a reversed vocative in the live prose.
- * The stream path calls this function only after a complete sentence/newline
- * is buffered, so a bad title is replaced before it reaches the client or DB.
+ * clean, but a provider can still emit a reversed title in the live prose.
+ * Correct only locally explicit speaker AND listener pairs. A bare vocative,
+ * a speaker-only label, or attribution lost across streaming chunks is not
+ * proof of a reversed direction. In particular, a persona-owned address row
+ * does not reserve that name/title exclusively for the persona's use.
  * Fenced INFO/STATUS metadata is left untouched because a relationship label
  * there is not necessarily spoken dialogue.
  */
@@ -156,82 +184,45 @@ export function sanitizeAddressDirectionOutput(input: {
   const reversedSpeakers = new Set<string>();
   let replaced = 0;
   let text = source;
+  const knownNames = directions.flatMap((direction) => [direction.speakerName, direction.targetName]);
 
   for (const direction of directions) {
     const term = clean(direction.term, 40);
     const replacement = clean(direction.speakerName, 80);
-    if (!term || !replacement) continue;
+    if (!term || !replacement || isNameAddress(term, knownNames)) continue;
 
-    const sameTermCanAddressPersona = directions.some(
-      (candidate) =>
-        key(candidate.term) === key(term) &&
-        key(candidate.targetKey) === "persona" &&
-        key(candidate.speakerKey) !== "persona"
-    );
+    // In a proven reversal, the canonical target speaks to the canonical
+    // speaker. Require both names in one local attribution, never a 260-char
+    // proximity window that can include another character's separate action.
+    const reversedSpeaker = namePattern(direction.targetName, knownNames);
+    const reversedListener = namePattern(direction.speakerName, knownNames);
+    if (!reversedSpeaker || !reversedListener) continue;
+    const recordReplacement = () => {
+      replaced += 1;
+      replacedTerms.add(term);
+      reversedSpeakers.add(direction.targetName);
+      return replacement;
+    };
 
     text = sanitizeOutsideFences(text, (outside) => {
       let value = outside;
+      const explicitProse = new RegExp(
+        `(${reversedSpeaker}(?:은|는|이|가|도)\\s+${reversedListener}(?:을|를)\\s+)${escapeRegExp(term)}(?=\\s*(?:이?라고|이라)\\s*(?:부르|불렀|호칭))`,
+        "gu"
+      );
+      value = value.replace(explicitProse, (_match, prefix: string) => `${prefix}${recordReplacement()}`);
 
-      // The assistant must not write dialogue/actions for the persona. When a
-      // title whose only canonical speaker is the persona appears as a live
-      // vocative, it is necessarily being spoken in the reverse direction.
-      // This also works on a small held streaming chunk such as
-      // "장인어른... ", where the speaker-attribution prose was emitted earlier.
-      if (key(direction.speakerKey) === "persona" && !sameTermCanAddressPersona) {
+      const attributedDialogue = new RegExp(
+        `(${reversedSpeaker}(?:은|는|이|가|도)\\s+${reversedListener}(?:에게|한테|께)\\s+(?:말했다|물었다|대답했다|외쳤다|소리쳤다|속삭였다)[.!?。！？]?\\*?\\s*)("[^"\\r\\n]*"|“[^”\\r\\n]*”)`,
+        "gu"
+      );
+      value = value.replace(attributedDialogue, (_match, attribution: string, dialogue: string) => {
         const vocative = new RegExp(
-          `(^|[\\n\\r]|["“'‘]\\s*|[.!?。！？…]\\s+)(${escapeRegExp(term)})(?=\\s*(?:[,，.!?。！？…~～:：]|$))`,
-          "gmu"
-        );
-        value = value.replace(vocative, (_match, prefix: string) => {
-          replaced += 1;
-          replacedTerms.add(term);
-          reversedSpeakers.add(direction.targetName);
-          return `${prefix}${replacement}`;
-        });
-      }
-
-      // Catch explicit prose/label attribution for every pair, including
-      // third-party relationships: "B는 A를 T라고 불렀다" and
-      // `B | "T, ..."` are invalid when the canon is A → B → T.
-      for (const targetName of nameVariants(direction.targetName)) {
-        const target = escapeRegExp(targetName);
-        const speakerVariants = nameVariants(direction.speakerName);
-        const subjectPattern = new RegExp(`${target}(?:은|는|이|가|도)`, "gu");
-        let subjectMatch: RegExpExecArray | null;
-        while ((subjectMatch = subjectPattern.exec(value))) {
-          const start = subjectMatch.index;
-          const windowEnd = Math.min(value.length, start + 260);
-          const window = value.slice(start, windowEnd);
-          const attributedTerm = new RegExp(
-            `${escapeRegExp(term)}(?=(?:\\s*(?:이?라(?:고)?|라고))?\\s*(?:부르|불렀|호칭|말하|외치))`,
-            "u"
-          ).exec(window);
-          if (!attributedTerm) continue;
-          const termAt = Number(attributedTerm.index || 0);
-          const between = window.slice(subjectMatch[0].length, termAt);
-          const canonicalSpeakerTakesSubject = speakerVariants.some((speakerName) =>
-            new RegExp(`${escapeRegExp(speakerName)}(?:은|는|이|가|도)`, "u").test(between)
-          );
-          if (canonicalSpeakerTakesSubject) continue;
-          const absoluteTermAt = start + termAt;
-          value = `${value.slice(0, absoluteTermAt)}${replacement}${value.slice(absoluteTermAt + term.length)}`;
-          replaced += 1;
-          replacedTerms.add(term);
-          reversedSpeakers.add(direction.targetName);
-          subjectPattern.lastIndex = absoluteTermAt + replacement.length;
-        }
-
-        const labelledDialogue = new RegExp(
-          `(${target}\\s*(?:[|:：-])\\s*["“]?[^\\n]{0,100}?)${escapeRegExp(term)}`,
+          `(^["“]\\s*|[.!?。！？…]\\s+)${escapeRegExp(term)}(?=\\s*[,，.!?。！？…~～:：])`,
           "gu"
         );
-        value = value.replace(labelledDialogue, (_match, prefix: string) => {
-          replaced += 1;
-          replacedTerms.add(term);
-          reversedSpeakers.add(direction.targetName);
-          return `${prefix}${replacement}`;
-        });
-      }
+        return attribution + dialogue.replace(vocative, (_term, prefix: string) => `${prefix}${recordReplacement()}`);
+      });
       return value;
     });
   }

@@ -2426,6 +2426,18 @@ ${body}`.trim();
       const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
       const communication = sanitizeCommunicationAbilities(physicalOwnership.text);
       const addressDirection = sanitizeAddressDirections(communication.text);
+      if (addressDirection.replaced > 0) {
+        // Done-only responses can take this recovery path without passing the
+        // stream's counters. Keep address edits visible in diagnostics too.
+        dbg({
+          tag: "send.recovery.address-direction",
+          chatId: cid,
+          reqId,
+          addressDirectionReplacements: addressDirection.replaced,
+          addressDirectionTerms: addressDirection.terms,
+          reversedAddressSpeakers: addressDirection.reversedSpeakers,
+        });
+      }
       if (
         epistemic.redactedSegments > 0 ||
         authorityClaims.removed > 0 ||
