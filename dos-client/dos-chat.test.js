@@ -23,8 +23,8 @@ const {
   terminalRowsForLine,
 } = require("./dos-chat.js");
 
-const ANSI_NARRATION = "\x1b[2;90m";
-const ANSI_DIALOGUE = "\x1b[38;5;250m";
+const ANSI_NARRATION = "\x1b[38;5;244m";
+const ANSI_DIALOGUE = "\x1b[38;5;246m";
 const ANSI_SOFT = "\x1b[38;5;248m";
 const stripAnsi = (value) => String(value || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 

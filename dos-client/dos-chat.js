@@ -128,11 +128,10 @@ const ANSI = {
   bold: "\x1b[1m",
   dim: "\x1b[2m",
   gray: "\x1b[38;5;244m",
-  // Windows PowerShell/conhost에서는 256색과 truecolor가 색상표에 따라
-  // 기본 글자색처럼 보일 수 있다. 표준 DarkGray에 DIM을 함께 적용하면
-  // 해당 기능 중 하나만 지원되는 호스트에서도 대사색과 확실히 구분된다.
-  narration: "\x1b[2;90m",
-  dialogue: "\x1b[38;5;250m",
+  // 회사에서도 본문 전체가 튀지 않도록 지문과 대사를 가까운 중간 회색으로 둔다.
+  // 지문은 충분히 읽히고, 대사는 아주 조금만 밝게 구분된다.
+  narration: "\x1b[38;5;244m",
+  dialogue: "\x1b[38;5;246m",
   meta: "\x1b[38;5;247m",
   soft: "\x1b[38;5;248m",
   title: "\x1b[38;5;252m",
