@@ -5,6 +5,15 @@ import { extractSummarySections } from "./summaryStored";
 const RECALL = /(?:기억|회상|회고|예전|이전에|지난번|아까|그때|당시|처음에|전에는|했었|했던|했잖|했거든|했거덩|했지|없었|안\s*했|일어났|겪었|무슨\s*일|\d+\s*턴)/u;
 const FOLLOW_UP = /^(?:그리고|그게|그거|그것|그건|그때|또|더는|그뿐|그\s*외|아니|맞아|맞지)|(?:했지|했잖|했거든|했거덩|없었|끝이야|뿐이야)/u;
 const TOPIC_CHANGE = /(?:장면\s*(?:전환|바꿔)|다음\s*날|다른\s*(?:이야기|얘기|주제)|이제\s*(?:그만|다른))/u;
+const PAST_CONFIRMATION = /했(?:었)?(?:지|찌|징|죠|쥐|쥬|잖|거든|거덩|냐|니|나요)/u;
+
+function isRecall(text: string) {
+  return RECALL.test(text) || PAST_CONFIRMATION.test(text);
+}
+
+function isFollowUp(text: string) {
+  return FOLLOW_UP.test(text) || PAST_CONFIRMATION.test(text);
+}
 
 export type MemoryRecallQuery = {
   requested: boolean;
@@ -23,29 +32,33 @@ export function buildMemoryRecallQuery(params: {
   const current = String(params.userText || "").trim();
   const ids = findMentionedCharacterIds(params.identities, current);
   let anchorText = "";
-  let requested = RECALL.test(current) && !TOPIC_CHANGE.test(current);
-  if (!TOPIC_CHANGE.test(current) && current.length <= 240 && (requested || FOLLOW_UP.test(current))) {
+  let requested = isRecall(current) && !TOPIC_CHANGE.test(current);
+  if (!TOPIC_CHANGE.test(current) && current.length <= 240 && (requested || isFollowUp(current))) {
     for (const previous of params.previousUserTexts.slice(0, 4)) {
       if (TOPIC_CHANGE.test(previous)) break;
       const previousIds = findMentionedCharacterIds(params.identities, previous);
       // A new explicitly named subject starts a different lookup.
       if (ids.size && previousIds.size && ![...ids].some((id) => previousIds.has(id))) break;
-      if (RECALL.test(previous)) {
+      if (isRecall(previous)) {
         requested = true;
         anchorText = previous;
         if (!ids.size) for (const id of previousIds) ids.add(id);
         if (ids.size) break;
-      } else if (previousIds.size || !FOLLOW_UP.test(previous.trim())) {
+      } else if (previousIds.size || !isFollowUp(previous.trim())) {
         break;
       }
     }
   }
   const names = params.identities.filter((identity) => ids.has(identity.id)).map((identity) => identity.name);
+  // Keep the user's wording, but also search the action noun: "반납했찌?"
+  // must still match a stored "반납했다" without hardcoding event synonyms.
+  const actionNouns = [...current.matchAll(/([가-힣]{2,}?)했(?:었)?(?:지|찌|징|죠|쥐|쥬|잖|거든|거덩|냐|니|나요)/gu)]
+    .map((match) => match[1]);
   return {
     requested,
     names,
     anchorText,
-    searchText: [current, anchorText, ...names].filter(Boolean).join("\n"),
+    searchText: [current, anchorText, ...names, ...actionNouns].filter(Boolean).join("\n"),
   };
 }
 
