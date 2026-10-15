@@ -642,7 +642,7 @@ export function selectHybridMemory(params: {
   const relatedArchiveText = picked.length
     ? [
         "# 관련 과거 사건 기억",
-        "- 현재 대화와 관련된 오래된 사건이다. 현재 서사와 충돌하면 더 최근 구간을 우선한다.",
+        "- 현재 대화와 관련된 오래된 사건이다. 명시적 정정·상태 변화는 시간순으로 반영하되, 최근의 근거 없는 부정만으로 과거 사건을 지우지 않는다.",
         picked.map((item) => formatSection(item.section)).join("\n\n"),
       ].join("\n")
     : "";

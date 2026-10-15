@@ -1,3 +1,5 @@
+import { findMentionedCharacterIds } from "./character_mentions";
+
 export type CharacterScopeRow = {
   id: string;
   name: string;
@@ -49,48 +51,8 @@ export function stripFencedBlocks(text: string) {
   return String(text || "").replace(/```[\s\S]*?```/g, " ");
 }
 
-function parseAliases(raw: string) {
-  const src = String(raw || "").trim();
-  if (!src) return [] as string[];
-  const out: string[] = [];
-  const add = (value: unknown) => {
-    const alias = String(value || "").trim();
-    if (alias) out.push(alias);
-  };
-
-  try {
-    const parsed = JSON.parse(src);
-    if (Array.isArray(parsed)) parsed.forEach(add);
-    else if (Array.isArray(parsed?.aliases)) parsed.aliases.forEach(add);
-  } catch {}
-
-  src.split(/[\n,;\/|]+/g).forEach(add);
-  return Array.from(new Set(out));
-}
-
 export function findFocusedCharacterIds(rows: CharacterScopeRow[], focusText: string) {
-  const haystack = stripFencedBlocks(focusText).toLowerCase();
-  const ids = new Set<string>();
-  if (!haystack.trim()) return ids;
-
-  for (const row of rows) {
-    const canonicalName = String(row.name || "").trim().toLowerCase();
-    const aliases = parseAliases(String(row.aliases || ""))
-      .map((name) => name.trim().toLowerCase())
-      // One-character aliases collide with ordinary word fragments. Keep them
-      // stored, but do not use them for automatic current-turn focus.
-      .filter((name) => name.length >= 2);
-    const canonicalMentioned =
-      canonicalName.length >= 2
-        ? haystack.includes(canonicalName)
-        : canonicalName.length === 1
-          ? haystack.split(/[^\p{L}\p{N}]+/gu).includes(canonicalName)
-          : false;
-    if (canonicalMentioned || aliases.some((name) => haystack.includes(name))) {
-      ids.add(String(row.id || ""));
-    }
-  }
-  return ids;
+  return findMentionedCharacterIds(rows, focusText);
 }
 
 function userSegments(source: string) {

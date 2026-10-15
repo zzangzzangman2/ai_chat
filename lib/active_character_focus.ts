@@ -1,3 +1,5 @@
+import { findMentionedCharacterIds } from "./character_mentions";
+
 export type ActiveCharacterIdentity = {
   id: string;
   name: string;
@@ -18,28 +20,11 @@ function cleanStoryText(value: unknown) {
     .replace(/```[\s\S]*$/g, " ");
 }
 
-function aliasesOf(identity: ActiveCharacterIdentity) {
-  const raw = identity.aliases;
-  let values: string[] = [];
-  if (Array.isArray(raw)) values = raw.map(String);
-  else if (typeof raw === "string") {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) values = parsed.map(String);
-      else values = raw.split(/[,/|，、\n]+/g);
-    } catch {
-      values = raw.split(/[,/|，、\n]+/g);
-    }
-  }
-  return Array.from(
-    new Set([identity.name, ...values].map((value) => String(value || "").trim()).filter((value) => value.length >= 2))
-  );
-}
-
 function mentionedIdentities(text: unknown, identities: ActiveCharacterIdentity[]) {
   const source = cleanStoryText(text);
   if (!source.trim()) return [];
-  return identities.filter((identity) => aliasesOf(identity).some((name) => source.includes(name)));
+  const ids = findMentionedCharacterIds(identities, source);
+  return identities.filter((identity) => ids.has(identity.id));
 }
 
 export function usesSecondPersonReference(text: unknown) {

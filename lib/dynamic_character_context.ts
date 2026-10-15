@@ -718,13 +718,9 @@ export function buildDynamicCharacterContext(params: {
       memoryType: cleanText(memory?.memoryType, 40) || "none",
       importance: Math.max(1, Math.min(3, Number(memory?.importance || 1))),
     }));
-  const durableMemories = normalizedMemoryCandidates.filter((memory) => memory.importance >= 2);
-  const recentEpisodicMemories = normalizedMemoryCandidates
-    .filter((memory) => memory.importance < 2)
-    .slice(-12);
-  const memories = selectConservativeMemoryRows(
-    [...durableMemories, ...recentEpisodicMemories].sort((a, b) => a.turnNo - b.turnNo)
-  );
+  // Importance is an extraction hint, not permission to erase an older event
+  // from a focused character's history. Collapse only actual duplicates.
+  const memories = selectConservativeMemoryRows(normalizedMemoryCandidates);
   const eventSeen = new Set<string>();
   const majorEvents = memories
     .map((memory) => {

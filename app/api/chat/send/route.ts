@@ -157,6 +157,7 @@ import {
   selectHybridMemory,
 } from "./_server/memorySelection";
 import { buildContinuityLedgerBlock } from "./_server/continuityState";
+import { buildMemoryRecallQuery, buildRecallEvidence, selectRecallSummary } from "./_server/memoryRecall";
 import {
   _reEsc,
   applyPromptPlaceholders,
@@ -798,12 +799,7 @@ function buildManualCharacterRosterBlock(
           evidence: decryptIfPossible(String(memory?.evidence || "")),
           importance: Math.max(1, Math.min(3, Number(memory?.importance || 1))),
         }));
-      const memoryRows = selectConservativeMemoryRows(
-        [
-          ...normalizedMemoryRows.filter((memory) => memory.importance >= 2),
-          ...normalizedMemoryRows.filter((memory) => memory.importance < 2).slice(-12),
-        ].sort((a, b) => a.turnNo - b.turnNo)
-      );
+      const memoryRows = selectConservativeMemoryRows(normalizedMemoryRows);
       for (const m of memoryRows) {
         const k = String(m?.rosterId || "");
         if (!k) continue;
@@ -1884,8 +1880,19 @@ ${body}`.trim();
     tEnd(tUserNote);
 
     const tLongMemoryBlock = tStart("장기기억");
-    const memoryQueryText = [
+    const memoryRecall = buildMemoryRecallQuery({
       userText,
+      previousUserTexts: all
+        .filter((message: any) => message.role === "user" && message.id !== userMsg.id)
+        .slice(-4).reverse().map((message: any) => String(message.content || "")),
+      identities: (db.prepare(
+        `SELECT id, name, aliases FROM chat_character_roster WHERE chatId=? AND enabled != 0`
+      ).all(cid) as Array<{ id: string; name: string; aliases: string }>).map((row) => ({
+        ...row, aliases: decryptIfPossible(String(row.aliases || "")),
+      })),
+    });
+    const memoryQueryText = [
+      memoryRecall.searchText,
       tail
         .slice(-8)
         .map((m: any) => String(m?.content || ""))
@@ -1894,7 +1901,7 @@ ${body}`.trim();
     const hybridMemory = selectHybridMemory({
       historySummary,
       queryText: memoryQueryText,
-      primaryQueryText: userText,
+      primaryQueryText: memoryRecall.searchText,
       currentArcTurns: 15,
       currentArcMaxChars: 3200,
       maxRelatedSections: 6,
@@ -1906,7 +1913,7 @@ ${body}`.trim();
     const indexedRelatedMemory = buildRelatedMemoryBlocks({
       chatId: cid,
       queryText: memoryQueryText,
-      primaryQueryText: userText,
+      primaryQueryText: memoryRecall.searchText,
       historySummary: "",
       maxBlocks: 5,
       maxChars: 1800,
@@ -1940,7 +1947,7 @@ ${body}`.trim();
         });
       const hybridSupplements = rankMemoryRetrievalCandidates({
         candidates: hybridSupplementCandidates,
-        primaryQueryText: userText,
+        primaryQueryText: memoryRecall.searchText,
         contextQueryText: memoryQueryText,
         maxItems: 3,
         maxChars: 1200,
@@ -2556,11 +2563,17 @@ ${body}`.trim();
     const fullLongMemoryText = fullLongMemoryEnabled
       ? clampLongMemoryBySection(String(historySummary || "").trim(), fullLongMemoryMaxChars)
       : "";
-    const historySummaryForPromptRaw = (
-      fullLongMemoryText
-        ? [fullLongMemoryText, manualCharacterRosterFallback]
-        : [hybridMemory.currentArcText, relatedArchiveText, manualCharacterRosterFallback]
-    )
+    const recallSummaryText = selectRecallSummary(historySummary, memoryRecall);
+    const recallEvidence = buildRecallEvidence({
+      query: memoryRecall,
+      messages: all,
+      recentMessageIds: tail.map((message: any) => String(message.id || "")),
+    });
+    const historySummaryForPromptRaw = [
+      fullLongMemoryText || recallSummaryText || [hybridMemory.currentArcText, relatedArchiveText].filter(Boolean).join("\n\n"),
+      manualCharacterRosterFallback,
+      recallEvidence.block,
+    ]
       .filter((x) => String(x || "").trim())
       .join("\n\n");
     const historyEpistemicView = sanitizeSharedEpistemicText(
@@ -2592,6 +2605,12 @@ ${body}`.trim();
       tag: "send.memory.blocks",
       chatId: cid,
       reqId,
+      recallRequested: memoryRecall.requested,
+      recallNames: memoryRecall.names,
+      recallSummaryChars: recallSummaryText.length,
+      recallEvidenceTurns: recallEvidence.turns,
+      recallEvidenceMessageIds: recallEvidence.messageIds,
+      recallEvidenceChars: recallEvidence.block.length,
       totalArchiveSections: hybridMemory.totalSections,
       currentRanges: hybridMemory.currentRanges,
       pickedBlocks: indexedRelatedMemory.blocks.length
@@ -2678,7 +2697,9 @@ ${body}`.trim();
       fullLongMemoryText
         ? `- 사용자가 과거 사건/인물/약속을 물으면 이 아카이브에서 근거를 찾아 답하고, 근거가 없으면 지어내지 말고 모른다고 처리한다.`
         : `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
-      `- 구간 정보가 충돌하면 턴 번호가 더 큰(더 최근) 구간을 우선한다.`,
+      `- 구간 정보가 충돌하면 명시적인 정정·상태 변화의 근거와 턴 순서를 확인한다. 뒤늦은 질문이나 근거 없는 부정만으로 이전에 확인된 사건을 지우지 않는다.`,
+      `- 요약·관계표·검색 결과의 누락은 사건이 없었다는 증거가 아니다. 근거가 충분하지 않으면 발생 여부를 미확인으로 남기며, 단정적인 부정이나 긍정으로 메우지 않는다.`,
+      `- 과거 원문 근거는 출처·참여자·당시 시점과 함께 확인한다. 미완료·가정·주장·사건 발생을 구분하고, 상세 묘사가 생략되어도 확인된 사실의 발생 여부를 반대로 바꾸지 않는다.`,
       `- 인물 연속성 장부가 있으면 과거 캐릭터 기록과 최신 일반 장면 지시보다 우선한다.`,
       `- 별도의 인물 정체성·가족관계 정사 블록이 있으면 이 통합 장기기억보다 우선한다.`,
       `- 별도의 공간 정본 블록이 있으면 집·거주지·아랫집·윗집 판단은 그 블록을 우선한다.`,
