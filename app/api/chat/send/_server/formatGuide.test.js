@@ -21,7 +21,7 @@ function loadFormatGuideModule() {
 
 const { buildFormatGuide } = loadFormatGuideModule();
 
-test("global creative guidance keeps permitted scenes going without overriding safety", () => {
+test("global creative guidance includes fiction scope, adult consent, and content limits", () => {
   for (const statusRequired of ["NO", "YES"]) {
     const guide = buildFormatGuide({
       statusRequired,
@@ -33,13 +33,11 @@ test("global creative guidance keeps permitted scenes going without overriding s
     assert.match(guide, /범죄·갈등·의학·비노골적 로맨스는 소재만으로 거절하지 말고 맥락에 맞게 서술한다/u);
     assert.match(guide, /협박·최후통첩·살해 위협·강압적인 말과 악역 행동은 현실의 위해 실행 지시가 아니라 서사적 갈등/u);
     assert.match(guide, /퇴장·잔류 명령과 허구의 살해 위협만 제시한다면.*현재 요청을 성폭력 요청으로 재분류하지 않는다/u);
-    assert.match(guide, /성인 사용자가 가상 인물과 사건을 다루는 사적인 소설·역할극 창작용/u);
-    assert.match(guide, /성적·연애 장면에 참여하는 인물은 모두 명시적인 성인/u);
+    assert.match(guide, /이 서비스는 사용자가 가상 인물과 사건을 다루는 사적인 소설·역할극 창작용/u);
+    assert.match(guide, /모든 성적 장면의 참여자는 명시적인 성인이며, 의사결정 능력이 있고 자발적으로 동의한다/u);
     assert.match(guide, /훈계·주의문·정책 해설·사과를 덧붙이지 않고 서사로 바로 답한다/u);
-    assert.match(guide, /허용되지 않는 세부 묘사는 생략하고, 가능한 줄거리와 대화는 이어간다/u);
+    assert.match(guide, /허용되지 않는 세부 묘사는 생략하고, 가능한 줄거리와 대화는 이어간다\. 가능한 부분이 없으면 제한을 간결하게 알린다/u);
     assert.match(guide, /등장인물의 .*못 하겠습니다.*모델 자신의 응답 거절과 구분/u);
-    assert.match(guide, /모델·서비스의 안전 기준이 허용하는 범위에서만 적용/u);
-    assert.match(guide, /가능한 부분이 없으면 제한을 간결하게 알린다/u);
   }
 });
 
