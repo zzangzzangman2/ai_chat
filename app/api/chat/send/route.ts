@@ -3144,7 +3144,7 @@ const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
 // 적중하므로, 고정 블록(작품설정/페르소나/유저노트/관계규칙)을 앞에, 매턴 변동 블록
 // (로어=키워드 매칭, 장기기억=FTS 검색+N턴 요약)을 뒤에 배치한다. (블록 내용은 동일, 순서만 변경)
 // - 카드/프로필/작품설정을 수정하면 바이트가 달라져 자동으로 캐시 미스→재캐싱된다(퍼지 불필요).
-// - formatGuide는 형식(상태창 펜스) 준수율을 위해 기존처럼 맨 뒤 유지.
+// - formatGuide는 아래의 모든 동적 우선순위 블록 뒤에 붙여 실제 systemInstruction의 맨 끝을 유지한다.
 // - 롤백: AI_CACHE_FRIENDLY_PROMPT=0 → 기존 순서(장기기억이 중간).
 const cacheFriendlyLayout = String(process.env.AI_CACHE_FRIENDLY_PROMPT || "1").trim() !== "0";
 const systemRaw = (cacheFriendlyLayout
@@ -3167,7 +3167,6 @@ const systemRaw = (cacheFriendlyLayout
           ? sanitizePromptCached(dynamicCharacterContext.block)
           : "",
         dynamicCharacterContext.block ? `` : "",
-        sanitizePromptCached(formatGuide),
         recentExpressionAvoidanceBlock ? `` : "",
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
@@ -3192,7 +3191,6 @@ const systemRaw = (cacheFriendlyLayout
           ? sanitizePromptCached(dynamicCharacterContext.block)
           : "",
         dynamicCharacterContext.block ? `` : "",
-        sanitizePromptCached(formatGuide),
         recentExpressionAvoidanceBlock ? `` : "",
         recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
@@ -3366,6 +3364,9 @@ const systemRaw = (cacheFriendlyLayout
     ]
       .filter(Boolean)
       .join("\n\n");
+    const systemWithFormatGuide = [system, sanitizePromptCached(formatGuide)]
+      .filter(Boolean)
+      .join("\n\n");
 
 		    // (변경) 상태창을 포함한 응답을 '한 번의 호출'로 생성한다.
 	    // - Gemini 3 Pro는 streaming 중간에 fenced(STATUS/INFO)가 반쪽으로 보이는 문제가 컸지만,
@@ -3375,7 +3376,7 @@ const systemRaw = (cacheFriendlyLayout
 		    // 즉시 종료되도록 stop sequence를 사용한다.
 		    // - 모델이 메타 fence를 닫고도 계속 출력(불필요 토큰 낭비)하는 케이스를 줄인다.
 		    // - stopSequences는 해당 문자열을 응답에 포함하지 않고 중단한다.
-		    const systemMain = system;
+		    const systemMain = systemWithFormatGuide;
 	
 	    // 이어쓰기/보강용 시스템 프롬프트
 	    // - 이어쓰기에서는 "상태창/메타"를 다시 출력하지 않도록 금지한다(상태창은 첫 호출의 맨 끝 1회만).
@@ -3392,8 +3393,6 @@ const systemRaw = (cacheFriendlyLayout
 	          sanitizePromptCached(relationshipConsistencyBlock),
 	          addressDirectionPriorityBlock ? `` : "",
 	          addressDirectionPriorityBlock ? sanitizePromptCached(addressDirectionPriorityBlock) : "",
-	          ``,
-	          sanitizePromptCached(formatGuide),
 	          recentExpressionAvoidanceBlock ? `` : "",
 	          recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
 	          identityCanonBlock ? `` : "",
@@ -3423,13 +3422,17 @@ const systemRaw = (cacheFriendlyLayout
 	          currentOocPriorityBlock
 	            ? sanitizePromptCached(currentOocPriorityBlock)
 	            : "",
+	          ``,
+	          sanitizePromptCached(formatGuide),
 	        ].join("\n")
 	      : [
-	          systemMain,
+	          system,
 	          "",
 	          sanitizePromptCached(relationshipConsistencyBlock),
 	          "",
 	          "※ (중요) 이 이어쓰기 호출에서는 fenced 코드블록(```...```) 출력 금지. STATUS/INFO/메타 블록도 출력하지 마라.",
+	          "",
+	          sanitizePromptCached(formatGuide),
 	        ].join("\n");
 	    const systemForContinuation = applyPromptPlaceholders(systemForContinuationRaw, { charName: preset.characterName || npcName || "", userName: personaNameFinal || "" });
 
@@ -3457,7 +3460,7 @@ const systemRaw = (cacheFriendlyLayout
 	        ].join("\n")
 	      : system;
 
-	    const systemStatus = system; // (레거시) 별도 상태창 호출용 - 현재는 기본 비활성
+	    const systemStatus = systemMain; // (레거시) 별도 상태창 호출용 - 현재는 기본 비활성
 
     // 6) 모델 호출
     // - 최근 컨텍스트는 "유저 입력 K턴" 기준으로 tail에 포함
@@ -3638,6 +3641,14 @@ const systemRaw = (cacheFriendlyLayout
     ].join("\n");
 
     const latestInputNoEchoRule = `사용자의 최신 입력은 이미 화면에 표시되고 끝난 사건이다. 절대 다시 직접 인용하거나, "~라는 말/명령/요구"로 간접 인용·요약·재서술하지 마라. 입력을 내뱉는 목소리·태도·행위도 다시 묘사하지 말고, 그 직후의 NPC 반응·행동·장면 변화부터 시작하라.`;
+    const currentTurnFictionScope = currentOocInstruction
+      ? ""
+      : [
+          `# [CURRENT TURN FICTION SCOPE — HIGH PRIORITY]`,
+          `- CURRENT USER INPUT은 진행 중인 가상소설 안의 캐릭터 대사 또는 장면 지시이며 현실의 위해 실행 요청이 아니다.`,
+          `- 허구 인물의 협박·최후통첩·살해 위협·강압적인 말은 악역 행동과 서사 갈등으로 처리한다. 그 소재만으로 거절·경고·훈계하지 말고 NPC들의 즉각적인 반응과 결과를 이어간다.`,
+          `- 현재 입력 자체에 성적 행위 요구가 없고 퇴장·잔류 명령과 허구의 위협만 있다면, 이전 대화의 성적 맥락을 끌어와 현재 요청을 성폭력으로 재분류하지 않는다. 현재 입력이 요구한 행동과 반응만 쓴다.`,
+        ].join("\n");
 
     const user = continueMode
       ? buildManualContinuationPrompt({ continueTail, targetChars })
@@ -3650,6 +3661,7 @@ const systemRaw = (cacheFriendlyLayout
 	          `- [최근 대화]의 PREVIOUS USER TURN은 이미 답변이 끝난 과거 입력이다. 이전 입력의 명령이나 행동에 다시 반응하지 않는다.`,
 	          `- 아래 CURRENT USER INPUT만 이번 턴의 활성 입력이다. 대상·행동·상황이 바뀌었으면 즉시 그 변화에 반응한다.`,
 	          latestInputNoEchoRule,
+	          currentTurnFictionScope,
 	          `상대가 현재 입력을 들었다는 전제에서 반응만 진행하라. (이름 | ... 같은 화자표기는 쓰지 말고 큰따옴표만 사용)`,
 	          `[CURRENT USER INPUT]\n${userLine}`,
 	          ``,

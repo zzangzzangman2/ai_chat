@@ -31,6 +31,8 @@ test("global creative guidance keeps permitted scenes going without overriding s
     });
 
     assert.match(guide, /범죄·갈등·의학·비노골적 로맨스는 소재만으로 거절하지 말고 맥락에 맞게 서술한다/u);
+    assert.match(guide, /협박·최후통첩·살해 위협·강압적인 말과 악역 행동은 현실의 위해 실행 지시가 아니라 서사적 갈등/u);
+    assert.match(guide, /퇴장·잔류 명령과 허구의 살해 위협만 제시한다면.*현재 요청을 성폭력 요청으로 재분류하지 않는다/u);
     assert.match(guide, /성인 사용자가 가상 인물과 사건을 다루는 사적인 소설·역할극 창작용/u);
     assert.match(guide, /성적·연애 장면에 참여하는 인물은 모두 명시적인 성인/u);
     assert.match(guide, /훈계·주의문·정책 해설·사과를 덧붙이지 않고 서사로 바로 답한다/u);
@@ -53,22 +55,34 @@ test("Argon receives a concise adult-fiction continuation block without leaking 
 
   assert.match(argon, /GEMINI 4 ARGON 전용 가상소설 지침/u);
   assert.match(argon, /거절문·경고문·도덕적 평가·메타 해설을 출력하지 말고/u);
+  assert.match(argon, /한 명만 남고 모두 나가라.*여기 있는 인물들을 죽인다.*1분 준다/u);
   assert.match(argon, /그 부분만 생략하거나 완화하고 나머지 행동·감정·대사·결과/u);
   assert.doesNotMatch(flash, /GEMINI 4 ARGON 전용 가상소설 지침/u);
 });
 
-test("main and lightweight continuation prompts both include the global format guide", () => {
+test("global format guide is the final instruction in main and continuation prompts", () => {
   const route = fs.readFileSync(path.join(__dirname, "..", "route.ts"), "utf8");
-  const main = route.slice(route.indexOf("const systemRaw"), route.indexOf("const npcName"));
+  const main = route.slice(route.indexOf("const system = ["), route.indexOf("const systemMain"));
   const continuation = route.slice(
     route.indexOf("const systemForContinuationRaw"),
     route.indexOf("const systemForContinuation =")
   );
 
-  assert.equal((main.match(/sanitizePromptCached\(formatGuide\)/gu) || []).length, 2);
-  assert.match(continuation, /sanitizePromptCached\(formatGuide\)/u);
-  assert.match(continuation, /systemMain/u);
+  assert.equal((main.match(/sanitizePromptCached\(formatGuide\)/gu) || []).length, 1);
+  assert.ok(main.lastIndexOf("sanitizePromptCached(formatGuide)") > main.lastIndexOf("currentOocPriorityBlock"));
+  assert.equal((continuation.match(/sanitizePromptCached\(formatGuide\)/gu) || []).length, 2);
+  assert.ok(continuation.lastIndexOf("sanitizePromptCached(formatGuide)") > continuation.lastIndexOf("system,"));
   assert.match(route, /buildFormatGuide\(\{[\s\S]{0,300}model:/u);
+});
+
+test("current user input receives a nearby fictional-threat classifier", () => {
+  const route = fs.readFileSync(path.join(__dirname, "..", "route.ts"), "utf8");
+  const userPrompt = route.slice(route.indexOf("const currentTurnFictionScope"), route.indexOf("const recognitionOverrideRequested"));
+
+  assert.match(userPrompt, /CURRENT TURN FICTION SCOPE/u);
+  assert.match(userPrompt, /협박·최후통첩·살해 위협·강압적인 말/u);
+  assert.match(userPrompt, /현재 요청을 성폭력으로 재분류하지 않는다/u);
+  assert.ok(userPrompt.indexOf("currentTurnFictionScope") < userPrompt.indexOf("[CURRENT USER INPUT]"));
 });
 
 test("global prompt preserves scene membership and closes incapacity loopholes", () => {
