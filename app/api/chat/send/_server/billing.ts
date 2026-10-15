@@ -11,6 +11,10 @@ export function getModelPricing(model: string, atMs = Date.now()): ModelPricing 
     : { inPer1M: 1.5, outPer1M: 7.5 };
   // 기본값은 2.5-pro로 둔다(프로젝트 기본 모델).
   const table: Record<string, ModelPricing> = {
+    // https://cloud.google.com/blog/products/ai-machine-learning/gemini-4-argon-available-on-google-cloud
+    "gemini-4-argon": atMs < Date.UTC(2026, 11, 1)
+      ? { inPer1M: 2, outPer1M: 10 }
+      : { inPer1M: 4, outPer1M: 20 },
     // Gemini 2.5
     "gemini-2.5-pro": { inPer1M: 1.25, outPer1M: 10.0 },
     // Official on-demand Gemini API pricing (USD per 1M tokens).

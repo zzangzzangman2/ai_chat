@@ -1,4 +1,4 @@
-import { isReasoningPresetValue, normalizeModelId, reasoningPresetsForModel } from "@/lib/models";
+import { isGemini4ArgonModel, isReasoningPresetValue, normalizeModelId, reasoningPresetsForModel } from "@/lib/models";
 
 // Remove explicit end markers ONLY.
 //
@@ -464,6 +464,7 @@ export function stripLeadingTitleForDisplay(text: string): string {
 
 export function getModelDisplayLabel(rawModel: string): string {
   const m = normalizeModelId(rawModel);
+  if (isGemini4ArgonModel(m)) return "Gemini 4 Argon";
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) return "3.1-pro";
   // Display the same normalized ID the provider receives, including old rooms.
   if (/^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(m)) return m.replace(/^gemini-/, "");
@@ -475,6 +476,7 @@ export function getModelDisplayLabel(rawModel: string): string {
 
 export function getModelBadge(rawModel: string): { label: string; bg: string; fg: string } {
   const m = normalizeModelId(rawModel);
+  if (isGemini4ArgonModel(m)) return { label: getModelDisplayLabel(m), bg: "rgba(75,170,140,0.18)", fg: "rgba(170,220,200,0.98)" };
   if (/^gemini-3\.1-pro(?:-|$)/i.test(m)) {
     return { label: "3.1-pro", bg: "rgba(255, 75, 75, 0.22)", fg: "rgba(255, 165, 165, 0.98)" };
   }

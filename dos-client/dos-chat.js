@@ -13,11 +13,13 @@ const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, "data", "data.sqlite3");
 const ENC_PREFIX = "enc:v1:";
 const GEMINI_FLASH_MODEL = "gemini-3.8-flash";
-const MODELS = ["gemini-2.5-pro", GEMINI_FLASH_MODEL, "gemini-3.1-pro-preview"];
+const GEMINI_4_ARGON_MODEL = "gemini-4-argon";
+const MODELS = ["gemini-2.5-pro", GEMINI_FLASH_MODEL, "gemini-3.1-pro-preview", GEMINI_4_ARGON_MODEL];
 const MODEL_OPTIONS = [
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   { id: GEMINI_FLASH_MODEL, label: "Gemini 3.8 Flash" },
   { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview" },
+  { id: GEMINI_4_ARGON_MODEL, label: "Gemini 4 Argon" },
 ];
 
 // ────────────────────────────────────────────────────────────────────
@@ -45,13 +47,14 @@ function isGemini3ProFamilyModel(model) {
   return /gemini-3(?:\.\d+)?-pro/i.test(String(model || ""));
 }
 function isDoneOnlyDosModel(model) {
-  return /^gemini-3\.1-pro(?:-|$)/i.test(normalizeDosModelId(model));
+  return normalizeDosModelId(model) === GEMINI_4_ARGON_MODEL || /^gemini-3\.1-pro(?:-|$)/i.test(normalizeDosModelId(model));
 }
 function isGemini3FlashModel(model) {
   return /^gemini-3(?:\.\d+)?-flash(?:-|$)/i.test(String(model || ""));
 }
 function getReasoningPresets(model) {
   model = normalizeDosModelId(model);
+  if (model === GEMINI_4_ARGON_MODEL) return { low: 0, middle: 640, high: 1024 };
   if (isGemini3ProFamilyModel(model)) return { zero: 0, middle: 768, high: 1536 };
   // Gemini 3.6 Flash supports medium/high thinking levels, not zero/minimal.
   if (/^gemini-3\.6-flash(?:-|$)/i.test(String(model || ""))) return { middle: 640, high: 1024 };
@@ -3366,7 +3369,7 @@ async function postSend(text) {
       }
     : undefined;
   const modelName = String(runtime?.model || st?.model || "").trim();
-  const wantStream = isGemini3ProFamilyModel(modelName);
+  const wantStream = isGemini3ProFamilyModel(modelName) || isDoneOnlyDosModel(modelName);
 
   console.log("");
   hr("응답");

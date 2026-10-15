@@ -2,9 +2,9 @@
 //
 // (2026-08-16) 거부 응답이 대화에 그대로 저장되면 다음 턴 프롬프트의 [최근 대화]에 실려
 // 들어간다. 모델은 그것을 "이 대화에서는 이런 요청에 거부하는 게 정상"이라는 선례로 읽고
-// 거부를 반복한다(자기강화). 그래서 거부 응답은
-//   1) 감지하면 최대 N회 자동 리롤하고
-//   2) 끝내 실패해도 DB에 저장하지 않는다(화면에는 안내를 띄우되 기록은 남기지 않음)
+// 거부를 반복한다(자기강화). 그래서 거부 응답은 DB에 저장하지 않는다.
+// (2026-10-15) 사용자 요청으로 자동 리롤은 전면 중단한다.
+// 최초 결과를 화면에 알리고 끝내며, 다시 생성하려면 사용자가 직접 요청해야 한다.
 //
 // 판정은 "롤플레이 본문인가"를 먼저 본다. 극중 인물이 "죄송해요"라고 말하는 것은 거부가
 // 아니다(실측: 저장된 어시스턴트 메시지 1117개 중 '죄송' 포함 19건은 전부 극중 대사였다).
@@ -37,7 +37,7 @@ const REFUSAL_PHRASES: Array<[RegExp, string]> = [
   [/참여할\s*수\s*없/, "참여할 수 없"],
   [/제공할\s*수\s*없/, "제공할 수 없"],
   [/계속(?:할|하기)\s*(?:는\s*)?(?:수\s*없|어렵)/, "계속할 수 없"],
-  [/요청(?:을|를)?\s*(?:수행|처리)할\s*수\s*없/, "요청을 처리할 수 없"],
+  [/요청(?:을|를|은|는)?\s*(?:수행|처리)할\s*수\s*없/, "요청을 처리할 수 없"],
   [/(?:안전|콘텐츠|이용)\s*(?:정책|지침|가이드라인)/, "정책/지침 언급"],
   [/\bI(?:'m| am)\s+(?:sorry|unable|not able)\b/i, "I'm sorry/unable"],
   [/\bI\s+(?:cannot|can't|can not|won't|will not)\b/i, "I cannot"],
@@ -45,8 +45,14 @@ const REFUSAL_PHRASES: Array<[RegExp, string]> = [
   [/\b(?:safety|content|usage)\s+(?:policy|policies|guidelines?)\b/i, "safety policy"],
 ];
 
-// 롤플레이 대사. 극중 인물의 사과/거절과 모델 자신의 거부를 가르는 핵심 신호다.
-const DIALOGUE_RE = /["“「『][^"”」』\n]{2,}["”」』]/;
+// 대사 부분만 제외한다. 인용문이 있다는 이유로 응답 전체를 정상 처리하면
+// '요청하신 "장면"은 생성할 수 없습니다' 같은 실제 거부까지 놓친다.
+const DIALOGUE_RE = /"[^"\n]{2,}"|“[^”\n]{2,}”|「[^」\n]{2,}」|『[^』\n]{2,}』/gu;
+
+// '제공할 수 없다고 말했다'처럼 인물의 거절을 전달하는 명확한 간접화법.
+// 매칭된 거절 문구 바로 뒤만 검사하며, 같은 응답의 다른 거절문까지 면제하지 않는다.
+const REPORTED_SPEECH_TAIL_RE =
+  /^(?:다(?:고|며|면서)|라(?:고|며|면서))\s*(?:(?:조용히|작게|단호히|짧게)\s+)?(?:말했|대답했|답했|중얼거렸|설명했|덧붙였)(?:다|고|지만|으며|는데)(?=[\s.!?…]|$)/u;
 
 /** 코드펜스(INFO/STATUS 등)를 제거한 서사 본문만 남긴다. */
 export function stripFencesForRefusalCheck(text: string): string {
@@ -59,7 +65,7 @@ export function stripFencesForRefusalCheck(text: string): string {
 /**
  * 거부/차단 응답인지 판정한다.
  *
- * 주의: 본문이 짧고, 롤플레이 대사가 없고, 거부 문구가 있을 때만 거부로 본다.
+ * 주의: 짧은 본문의 극중 대사/간접화법 밖에 거부 문구가 있을 때만 거부로 본다.
  * 지문 마커(*...*)는 신뢰하지 않는다 — textPolicy가 거부 문장을 *...*로 감싸는
  * 경로가 있어서, 마커 유무로는 거부와 서사를 구분할 수 없다.
  */
@@ -91,11 +97,17 @@ export function inspectRefusalOutput(text: string): RefusalCheck {
   const REFUSAL_MAX_CHARS = Number(process.env.AI_REFUSAL_MAX_CHARS ?? 400);
   if (flat.length > Math.max(80, REFUSAL_MAX_CHARS)) return OK;
 
-  // 극중 대사가 있으면 장면이다. (인물이 "죄송해요"라고 말하는 경우)
-  if (DIALOGUE_RE.test(body)) return OK;
+  // 극중 대사의 거절은 무시하되, 그 밖의 모델 안내는 계속 검사한다.
+  const outsideDialogue = body
+    .replace(DIALOGUE_RE, " ")
+    .replace(/[*_`>#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   for (const [re, label] of REFUSAL_PHRASES) {
-    if (re.test(flat)) {
+    for (const match of outsideDialogue.matchAll(new RegExp(re.source, `${re.flags}g`))) {
+      const afterPhrase = outsideDialogue.slice((match.index ?? 0) + match[0].length);
+      if (REPORTED_SPEECH_TAIL_RE.test(afterPhrase)) continue;
       return { refused: true, reason: "model_refusal", detail: `phrase:${label}` };
     }
   }
@@ -117,10 +129,9 @@ export function isRefusalLikeOutput(text: string): boolean {
 // 판정(inspectRefusalOutput)은 정상이었고, 호출하는 쪽이 없었던 게 원인이다.
 // 회차 상한과 샘플링 확장 규칙을 여기 한 곳에 두고 두 경로가 같이 참조한다.
 
-/** 거부 자동 리롤 최대 회차. */
+/** 자동 재시도는 항상 꺼 둔다. 레거시 환경변수로도 다시 켜지지 않는다. */
 export function refusalRerollMax(): number {
-  const raw = Number(process.env.AI_REFUSAL_REROLL_MAX ?? 5);
-  return Number.isFinite(raw) ? Math.max(0, Math.min(10, Math.floor(raw))) : 5;
+  return 0;
 }
 
 /**

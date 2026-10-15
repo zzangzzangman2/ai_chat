@@ -6,6 +6,7 @@ import {
   coerceChatModelId,
   defaultReasoningTokensForModel,
   isAllowedChatModel,
+  isGemini4ArgonModel,
   isGemini3FlashModel,
   isGemini3ProModel,
   isReasoningPresetValue,
@@ -146,7 +147,7 @@ export async function GET(req: Request) {
     changed = true;
   }
   const patchedModel = String(patched.model || "");
-  const minReasoning = isGemini3FlashModel(patchedModel) || isGemini3ProModel(patchedModel) ? 0 : 384;
+  const minReasoning = isGemini4ArgonModel(patchedModel) || isGemini3FlashModel(patchedModel) || isGemini3ProModel(patchedModel) ? 0 : 384;
   if (Number(patched.maxReasoningTokens ?? 0) < minReasoning) {
     patched.maxReasoningTokens = defaultReasoningTokens(String(patched.model || ""));
     changed = true;
@@ -233,7 +234,7 @@ export async function POST(req: Request) {
 
   // NOTE: UI에서는 "출력길이"를 글자수(자)로 노출한다.
   if (maxOutputTokens < 800 || maxOutputTokens > 5000) return bad("출력길이는 800~5000자 사이로 설정해 주세요.");
-  const supportsZeroReasoning = isGemini3FlashModel(model) || isGemini3ProModel(model);
+  const supportsZeroReasoning = isGemini4ArgonModel(model) || isGemini3FlashModel(model) || isGemini3ProModel(model);
   const minReasoning = supportsZeroReasoning ? 0 : 384;
   const previousModel = existingSettings?.model
     ? coerceChatModelId(String(existingSettings.model), DEFAULT_MODEL)

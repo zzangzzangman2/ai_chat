@@ -45,7 +45,7 @@ import { computeMessageWindow } from "@/app/components/chat/ChatArea/selectors/m
 import { MessageList } from "@/app/components/chat/ChatArea/MessageList";
 import MemoryPanel from "@/app/components/MemoryPanel";
 import RelationshipGraphPanel from "@/app/components/RelationshipGraphPanel";
-import { CHAT_MODEL_IDS, type ChatModelId, coerceChatModelId } from "@/lib/models";
+import { CHAT_MODEL_IDS, type ChatModelId, coerceChatModelId, isGemini4ArgonModel } from "@/lib/models";
 import { mergeStreamFinalContent } from "@/app/components/chat/ChatArea/streamMerge";
 import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
 import { supportsAbilityViewQuickCommand } from "@/lib/meta_panel_policy";
@@ -4765,7 +4765,7 @@ async function send(overrideText?: unknown) {
     // Gemini 3 Pro: use NDJSON streaming transport for keep-alive stability,
     // but the server will still send a single final "done" payload (no deltas).
     // This prevents common 120s proxy timeouts while keeping the UI "one-shot".
-    const wantStream = /gemini-3(?:\.\d+)?-pro/i.test(modelName);
+    const wantStream = /gemini-3(?:\.\d+)?-pro/i.test(modelName) || isGemini4ArgonModel(modelName);
 
     const payload = {
       chatId,
@@ -5317,7 +5317,7 @@ async function send(overrideText?: unknown) {
         userMessageId: prevUser.id,
         replaceAssistantId: assistantMessageId,
         includeSuggestions: false,
-        stream: false,
+        stream: isGemini4ArgonModel(String(settings?.model || "")),
       };
 
       const dbgId = `regen-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
@@ -5562,7 +5562,7 @@ setMessages((prev) =>
         replaceAssistantId: assistantMessageId,
         continueFromAssistantId: assistantMessageId,
         includeSuggestions: false,
-        stream: false,
+        stream: isGemini4ArgonModel(String(settings?.model || "")),
       };
 
       const dbgId = `continue-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
@@ -6844,7 +6844,7 @@ const insertNarrationMarkers = useCallback(() => {
                 </div>
 
                 <div>
-                  <div style={{ fontSize: 12, fontWeight: 700 }}>{/^gemini-3(?:\.|-)/i.test(String(settings.model || "")) ? "사고 수준 (Gemini 3)" : "추론길이"}</div>
+                  <div style={{ fontSize: 12, fontWeight: 700 }}>{isGemini4ArgonModel(settings.model) ? "사고 수준 (Gemini 4)" : /^gemini-3(?:\.|-)/i.test(String(settings.model || "")) ? "사고 수준 (Gemini 3)" : "추론길이"}</div>
 
                   {(() => {
                     const presets = getReasoningPresets(settings.model);
@@ -6884,6 +6884,7 @@ const insertNarrationMarkers = useCallback(() => {
                         <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
                           {(() => {
                             const modelName = String(settings.model || "");
+                            if (isGemini4ArgonModel(modelName)) return `Gemini 4 사고: ${level === "high" ? "high" : level === "middle" ? "medium" : "low"} (토큰 수 제한이 아닌 사고 수준)`;
                             const isG3 = /^gemini-3(?:\.|-)/i.test(modelName);
                             const isG3Pro = /gemini-3(?:\.\d+)?-pro/i.test(modelName);
                             const actualReasoning = Number(settings.maxReasoningTokens ?? presets[level]);

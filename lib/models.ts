@@ -3,12 +3,14 @@ export const GEMINI_25_PRO_MODEL = "gemini-2.5-pro" as const;
 // (2026-09-03) Gemini API / Vertex(global) GA: low, medium, high; no minimal.
 export const GEMINI_3_FLASH_MODEL = "gemini-3.8-flash" as const;
 export const GEMINI_31_PRO_MODEL = "gemini-3.1-pro-preview" as const;
+export const GEMINI_4_ARGON_MODEL = "gemini-4-argon" as const;
 export const DEFAULT_CHAT_MODEL = GEMINI_31_PRO_MODEL;
 
 export const CHAT_MODEL_IDS = [
   GEMINI_25_PRO_MODEL,
   GEMINI_3_FLASH_MODEL,
   GEMINI_31_PRO_MODEL,
+  GEMINI_4_ARGON_MODEL,
 ] as const;
 
 export type ChatModelId = (typeof CHAT_MODEL_IDS)[number];
@@ -72,6 +74,7 @@ export function providerModelNameForGemini(model: string): string {
 }
 
 export function defaultReasoningTokensForModel(model?: string): number {
+  if (model && isGemini4ArgonModel(model)) return 640;
   if (model && isCurrentGeminiFlashModel(model)) return 640;
   if (model && isGemini3FlashModel(model)) return 0;
   return 384;
@@ -83,6 +86,10 @@ export function isGemini3ProModel(model: string): boolean {
 
 export function isGemini31ProModel(model: string): boolean {
   return /^gemini-3\.1-pro(?:-|$)/i.test(normalizeModelId(model));
+}
+
+export function isGemini4ArgonModel(model: string): boolean {
+  return normalizeModelId(model) === GEMINI_4_ARGON_MODEL;
 }
 
 export function isCurrentGeminiFlashModel(model: string): boolean {
@@ -114,6 +121,8 @@ export function isGemini3Model(model: string): boolean {
 export type ReasoningPresetLevel = "zero" | "low" | "middle" | "high";
 
 export function reasoningPresetsForModel(model: string): Record<ReasoningPresetLevel, number> {
+  // Argon supports LOW/MEDIUM/HIGH, never MINIMAL or a numeric thinking budget.
+  if (isGemini4ArgonModel(model)) return { zero: 0, low: 0, middle: 640, high: 1024 };
   if (isGemini3ProModel(model)) {
     // zero 슬롯은 UI에서 FAST로 노출되며 공식 지원 레벨인 low에 매핑된다.
     return { zero: 0, low: 384, middle: 768, high: 1536 };

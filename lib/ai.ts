@@ -4,6 +4,7 @@ import {
   GEMINI_3_FLASH_MODEL,
   isGemini25ProModel,
   isGemini31ProModel,
+  isGemini4ArgonModel,
   isCurrentGeminiFlashModel,
   isGemini3FlashModel,
   isGemini3Model,
@@ -252,6 +253,9 @@ type ThinkingConfigAny = { thinkingBudget?: number; thinkingLevel?: string };
 function buildThinkingConfig(model: string, maxReasoningTokens: number, maxOutputTokensRequested: number): ThinkingConfigAny | null {
   const tRaw = Number(maxReasoningTokens) || 0;
   const t = Math.max(0, Math.floor(tRaw));
+  if (isGemini4ArgonModel(model)) {
+    return { thinkingLevel: t >= 1024 ? "high" : t >= 640 ? "medium" : "low" };
+  }
   // Gemini 3:
   // - SDK/API에서는 thinkingBudget(숫자)와 thinkingLevel(레벨) 중 **하나만** 설정 가능
   //   (둘 다 주면 400: "You can only set only one of thinking budget and thinking level.")
@@ -418,6 +422,11 @@ function computeEffectiveMaxOutputTokens(
   user: string
 ) {
   const req = Math.max(0, Math.floor(Number(requestedMaxOutputTokens) || 0));
+  if (isGemini4ArgonModel(model)) {
+    // Google's recommended thought+answer allowance, capped to one non-streaming
+    // hop. This is a ceiling, not a target; the existing character prompt stays.
+    return 32768;
+  }
   const g3ProHeadroomCapRaw = Number(process.env.G3PRO_HEADROOM_CAP ?? 6144);
   const g3ProHeadroomCap = Number.isFinite(g3ProHeadroomCapRaw)
     ? Math.min(8192, Math.max(256, Math.floor(g3ProHeadroomCapRaw)))
@@ -528,6 +537,8 @@ if (isGemini3Pro(model)) {
 }
 
 function defaultCallTimeoutMs(model: string) {
+  // Argon can reason for minutes; retain caller cancellation and explicit deadlines.
+  if (isGemini4ArgonModel(model)) return 0;
   const modelIs31Pro = isGemini31Pro(model);
   const modelIs3Pro = isGemini3Pro(model);
   const modelIs3Flash = isGemini3Flash(model);
@@ -804,6 +815,10 @@ export async function generateText(params: {
     model: requestModel,
     contents: [{ role: "user", parts: [{ text: user }] }],
     config: {
+      // SDK 2.x enables multi-hop continuation/retries by default. Preserve
+      // the app's single-call contract after upgrading the SDK for Argon.
+      automaticContinuation: false,
+      httpOptions: { retryOptions: { attempts: 1 }, ...(isGemini4ArgonModel(opts.model) ? { timeout: 1200000 } : {}) },
       systemInstruction: system,
       maxOutputTokens: effectiveMaxOutputTokens,
       ...(samplingConfig ? samplingConfig : {}),
@@ -1004,6 +1019,8 @@ export async function generateTextStream(params: {
     model: requestModel,
     contents: [{ role: "user", parts: [{ text: user }] }],
     config: {
+      automaticContinuation: false,
+      httpOptions: { retryOptions: { attempts: 1 }, ...(isGemini4ArgonModel(opts.model) ? { timeout: 1200000 } : {}) },
       systemInstruction: system,
       maxOutputTokens: effectiveMaxOutputTokens,
       ...(samplingConfig ? samplingConfig : {}),

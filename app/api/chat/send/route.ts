@@ -5,7 +5,7 @@ import { getSessionUser, isAdminEmail } from "@/lib/auth";
 import { randomUUID } from "crypto";
 import { countTokens, generateText, generateTextStream, summarizeKorean, summarizeLongMemoryKorean, isRefusalText, REFUSAL_FALLBACK_MODEL } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
-import { DEFAULT_CHAT_MODEL, GEMINI_3_FLASH_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini31ProModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
+import { DEFAULT_CHAT_MODEL, GEMINI_3_FLASH_MODEL, coerceChatModelId, defaultReasoningTokensForModel, isGemini4ArgonModel, isGemini31ProModel, isGemini3FlashModel, isGemini3ProModel } from "@/lib/models";
 
 import {
   postprocessLongMemorySummary,
@@ -205,7 +205,7 @@ import {
 const DEFAULT_USD_TO_KRW = Number(process.env.USD_TO_KRW) || 1350;
 
 // One-shot mode: never make additional LLM calls (auto-continue / rewrite / status fallback).
-// Default ON. Set CHAT_ONE_SHOT="0" to restore legacy multi-call behavior.
+// Always enabled; refusalRerollMax() also forces refusal retries to zero.
 const ONE_SHOT = true; // hard: disable all multi-call flows (no 2nd model call)
 
 const GEMINI_3_PRO_FAMILY_RE = /gemini-3(?:\.\d+)?-pro/i;
@@ -1393,7 +1393,7 @@ export async function POST(req: Request) {
       maxReasoningTokens: (() => {
         const v = Number(reasonRaw);
         // UI 선택값(low/mid/high)을 그대로 반영하되, 안전 범위만 클램프한다.
-        const minReasoning = isGemini3FlashModel(chosenModel) || isGemini3ProModel(chosenModel) ? 0 : 384;
+        const minReasoning = isGemini4ArgonModel(chosenModel) || isGemini3FlashModel(chosenModel) || isGemini3ProModel(chosenModel) ? 0 : 384;
         return Math.max(minReasoning, Math.min(8192, Math.floor(v)));
       })(),
       signal: generationAbortController.signal,
@@ -2715,7 +2715,7 @@ ${body}`.trim();
     // Gemini 3.1 Pro는 모델 텍스트 델타를 화면에 내보내지 않는다.
     // 한 번에 생성한 완성본을 검증·정규화한 뒤 done으로만 전달한다.
     // NDJSON 연결의 keep-alive ping은 장시간 요청의 연결 유지만 담당한다.
-    const G3PRO_DONE_ONLY = isGemini31Pro;
+    const G3PRO_DONE_ONLY = isGemini31Pro || isGemini4ArgonModel(modelName);
 // Gemini 3 Pro는 1-shot으로 한 번에 출력을 뱉는 경우가 많아서,
     // 이어쓰기(추가 generateText 호출)가 들어가면 대기 시간이 거의 2배가 된다.
     // → 이 모델에 한해 "추가 호출(이어쓰기/짧음 보정/메타 오버랩)"을 금지한다.
@@ -3117,7 +3117,8 @@ statusRequired = !continueMode && (authorWantsStatus || metaRequired === "YES") 
 const formatGuide = buildFormatGuide({
           statusRequired,
           targetChars,
-						promptMinChars: promptMinForGuide,
+          model: modelName,
+          promptMinChars: promptMinForGuide,
           promptMaxChars,
           bodyMaxChars,
           metaMaxChars,
@@ -4151,7 +4152,7 @@ let cancelStreamWork: (() => void) | null = null;
 
           // Gemini 3.1 Pro는 항상 비스트리밍 generateText 경로를 사용한다.
           // 전송 연결은 ping을 보낼 수 있지만 생성 본문은 완료 후 한 번만 전달된다.
-          const PRO_DONE_ONLY = isGemini31Pro;
+          const PRO_DONE_ONLY = isGemini31Pro || isGemini4ArgonModel(modelName);
 
           // (2026-08-16) 거부 응답 자동 리롤 회차. 아래 생성 호출들이 이 값을 읽어
           // 리롤마다 샘플링을 넓힌다(같은 temperature로 다시 굴리면 같은 거부가 재현된다).
@@ -4305,6 +4306,8 @@ if (doneOnlyOverlapStart.metaOverlapTriggeredAt > 0) {
           // "이 대화에서는 이런 요청에 거부하는 것이 정상"이라는 선례로 읽고 거부를 반복한다.
           // 그래서 사용자가 다시 누르기 전에 서버가 먼저 다시 굴린다.
           //
+          // (2026-10-15) 자동 재시도 중단: refusalRerollMax()는 항상 0이다.
+          // 아래 레거시 루프는 실행되지 않으며, 첫 결과만 반환한다.
           // 리롤할 때마다 refusalRerollAttempt가 올라가고 buildModelCallOpts가 그 값으로
           // temperature/topP를 높인다. 같은 샘플링으로 다시 굴리면 같은 거부가 나오기 쉽다.
           //
@@ -5306,7 +5309,7 @@ const activeGenerationSystem = continueMode ? systemForContinuation : systemMain
     // Pro 계열에서만 스트리밍을 켜므로(ChatArea: /gemini-3(\.\d+)?-pro/), Flash로 도는
     // 대화와 재생성/이어쓰기(continueAid → wantStream=false)는 전부 이 경로로 온다.
     // 즉 거부가 나와도 한 번도 다시 굴리지 않고 그대로 저장됐다.
-    // 판정은 transport와 무관해야 하므로 여기에도 같은 리롤을 둔다.
+    // (2026-10-15) 공통 refusalRerollMax()가 항상 0이므로 아래 레거시 루프는 실행되지 않는다.
     let refusalRerollAttempt = 0;
     let refusalDiscardedUsage: any = null;
     const runFirstGeneration = () =>

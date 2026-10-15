@@ -21,6 +21,56 @@ function loadFormatGuideModule() {
 
 const { buildFormatGuide } = loadFormatGuideModule();
 
+test("global creative guidance keeps permitted scenes going without overriding safety", () => {
+  for (const statusRequired of ["NO", "YES"]) {
+    const guide = buildFormatGuide({
+      statusRequired,
+      targetChars: 1200,
+      promptMinChars: 900,
+      promptMaxChars: 1600,
+    });
+
+    assert.match(guide, /범죄·갈등·의학·비노골적 로맨스는 소재만으로 거절하지 말고 맥락에 맞게 서술한다/u);
+    assert.match(guide, /성인 사용자가 가상 인물과 사건을 다루는 사적인 소설·역할극 창작용/u);
+    assert.match(guide, /성적·연애 장면에 참여하는 인물은 모두 명시적인 성인/u);
+    assert.match(guide, /훈계·주의문·정책 해설·사과를 덧붙이지 않고 서사로 바로 답한다/u);
+    assert.match(guide, /허용되지 않는 세부 묘사는 생략하고, 가능한 줄거리와 대화는 이어간다/u);
+    assert.match(guide, /등장인물의 .*못 하겠습니다.*모델 자신의 응답 거절과 구분/u);
+    assert.match(guide, /모델·서비스의 안전 기준이 허용하는 범위에서만 적용/u);
+    assert.match(guide, /가능한 부분이 없으면 제한을 간결하게 알린다/u);
+  }
+});
+
+test("Argon receives a concise adult-fiction continuation block without leaking it to other models", () => {
+  const common = {
+    statusRequired: "NO",
+    targetChars: 1200,
+    promptMinChars: 900,
+    promptMaxChars: 1600,
+  };
+  const argon = buildFormatGuide({ ...common, model: "publishers/google/models/gemini-4-argon" });
+  const flash = buildFormatGuide({ ...common, model: "gemini-3.8-flash" });
+
+  assert.match(argon, /GEMINI 4 ARGON 전용 가상소설 지침/u);
+  assert.match(argon, /거절문·경고문·도덕적 평가·메타 해설을 출력하지 말고/u);
+  assert.match(argon, /그 부분만 생략하거나 완화하고 나머지 행동·감정·대사·결과/u);
+  assert.doesNotMatch(flash, /GEMINI 4 ARGON 전용 가상소설 지침/u);
+});
+
+test("main and lightweight continuation prompts both include the global format guide", () => {
+  const route = fs.readFileSync(path.join(__dirname, "..", "route.ts"), "utf8");
+  const main = route.slice(route.indexOf("const systemRaw"), route.indexOf("const npcName"));
+  const continuation = route.slice(
+    route.indexOf("const systemForContinuationRaw"),
+    route.indexOf("const systemForContinuation =")
+  );
+
+  assert.equal((main.match(/sanitizePromptCached\(formatGuide\)/gu) || []).length, 2);
+  assert.match(continuation, /sanitizePromptCached\(formatGuide\)/u);
+  assert.match(continuation, /systemMain/u);
+  assert.match(route, /buildFormatGuide\(\{[\s\S]{0,300}model:/u);
+});
+
 test("global prompt preserves scene membership and closes incapacity loopholes", () => {
   const guide = buildFormatGuide({
     statusRequired: "NO",

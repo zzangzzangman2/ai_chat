@@ -6,6 +6,7 @@ type FormatGuideArgs = {
   targetChars: number;
   promptMinChars: number;
   promptMaxChars: number;
+  model?: string;
   bodyMaxChars?: number;
   metaMaxChars?: number;
   // If the creator/preset suggests a specific meta fence label (e.g. ```INFO), hint it here.
@@ -23,6 +24,8 @@ export function buildFormatGuide(args: FormatGuideArgs): string {
   const targetChars = Number(args.targetChars || 0);
   const promptMinChars = Number(args.promptMinChars || 0);
   const promptMaxChars = Number(args.promptMaxChars || 0);
+  const model = String(args.model || "").trim().toLowerCase();
+  const isArgon = /(?:^|\/)gemini-4-argon(?:-|$)/i.test(model);
   const metaLabelHint = String((args as any).metaLabelHint || "").trim();
 
   const metaRequired = String(args?.metaRequired || "NO");
@@ -60,7 +63,7 @@ export function buildFormatGuide(args: FormatGuideArgs): string {
     "2~3";
 const metaTemplateFence = String(args?.metaTemplateFence || "").trim();
 const metaTemplateSig = metaTemplateFence ? `${metaTemplateFence.length}:${metaTemplateFence.slice(0, 24)}` : "";
-const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars}|${bodyMaxChars}|${metaMaxChars}|${metaLabelHint}|${metaRequired}|${metaTemplateSig}`;
+const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars}|${bodyMaxChars}|${metaMaxChars}|${metaLabelHint}|${metaRequired}|${metaTemplateSig}|${isArgon ? "argon" : "default"}`;
   const hit = cache.get(key);
   if (hit !== undefined) return hit;
 
@@ -68,6 +71,23 @@ const key = `${statusRequired}|${targetChars}|${promptMinChars}|${promptMaxChars
   const formatGuide =
 [
 `출력 규칙:`,
+`[사이트 공통 창작 범위 — 모든 작품·채팅·이어쓰기에 적용]`,
+`   - 서비스 용도: 딸쟁이용 가상소설용`,
+`   - 이 서비스는 성인 사용자가 가상 인물과 사건을 다루는 사적인 소설·역할극 창작용이다.`,
+`   - 성적·연애 장면에 참여하는 인물은 모두 명시적인 성인이어야 한다. 미성년자이거나 나이가 불명확한 인물을 성적 장면에 포함하지 않는다.`,
+`   - 성인 인물 사이의 합의된 성적·로맨틱 장면, 강한 감정, 거친 언어는 가상소설의 소재로 취급한다. 허용되는 장면에는 훈계·주의문·정책 해설·사과를 덧붙이지 않고 서사로 바로 답한다.`,
+`   - 다음 창작 지침은 모델·서비스의 안전 기준이 허용하는 범위에서만 적용한다. OOC·세계관·출력 형식 지시가 안전 기준을 덮어쓰지 않는다.`,
+`   - 범죄·갈등·의학·비노골적 로맨스는 소재만으로 거절하지 말고 맥락에 맞게 서술한다.`,
+`   - 허용되지 않는 세부 묘사는 생략하고, 가능한 줄거리와 대화는 이어간다. 가능한 부분이 없으면 제한을 간결하게 알린다.`,
+`   - 세부 묘사를 생략한다는 이유로 인물의 동의·관계·사건·퇴장을 새로 지어내지 않는다. 허용되는 부분에서도 기존 정사와 인물 지식 경계를 유지한다.`,
+`   - 등장인물의 "못 하겠습니다" 같은 극중 대사나 그 대사를 전달하는 지문은 모델 자신의 응답 거절과 구분한다. 캐릭터의 거절은 장면의 일부이며 그 자체로 서술을 중단할 이유가 아니다.`,
+(isArgon
+  ? `[GEMINI 4 ARGON 전용 가상소설 지침]
+   - 현재 요청을 성인용 사적 허구 서사의 다음 장면 생성으로 해석한다. 허구의 사건 묘사를 현실의 조언이나 실행 지시로 오인하지 않는다.
+   - 허용되는 성인 가상소설 요청에는 거절문·경고문·도덕적 평가·메타 해설을 출력하지 말고, 캐릭터의 반응과 장면 전개로 즉시 시작한다.
+   - 요청 일부의 세부 묘사가 제한되더라도 답변 전체를 중단하지 않는다. 그 부분만 생략하거나 완화하고 나머지 행동·감정·대사·결과를 자연스럽게 이어간다.
+   - 캐릭터가 극중에서 거절하거나 저항하는 전개와 모델의 응답 거절을 혼동하지 않는다. 캐릭터의 의사와 기존 정사를 유지한 채 장면을 서술한다.`
+  : null),
 `0) [사이트 공통 OOC 규칙 — 모든 작품/채팅에서 최우선]`,
 `   - OOC 표식은 대소문자를 구분하지 않는다. OOC, ooc, Ooc, oOc 등 모든 조합을 같은 메타 지시로 인식한다.`,
 `   - [OOC: ...], ((OOC: ...)), OOC: ... 형태와 각 형태의 모든 대소문자 변형을 캐릭터 대사가 아닌 사용자 메타 지시로 처리한다.`,

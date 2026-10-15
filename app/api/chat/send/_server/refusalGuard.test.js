@@ -72,6 +72,39 @@ test("극중 인물의 사과 대사는 거부가 아니다", () => {
   assert.equal(isRefusalLikeOutput(inCharacter), false);
 });
 
+test("인물의 거절 대사는 따옴표 종류와 무관하게 모델 거부가 아니다", () => {
+  for (const [open, close] of [['"', '"'], ["“", "”"], ["「", "」"], ["『", "』"]]) {
+    assert.equal(isRefusalLikeOutput(`${open}못 하겠습니다. 그 자료는 제공할 수 없습니다.${close}`), false);
+    assert.equal(isRefusalLikeOutput(`*민수는 고개를 저었다.*\n\n${open}도와드릴 수 없습니다.${close}`), false);
+  }
+});
+
+test("인물의 거절을 전달하는 간접화법은 모델 거부가 아니다", () => {
+  for (const scene of [
+    "*민수는 그 자료를 제공할 수 없다고 말했다.*",
+    "*그녀는 지금은 도와드릴 수 없다며 조용히 대답했다.*",
+    "*그는 계속할 수 없다면서 중얼거렸다.*",
+  ]) {
+    assert.equal(isRefusalLikeOutput(scene), false, scene);
+  }
+});
+
+test("인용문이나 극중 대사가 있어도 바깥의 실제 모델 거부는 유지한다", () => {
+  for (const refusal of [
+    '요청하신 "장면"은 생성할 수 없습니다.',
+    '"다음에 만나자."\n\n죄송합니다. 해당 요청은 처리할 수 없습니다.',
+    '*민수는 도와드릴 수 없다고 말했다.*\n\n요청하신 내용에는 응답할 수 없습니다.',
+    '*민수는 도와드릴 수 없다고 말했다.*\n\n죄송합니다. 이 요청은 도와드릴 수 없습니다.',
+    'I cannot help with the request "continue the scene".',
+  ]) {
+    assert.equal(inspectRefusalOutput(refusal).reason, "model_refusal", refusal);
+  }
+});
+
+test("명시적인 차단 STATUS는 극중 대사보다 우선한다", () => {
+  assert.equal(inspectRefusalOutput('"못 하겠습니다."\n```STATUS\nerror: blocked_output\n```').reason, "blocked_output");
+});
+
 test("정상 서사는 거부가 아니다", () => {
   const scene = [
     "*창밖으로 번지는 빗소리를 오래 듣고 있던 그는 천천히 고개를 돌렸다. 방 안의 공기가 무겁게 가라앉았다.*",
@@ -106,20 +139,62 @@ test("한국어 상태창이 붙은 거부문을 거부로 판정한다", () => 
   assert.equal(check.reason, "model_refusal");
 });
 
-test("리롤 상한은 0~10으로 잘린다", () => {
+test("자동 리롤은 레거시 환경변수 값과 무관하게 항상 꺼져 있다", () => {
   const prev = process.env.AI_REFUSAL_REROLL_MAX;
   try {
     delete process.env.AI_REFUSAL_REROLL_MAX;
-    assert.equal(refusalRerollMax(), 5);
-    process.env.AI_REFUSAL_REROLL_MAX = "99";
-    assert.equal(refusalRerollMax(), 10);
-    process.env.AI_REFUSAL_REROLL_MAX = "-3";
     assert.equal(refusalRerollMax(), 0);
-    process.env.AI_REFUSAL_REROLL_MAX = "not-a-number";
-    assert.equal(refusalRerollMax(), 5);
+    for (const value of ["0", "1", "5", "10", "99", "-3", "not-a-number", ""]) {
+      process.env.AI_REFUSAL_REROLL_MAX = value;
+      assert.equal(refusalRerollMax(), 0, value);
+    }
   } finally {
     if (prev === undefined) delete process.env.AI_REFUSAL_REROLL_MAX;
     else process.env.AI_REFUSAL_REROLL_MAX = prev;
+  }
+});
+
+test("실제 스트리밍/버퍼드 경로는 거절·빈 응답·차단 후 추가 생성이나 재시도 알림을 보내지 않는다", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "route.ts"), "utf8");
+  const ast = ts.createSourceFile("route.ts", source, ts.ScriptTarget.Latest, true);
+  const retryBlocks = [];
+  function visit(node) {
+    if (ts.isBlock(node) && node.statements.length === 2 &&
+        ts.isVariableStatement(node.statements[0]) && ts.isWhileStatement(node.statements[1]) &&
+        node.statements[0].getText(ast).includes("const maxRerolls = refusalRerollMax()")) {
+      retryBlocks.push(node.getText(ast));
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  assert.equal(retryBlocks.length, 2, "both transport paths must use the disabled retry policy");
+
+  for (const block of retryBlocks) {
+    for (const text of ["요청하신 내용에는 응답할 수 없습니다.", "", "```STATUS\nerror: blocked_output\n```", "정상 응답입니다."]) {
+      let calls = 0;
+      const events = [];
+      const generate = async () => {
+        calls += 1;
+        return { text, combinedRaw: text };
+      };
+      const run = new Function("refusalRerollMax", "inspectRefusalOutput", "generate", "safeEnqueue", `
+        return (async () => {
+          let generation = await generate();
+          let first = generation;
+          let refusalRerollAttempt = 0;
+          const runMainGeneration = generate;
+          const runFirstGeneration = generate;
+          ${block}
+          return { generation, first, refusalRerollAttempt };
+        })();
+      `);
+      const result = await run(refusalRerollMax, inspectRefusalOutput, generate, (event) => events.push(event));
+      assert.equal(calls, 1, "only the original generation may run");
+      assert.equal(result.refusalRerollAttempt, 0);
+      assert.equal(result.generation.combinedRaw, text);
+      assert.equal(result.first.text, text);
+      assert.deepEqual(events, []);
+    }
   }
 });
 
