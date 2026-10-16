@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test:undo": "node --test app/api/chat/message/route.test.js dos-client/delete-recent.test.js dos-client/dos-chat.test.js",
     "test:knowledge": "node --test lib/character_knowledge.test.js",
     "test:recognition": "node --test lib/recognition_consistency_guard.test.js",
     "test:address": "node --test lib/relationship_direction.test.js lib/relationship_direction_identity.test.js lib/structured_relationship_direction_apply.test.js lib/guarded_text_stream.test.js",

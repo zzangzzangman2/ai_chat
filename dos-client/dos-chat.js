@@ -2982,21 +2982,26 @@ async function deleteRecent(arg) {
     return;
   }
 
-  const flatIds = pairs.flat();
-  let deleted = 0;
-  for (const id of flatIds) {
-    try {
-      const res = await fetch(
-        `${API_BASE}/api/chat/message?messageId=${encodeURIComponent(id)}`,
+  const chatId = state.chatId;
+  const deletedIds = new Set();
+  pauseBackgroundMaintenance({ abortRunning: true });
+  try {
+    for (const pair of pairs) {
+      // The API atomically deletes the pair and its derived memory together.
+      const result = await apiJson(
+        `/api/chat/message?messageId=${encodeURIComponent(pair[0])}`,
         { method: "DELETE" }
       );
-      if (res.ok) deleted += 1;
-    } catch {
-      // continue
+      for (const id of result.deleted || []) {
+        deletedIds.add(id);
+        state.pendingCharacterRefreshes.delete(`${chatId}:${id}`);
+      }
     }
+    console.log(`삭제 완료: ${pairs.length}쌍 (${deletedIds.size}개 메시지)`);
+    await showHistory(40);
+  } finally {
+    resumeBackgroundMaintenance();
   }
-  console.log(`삭제 완료: ${pairs.length}쌍 (${deleted}개 메시지)`);
-  await showHistory(40);
 }
 
 function isAbortLike(error) {

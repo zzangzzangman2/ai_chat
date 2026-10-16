@@ -6,6 +6,7 @@ import {
   loadStructuredCharacterIdentities,
 } from "@/lib/structured_relationship_memory";
 import { db } from "@/lib/db";
+import { captureChatHistory, withCurrentChatHistory, type ChatHistorySnapshot } from "@/lib/chat_history_guard";
 import { selectMessagesForAssistantTurnRange } from "@/app/api/chat/send/_server/turnRange";
 import {
   buildAuthoritativePersonaFacts,
@@ -38,7 +39,7 @@ export type RelationshipGraphRefreshResult = {
   factsUpserted: number;
 };
 
-const lastAttemptedTurnByChat = new Map<string, number>();
+const lastAttemptedTurnByChat = new Map<string, string>();
 
 function completedAssistantTurnCount(messages: RelationshipRefreshMessage[]) {
   const firstUserPos = messages.findIndex(
@@ -113,11 +114,13 @@ export async function refreshRelationshipGraphIfDue(params: {
   chatId: string;
   personaName: string;
   messages: RelationshipRefreshMessage[];
+  historySnapshot?: ChatHistorySnapshot;
   signal?: AbortSignal;
 }): Promise<RelationshipGraphRefreshResult> {
   const chatId = String(params.chatId || "").trim();
   const personaName = String(params.personaName || "").trim() || "나";
   const messages = Array.isArray(params.messages) ? params.messages : [];
+  const historySnapshot = params.historySnapshot || captureChatHistory(chatId);
   const turnNo = completedAssistantTurnCount(messages);
   if (turnNo < RELATIONSHIP_REFRESH_EVERY_TURNS) {
     return result("not_enough_turns", turnNo);
@@ -130,10 +133,11 @@ export async function refreshRelationshipGraphIfDue(params: {
 
   // The character-refresh endpoint and relationship panel can run together.
   // Avoid charging for the same graph extraction twice in one completed turn.
-  if (lastAttemptedTurnByChat.get(chatId) === turnNo) {
+  const attemptKey = `${turnNo}:${historySnapshot.signature}`;
+  if (lastAttemptedTurnByChat.get(chatId) === attemptKey) {
     return result("already_attempted", turnNo);
   }
-  lastAttemptedTurnByChat.set(chatId, turnNo);
+  lastAttemptedTurnByChat.set(chatId, attemptKey);
   if (lastAttemptedTurnByChat.size > 200) {
     const oldestChatId = lastAttemptedTurnByChat.keys().next().value;
     if (oldestChatId) lastAttemptedTurnByChat.delete(oldestChatId);
@@ -188,12 +192,12 @@ export async function refreshRelationshipGraphIfDue(params: {
     return result("extract_failed", turnNo, windowStartTurn);
   }
 
-  const applied = applyStructuredCharacterGraph({
+  const applied = withCurrentChatHistory(historySnapshot, () => applyStructuredCharacterGraph({
     chatId,
     personaName,
     graph,
     turnNo,
-  });
+  }));
   return {
     attempted: true,
     reason: "refreshed",

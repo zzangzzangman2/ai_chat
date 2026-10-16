@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { bad, requireChatAccess } from "@/app/api/memory/_util";
 import { decryptIfPossible } from "@/lib/crypto";
 import { db } from "@/lib/db";
+import { captureChatHistory, StaleChatHistoryError, withCurrentChatHistory } from "@/lib/chat_history_guard";
 import {
   deriveIdentityCanon,
   inferPersonaNameFromMessages,
@@ -142,6 +143,7 @@ export async function POST(req: Request) {
     const access = await requireChatAccess(chatId);
     if (!access.ok) return access.res;
 
+    const historySnapshot = captureChatHistory(chatId);
     const messages = loadMessages(chatId);
     const settings = db
       .prepare(`SELECT personaName, personaAge FROM chat_settings WHERE chatId=?`)
@@ -157,6 +159,7 @@ export async function POST(req: Request) {
     }
     const relationshipGraphRefresh = await refreshRelationshipGraphIfDue({
       chatId,
+      historySnapshot,
       personaName,
       messages,
     });
@@ -170,7 +173,8 @@ export async function POST(req: Request) {
     const turnNo = messages.filter((message) =>
       ["assistant", "model"].includes(String(message.role || "").toLowerCase())
     ).length;
-    const synced = syncIdentityCanonRelations({ chatId, canon, turnNo });
+    const synced = withCurrentChatHistory(historySnapshot, () => {
+    const count = syncIdentityCanonRelations({ chatId, canon, turnNo });
     syncCharacterVitals({
       chatId,
       messages,
@@ -179,6 +183,8 @@ export async function POST(req: Request) {
       personaAge: Number(settings?.personaAge || 0),
     });
     ensureCharacterAffinityRows({ chatId, personaName: canon.personaName, characters: roster });
+    return count;
+    });
 
     return NextResponse.json({
       ok: true,
@@ -188,6 +194,9 @@ export async function POST(req: Request) {
       ...graphResponse(chatId, canon.personaName),
     });
   } catch (error: any) {
+    if (error instanceof StaleChatHistoryError) {
+      return NextResponse.json({ ok: true, skipped: true, reason: "stale_source_changed" });
+    }
     console.error("/api/chat/relationships POST error", error);
     return bad(error?.message || "relationship_graph_refresh_failed", 500);
   }

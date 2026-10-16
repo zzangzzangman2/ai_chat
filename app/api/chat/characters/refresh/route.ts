@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { captureChatHistory, StaleChatHistoryError, withCurrentChatHistory } from "@/lib/chat_history_guard";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { generateText } from "@/lib/ai";
 import { GEMINI_3_FLASH_MODEL, normalizeModelId } from "@/lib/models";
@@ -328,6 +329,7 @@ export async function POST(req: Request) {
     const access = await requireChatAccess(chatId);
     if (!access.ok) return access.res;
 
+    const historySnapshot = captureChatHistory(chatId);
     const decryptedAll = db
       .prepare(`SELECT id, role, content, createdAt FROM messages WHERE chatId=? ORDER BY createdAt ASC, id ASC`)
       .all(chatId)
@@ -416,6 +418,7 @@ export async function POST(req: Request) {
 
     const relationshipGraphRefresh = await refreshRelationshipGraphIfDue({
       chatId,
+      historySnapshot,
       personaName,
       messages: all,
       signal: req.signal,
@@ -700,8 +703,8 @@ export async function POST(req: Request) {
          updatedAt=excluded.updatedAt`
     );
     const deleteStmt = db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo=?`);
-    resetCharacterAffinitiesForTurn(chatId, turnNo);
     const writeAll = db.transaction((entries: any[]) => {
+      resetCharacterAffinitiesForTurn(chatId, turnNo);
       deleteStmt.run(chatId, turnNo);
       for (const item of entries) {
         const id = String(item?.id || "").trim();
@@ -815,7 +818,7 @@ export async function POST(req: Request) {
         });
       }
     });
-    writeAll(items);
+    withCurrentChatHistory(historySnapshot, () => writeAll(items));
 
     return NextResponse.json({
       ok: true,
@@ -829,6 +832,9 @@ export async function POST(req: Request) {
       generationError: generationError || undefined,
     });
   } catch (e: any) {
+    if (e instanceof StaleChatHistoryError) {
+      return NextResponse.json({ ok: true, skipped: true, reason: "stale_source_changed", saved: 0 });
+    }
     console.error("/api/chat/characters/refresh error", e);
     return bad(e?.message || "character_refresh_failed", 500);
   }

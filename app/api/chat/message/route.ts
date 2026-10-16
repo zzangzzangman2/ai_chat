@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { captureChatHistory, StaleChatHistoryError, withCurrentChatHistory } from "@/lib/chat_history_guard";
 import { getSessionUser } from "@/lib/auth";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import {
@@ -92,7 +93,6 @@ function trimLongMemorySummaryToEnd(summary: string, endTurn: number) {
 }
 
 function trimLongMemoryCache(chatId: string, truncateEndTurn: number) {
-  try {
     const row = db
       .prepare(
         `SELECT recentSummary, rolledUpCount FROM chat_memory_cache WHERE chatId=?`
@@ -136,9 +136,25 @@ function trimLongMemoryCache(chatId: string, truncateEndTurn: number) {
       now,
       chars
     );
-  } catch {
-    // best-effort
+}
+
+function invalidateDerivedMemory(chatId: string, affectedTurn: number, sourceIndex: number, derivedTurn: number) {
+  if (affectedTurn > 0) {
+    const truncateEndTurn = computeTruncateEndTurn(affectedTurn);
+    trimLongMemoryCache(chatId, truncateEndTurn);
+    db.prepare(`DELETE FROM chat_memory_blocks WHERE chatId=? AND endTurn>?`).run(chatId, truncateEndTurn);
+    // Per-turn records do not need to discard the earlier turns in a 3-turn window.
+    db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo>=?`).run(chatId, affectedTurn);
+    db.prepare(`DELETE FROM chat_character_facts WHERE chatId=? AND turnNo>=?`).run(chatId, affectedTurn);
+    db.prepare(`DELETE FROM chat_character_events WHERE chatId=? AND turnNo>=?`).run(chatId, affectedTurn);
+    // These tables keep the latest value, not a complete history. Drop affected
+    // automatic values so they cannot be reused as evidence for the next reply.
   }
+  db.prepare(`DELETE FROM chat_character_relations WHERE chatId=? AND lastSeenTurn>=? AND slotKey NOT LIKE 'manual:%'`).run(chatId, derivedTurn);
+  db.prepare(`DELETE FROM chat_character_affinity WHERE chatId=? AND lastTurnNo>=?`).run(chatId, derivedTurn);
+  // A pending user turn can already have updated these before an answer exists.
+  db.prepare(`DELETE FROM chat_character_vitals WHERE chatId=? AND sourceOrder>=?`).run(chatId, sourceIndex);
+  db.prepare(`DELETE FROM chat_spatial_states WHERE chatId=? AND sourceOrder>=?`).run(chatId, sourceIndex);
 }
 
 function getMsgWithOwner(messageId: string): MsgRow | null {
@@ -184,6 +200,7 @@ export async function PATCH(req: Request) {
       return jsonError("only user/assistant messages can be edited", 400);
     }
 
+    db.transaction(() => {
     db.prepare(`UPDATE messages SET content=?, updatedAt=?, userEmail=? WHERE id=?`).run(
       encryptIfPossible(content),
       Date.now(),
@@ -195,7 +212,6 @@ export async function PATCH(req: Request) {
     // However, deleting *all* long memory feels like "장기기억 전체 초기화".
     // Instead, we **truncate** long memory to the last safe window before the edited point,
     // so only the affected ranges are regenerated.
-    try {
       const cid = msg.chatId;
 
       const ordered = db
@@ -206,20 +222,9 @@ export async function PATCH(req: Request) {
 
       // If the edit does not affect any assistant turn (e.g. editing the last user message
       // before an assistant reply exists), we keep existing long memory intact.
-      if (affectedTurn > 0) {
-        const truncateEndTurn = computeTruncateEndTurn(affectedTurn);
-        trimLongMemoryCache(cid, truncateEndTurn);
-
-        // Other derived tables (best-effort)
-        db.prepare(
-          `DELETE FROM chat_memory_blocks WHERE chatId=? AND endTurn>?`
-        ).run(cid, truncateEndTurn);
-        db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
-        db.prepare(`DELETE FROM chat_character_facts WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
-      }
-    } catch {
-      // best-effort
-    }
+      if (idx >= 0) invalidateDerivedMemory(cid, affectedTurn, idx,
+        affectedTurn || countAssistantTurnsUpToIndex(ordered, idx) + 1);
+    }).immediate();
 
     return NextResponse.json({ ok: true });
   } catch (e: any) {
@@ -243,6 +248,7 @@ export async function DELETE(req: Request) {
     }
     if (msg.chatOwner !== u.email) return jsonError("forbidden", 403);
 
+    const historySnapshot = captureChatHistory(msg.chatId);
     const ordered = db
       .prepare(`SELECT id, role, createdAt FROM messages WHERE chatId=? ORDER BY createdAt ASC, id ASC`)
       .all(msg.chatId) as any[];
@@ -256,12 +262,12 @@ export async function DELETE(req: Request) {
     // - assistant를 지우면 직전 user도 함께 삭제
     // - user를 지우면 직후 assistant도 함께 삭제
     const curRole = String(ordered[idx]?.role || "");
-    if (curRole === "assistant") {
+    if (isAssistantLikeRole(curRole)) {
       const prev = ordered[idx - 1];
       if (prev && String(prev.role) === "user") idsToDelete.add(String(prev.id));
     } else if (curRole === "user") {
       const next = ordered[idx + 1];
-      if (next && String(next.role) === "assistant") idsToDelete.add(String(next.id));
+      if (next && isAssistantLikeRole(next.role)) idsToDelete.add(String(next.id));
     }
 
     const ids = Array.from(idsToDelete);
@@ -282,10 +288,9 @@ export async function DELETE(req: Request) {
       // fallback: 삭제 대상에 assistant가 없으면(이론상) 해당 메시지의 영향 지점을 기준으로 자른다.
       affectedTurn = computeAffectedAssistantTurn(ordered, idx);
     }
-    const truncateEndTurn = affectedTurn > 0 ? computeTruncateEndTurn(affectedTurn) : null;
+    const sourceIndex = ordered.findIndex((row) => idsToDelete.has(String(row.id)));
 
-    db.exec("BEGIN");
-    try {
+    withCurrentChatHistory(historySnapshot, () => {
       for (const id of ids) {
         db.prepare(`DELETE FROM message_usage WHERE messageId=?`).run(id);
         db.prepare(`DELETE FROM chat_character_events WHERE messageId=?`).run(id);
@@ -294,29 +299,13 @@ export async function DELETE(req: Request) {
 
       // IMPORTANT: derived caches
       const cid = msg.chatId;
-      try {
-        if (truncateEndTurn !== null) {
-          // long memory: truncate to the safe window BEFORE the deleted range
-          trimLongMemoryCache(cid, truncateEndTurn);
-
-          // other derived tables (best-effort)
-          db.prepare(
-            `DELETE FROM chat_memory_blocks WHERE chatId=? AND endTurn>?`
-          ).run(cid, truncateEndTurn);
-          db.prepare(`DELETE FROM chat_character_turn_memories WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
-          db.prepare(`DELETE FROM chat_character_facts WHERE chatId=? AND turnNo>?`).run(cid, truncateEndTurn);
-        }
-      } catch {
-        // ignore
-      }
-      db.exec("COMMIT");
-    } catch (err) {
-      db.exec("ROLLBACK");
-      throw err;
-    }
+      invalidateDerivedMemory(cid, affectedTurn, sourceIndex,
+        affectedTurn || countAssistantTurnsUpToIndex(ordered, idx) + 1);
+    });
 
     return NextResponse.json({ ok: true, deleted: ids });
   } catch (e: any) {
+    if (e instanceof StaleChatHistoryError) return jsonError("대화가 변경되어 삭제를 다시 시도해 주세요.", 409);
     return jsonError(e?.message || "error", 500);
   }
 }

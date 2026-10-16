@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "crypto";
 
 import { db } from "@/lib/db";
+import { captureChatHistory, StaleChatHistoryError, withCurrentChatHistory, type ChatHistorySnapshot } from "@/lib/chat_history_guard";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { generateText, summarizeLongMemoryKorean, summarizeLongMemorySectionKorean } from "@/lib/ai";
 import { GEMINI_3_FLASH_MODEL, normalizeModelId } from "@/lib/models";
@@ -637,6 +638,7 @@ type StructuredGraphRefreshOutcome = {
 
 async function refreshStructuredCharacterState(params: {
   chatId: string;
+  historySnapshot: ChatHistorySnapshot;
   personaName: string;
   personaAge: number;
   personaGender: string;
@@ -714,12 +716,12 @@ async function refreshStructuredCharacterState(params: {
     let autoRelationshipsUpserted = 0;
     let autoFactsUpserted = 0;
     if (structuredGraph.ok) {
-      const applied = applyStructuredCharacterGraph({
+      const applied = withCurrentChatHistory(params.historySnapshot, () => applyStructuredCharacterGraph({
         chatId: params.chatId,
         personaName: params.personaName,
         graph: structuredGraph,
         turnNo: params.graphWindowEndTurn,
-      });
+      }));
       autoCharactersAdded = applied.charactersAdded;
       autoAliasesUpdated = applied.aliasesUpdated;
       autoRelationshipsUpserted = applied.relationshipsUpserted;
@@ -779,7 +781,7 @@ async function refreshStructuredCharacterState(params: {
           }
         }
       });
-      insertMany(detected);
+      withCurrentChatHistory(params.historySnapshot, () => insertMany(detected));
       autoCharactersAdded = [...new Set([...autoCharactersAdded, ...inserted])];
     }
 
@@ -817,6 +819,7 @@ async function refreshStructuredCharacterState(params: {
       autoFactsUpserted,
     };
   } catch (error: unknown) {
+    if (error instanceof StaleChatHistoryError) throw error;
     if (process.env.CHAT_DEBUG === "1") {
       console.log(JSON.stringify({
         tag: "structuredGraph.refresh_error",
@@ -1040,6 +1043,7 @@ export async function POST(req: Request) {
       Boolean(body?.allowBadOutputSave);
 
     // load & decrypt all messages
+    const historySnapshot = captureChatHistory(chatId);
     const rawAll = db
       .prepare(
         `SELECT id, chatId, role, content, imagesJson, createdAt, updatedAt
@@ -1146,13 +1150,13 @@ export async function POST(req: Request) {
     const normalizedSummary = sanitizeLongMemorySummary(normalizeSummaryTail(recentSummary), summaryEveryVal);
     const didNormalizeSummary = normalizedSummary !== recentSummary;
     recentSummary = normalizedSummary;
-    let memoryBlocksBackfilled = backfillMemoryBlocksFromSummary({
+    let memoryBlocksBackfilled = withCurrentChatHistory(historySnapshot, () => backfillMemoryBlocksFromSummary({
       chatId,
       summary: recentSummary,
       summaryEvery: summaryEveryVal,
       summaryLength: perTurnCharsVal,
       now: Date.now(),
-    });
+    }));
 
     const summarizedEndTurnText = Math.max(0, getSummarizedEndTurn(recentSummary));
 
@@ -1169,7 +1173,7 @@ export async function POST(req: Request) {
       const requestedEndTurn = Math.max(0, Math.floor(Number(nextSummarizedEndTurn) || 0));
       const safeEndTurn = Math.min(requestedEndTurn, contentEndTurn);
       const safeSummaryChars = strlenSummary(safeSummary);
-      db.prepare(
+      withCurrentChatHistory(historySnapshot, () => db.prepare(
         `UPDATE chat_memory_cache
          SET recentSummary=?, recentSummaryChars=?, summarizedEndTurn=?, updatedAt=?
          WHERE chatId=?`
@@ -1179,7 +1183,7 @@ export async function POST(req: Request) {
         safeEndTurn,
         now,
         chatId
-      );
+      ));
     };
 
     // Existing corrupted sections are repaired automatically before new windows advance.
@@ -1225,6 +1229,7 @@ export async function POST(req: Request) {
         );
         const graphOutcome = await refreshStructuredCharacterState({
           chatId,
+          historySnapshot,
           personaName,
           personaAge,
           personaGender,
@@ -1304,11 +1309,11 @@ export async function POST(req: Request) {
     if (!repair && hasRangeBlock(recentSummary, windowStartTurn, windowEndTurn)) {
       const nextEndTurn = Math.max(summarizedEndTurn, windowEndTurn);
       persistNormalizedSummaryIfNeeded(nextEndTurn);
-      db.prepare(
+      withCurrentChatHistory(historySnapshot, () => db.prepare(
         `UPDATE chat_memory_cache
          SET summarizedEndTurn=?, updatedAt=?
          WHERE chatId=?`
-      ).run(nextEndTurn, Date.now(), chatId);
+      ).run(nextEndTurn, Date.now(), chatId));
 
       const morePending = nextEndTurn < boundaryEndTurn;
 
@@ -1935,6 +1940,7 @@ export async function POST(req: Request) {
     const now = Date.now();
     const recentSummaryChars = strlenSummary(nextSummary);
 
+    withCurrentChatHistory(historySnapshot, () => {
     db.prepare(
       `INSERT INTO chat_memory_cache (chatId, recentSummary, summarizedEndTurn, rolledUpCount, lastSummarizedAt, updatedAt, recentSummaryChars)
        VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1982,6 +1988,7 @@ export async function POST(req: Request) {
       now,
     });
     memoryBlocksBackfilled += 1;
+    });
 
     // 새 채팅은 첫 완성 구간(3턴)에서 roster를 만들고, 이후에는 12턴마다
     // 관계·별칭을 갱신한다. roster 부트스트랩이 실패한 동안에는 다음 3턴
@@ -2025,6 +2032,7 @@ export async function POST(req: Request) {
       );
       const graphOutcome = await refreshStructuredCharacterState({
         chatId,
+        historySnapshot,
         personaName,
         personaAge,
         personaGender,
@@ -2092,6 +2100,9 @@ export async function POST(req: Request) {
       },
     });
   } catch (e: any) {
+    if (e instanceof StaleChatHistoryError) {
+      return NextResponse.json({ ok: true, skipped: true, reason: "stale_source_changed", morePending: true });
+    }
     console.error("/api/chat/memory/refresh error", e);
     return bad(e?.message || "refresh_failed", 500);
   }
