@@ -470,7 +470,11 @@ export function findScenePresenceContradiction(args: {
   presentCharacters: ScenePresenceFact[];
   excludedCharacters?: ScenePresenceFact[];
 }): ScenePresenceContradiction | null {
-  const story = stripFencedBlocks(args.text);
+  // Keep offsets into the original text even when a status fence precedes prose.
+  const story = String(args.text || "").replace(
+    /```[^\n]*\n[\s\S]*?```|```[\s\S]*$/g,
+    (fence) => fence.replace(/[^\n]/g, " ")
+  );
   const excludedCharacters = args.excludedCharacters || [];
   if (
     !story.trim() ||
@@ -865,7 +869,70 @@ export function removeRecognitionContradictionPassages(args: {
   };
 }
 
-/** Removes only the local contradictory prose after model repair also failed. */
+function removeLegacySceneFiller(value: string) {
+  let removed = 0;
+  let inFence = false;
+  const text = value.split("\n").filter((line) => {
+    if (/^\s*```/u.test(line)) {
+      inFence = !inFence;
+      return true;
+    }
+    if (inFence) return true;
+    // Match only the old generated narration, never quoted dialogue or a
+    // legitimate sentence which merely happens to say someone stayed.
+    if (/^\s*\*[^*\n]+ 역시 (?:자리를 벗어나지 않고|깨어 있는 채) 현재 장면에 그대로 남아, 이어지는 상황에 반응했다\.\*\s*$/u.test(line)) {
+      removed += 1;
+      return false;
+    }
+    return true;
+  }).join("\n");
+  return { text, removed };
+}
+
+function removeSceneBeat(args: {
+  text: string;
+  index: number;
+  anonymousExit: boolean;
+}) {
+  const { text, index } = args;
+  let start = text.lastIndexOf("\n", index) + 1;
+  const lineEnd = text.indexOf("\n", index);
+  let end = lineEnd < 0 ? text.length : lineEnd;
+  let narration = false;
+  for (const match of text.matchAll(/\*([^*]+)\*/gu)) {
+    const innerStart = match.index + 1;
+    const innerEnd = innerStart + match[1].length;
+    if (index >= innerStart && index < innerEnd) {
+      start = innerStart;
+      end = innerEnd;
+      narration = true;
+      break;
+    }
+  }
+  const body = text.slice(start, end);
+  let offset = 0;
+  let found = false;
+  const kept = body.split(/(?<=[.!?。！？])\s+|\n+/u).filter((sentence) => {
+    const sentenceStart = body.indexOf(sentence, offset);
+    offset = sentenceStart + sentence.length;
+    if (index >= start + sentenceStart && index < start + offset) {
+      found = true;
+      return false;
+    }
+    // "Only X remained" in the same beat depends on the anonymous departure.
+    return !(
+      found && args.anonymousExit &&
+      /(?:오직|홀로|혼자)[^.!?。！？\n]*(?:남겨졌|남았|남게)/u.test(sentence)
+    );
+  });
+  if (!found) return text;
+  const bodyAfter = kept.join(" ").trim();
+  const replacement = narration && bodyAfter ? `*${bodyAfter}*` : bodyAfter;
+  return text.slice(0, narration ? start - 1 : start) +
+    replacement + text.slice(narration ? end + 1 : end);
+}
+
+/** Removes contradictory prose without inventing stock replacement narration. */
 export function removeScenePresenceContradictionPassages(args: {
   text: string;
   currentUserText?: string;
@@ -873,8 +940,10 @@ export function removeScenePresenceContradictionPassages(args: {
   excludedCharacters?: ScenePresenceFact[];
 }) {
   const originalText = String(args.text || "");
-  let text = originalText;
-  let removed = 0;
+  // Earlier turns may already contain the old template, which the model can echo.
+  const legacy = removeLegacySceneFiller(originalText);
+  let text = legacy.text;
+  let removed = legacy.removed;
   const characters = new Set<string>();
   const kinds = new Set<ScenePresenceContradiction["kind"]>();
 
@@ -920,25 +989,15 @@ export function removeScenePresenceContradictionPassages(args: {
         contradiction.kind === "unauthorized_exit" ||
         isRelationalAnonymousExit
       ) {
-        // Keep the one-shot provider output intact. A previous implementation
-        // deleted the offending paragraph (and, for named exits, sometimes the
-        // entire suffix), wasting already-generated tokens and turning a full
-        // answer into a few hundred characters. Replace only the contradictory
-        // local beat with a deterministic continuity-preserving beat; later
-        // prose and the status panel remain untouched.
-        const rosterNames = args.presentCharacters
-          .map((fact) => fact.characterName.trim())
-          .filter(Boolean);
-        const subject = isRelationalAnonymousExit
-          ? rosterNames.join(", ") || contradiction.characterName
-          : contradiction.characterName;
-        const replacement =
-          contradiction.kind === "unauthorized_incapacitation"
-            ? `*${subject} 역시 깨어 있는 채 현재 장면에 그대로 남아, 이어지는 상황에 반응했다.*`
-            : `*${subject} 역시 자리를 벗어나지 않고 현재 장면에 그대로 남아, 이어지는 상황에 반응했다.*`;
-        text = `${text.slice(0, paragraphStart).trimEnd()}\n\n${replacement}\n\n${text
-          .slice(paragraphEnd)
-          .trimStart()}`.trim();
+        // Preserve valid sentences, dialogue and status metadata around the
+        // invalid beat. Do not replace it with a repeated invented reaction.
+        const filtered = removeSceneBeat({
+          text,
+          index: contradiction.index,
+          anonymousExit: isRelationalAnonymousExit,
+        });
+        if (filtered === text) break;
+        text = filtered;
         removed += 1;
         characters.add(contradiction.characterName);
         kinds.add(contradiction.kind);
