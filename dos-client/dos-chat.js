@@ -3417,7 +3417,9 @@ async function postSend(text) {
       }
     : undefined;
   const modelName = String(runtime?.model || st?.model || "").trim();
-  const wantStream = isGemini3ProFamilyModel(modelName) || isDoneOnlyDosModel(modelName);
+  // NDJSON is also the progress channel for buffered models such as Flash.
+  // Keep their final-only output, while allowing the watchdog to receive pings.
+  const doneOnly = isDoneOnlyDosModel(modelName) || !isGemini3ProFamilyModel(modelName);
 
   console.log("");
   hr("응답");
@@ -3449,7 +3451,9 @@ async function postSend(text) {
         userText: text,
         runtime,
         includeSuggestions: false,
-        stream: wantStream,
+        stream: true,
+        progress: true,
+        responseMode: doneOnly ? "done-only" : "stream",
       }),
       // Ctrl+C 취소 지원 (stream 응답 도중에도 abort됨)
       signal: responseWatchdog.signal,
@@ -3474,7 +3478,7 @@ async function postSend(text) {
   let printed = "";
 
   const isNdjson = ct.includes("application/x-ndjson") && res.body && typeof res.body.getReader === "function";
-  if (isNdjson && isDoneOnlyDosModel(modelName)) {
+  if (isNdjson && doneOnly) {
     doneObj = await readDoneOnlyChatResponse(res, {
       onActivity: () => responseWatchdog.touch(),
       onEvent: (event) => {

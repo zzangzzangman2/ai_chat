@@ -292,25 +292,35 @@ export function extractScopedRoleAnchors(
   const names = uniqueKnownNames(knownNames);
   if (!names.length) return [] as ScopedRoleAnchor[];
   const personaName = validPersonaName(personaNameRaw);
+  // Per-call cache: keep every source message, but do not compile the same
+  // name/relation pair again for each historical turn.
+  const patterns = new Map<string, RegExp>();
+  const patternFor = (source: string) => {
+    let pattern = patterns.get(source);
+    if (!pattern) {
+      pattern = new RegExp(source, "u");
+      patterns.set(source, pattern);
+    }
+    return pattern;
+  };
 
   for (const message of userMessages(messages)) {
+    const mentionedNames = names.filter((name) => message.text.includes(name));
     if (personaName) {
       const personaRelation = /(?:우리|저희|내|제)\s*(?:(?:어린|사랑하는|유일한)\s*)?((?:첫째|둘째|셋째|막내)?\s*)(아빠|아버지|엄마|어머니|부모|할아버지|할머니|조부모|딸|아들|손녀|손자|손자녀|자녀|여동생|남동생|동생|언니|누나|오빠|형|자매|형제자매|형제)/gu;
       for (const match of message.text.matchAll(personaRelation)) {
         const ordinal = String(match[1] || "").replace(/\s+/g, "");
         const term = String(match[2] || "");
         let relatedName = "";
-        for (const candidate of names) {
+        for (const candidate of mentionedNames) {
           if (candidate === personaName) continue;
           const candidateEscaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
           const termEscaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          const fromRole = new RegExp(
+          const fromRole = patternFor(
             `(?:우리|저희|내|제)\\s*(?:(?:어린|사랑하는|유일한)\\s*)?(?:첫째|둘째|셋째|막내)?\\s*${termEscaped}(?:인|은|는|이|가|:)?\\s*${candidateEscaped}(?:은|는|이|가)?(?=\\s|[,.!?]|$)`,
-            "u"
           );
-          const fromName = new RegExp(
+          const fromName = patternFor(
             `${candidateEscaped}(?:은|는|이|가)\\s*(?:우리|저희|내|제)\\s*(?:(?:어린|사랑하는|유일한)\\s*)?(?:첫째|둘째|셋째|막내)?\\s*${termEscaped}`,
-            "u"
           );
           if (fromRole.test(message.text) || fromName.test(message.text)) {
             relatedName = candidate;
@@ -343,7 +353,7 @@ export function extractScopedRoleAnchors(
       }
     }
 
-    for (const name of names) {
+    for (const name of mentionedNames) {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const relationPatterns: Array<{ relation: FamilyRelation; pattern: string }> = [
         { relation: "아버지", pattern: "(?:아빠|아버지)" },
@@ -393,16 +403,15 @@ export function extractScopedRoleAnchors(
         { relation: "피해자", pattern: "피해자" },
       ];
       for (const entry of relationPatterns) {
+        if (!patternFor(entry.pattern).test(message.text)) continue;
         const namedByAssignment = message.text.match(
-          new RegExp(
+          patternFor(
             `${escaped}(?:이|의)\\s*${entry.pattern}\\s*(?:의\\s*)?이름(?:\\s*(?:은|이|:)\\s*|\\s+)((?:[가-힣]{2,8}?|[A-Za-z][A-Za-z0-9_-]{1,19}))(?=\\s*(?:이야|야|이다|입니다|이고|이며|인데|라는|라고|다|[,.!?]|$))`,
-            "u"
           )
         );
         const namedByInverse = message.text.match(
-          new RegExp(
+          patternFor(
             `(${KOREAN_OR_LATIN_NAME})(?:은|는|이|가)\\s*${escaped}(?:이|의)\\s*(?:(?:\\d{1,3}\\s*(?:세|살)|어린|친|막내|첫째|둘째|셋째)\\s*){0,4}${entry.pattern}`,
-            "u"
           )
         );
         let relatedName =
@@ -410,13 +419,12 @@ export function extractScopedRoleAnchors(
           validPersonaName(namedByInverse?.[1] || "");
 
         if (!relatedName) {
-          for (const candidate of names) {
+          for (const candidate of mentionedNames) {
             if (candidate === name) continue;
             const candidateEscaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             if (
-              new RegExp(
+              patternFor(
                 `${escaped}(?:이|의)\\s*${entry.pattern}\\s*(?:은|는|이|가|:)\\s*${candidateEscaped}(?=\\s|[,.!?]|$)`,
-                "u"
               ).test(message.text)
             ) {
               relatedName = candidate;

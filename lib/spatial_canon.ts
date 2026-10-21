@@ -214,6 +214,19 @@ export function buildSpatialCanon(params: {
   const personaName = cleanText(params.personaName, 80);
   const placementIdentities = [...identities];
   if (personaName) placementIdentities.push({ alias: "나", canonicalName: personaName });
+  const placementMentions = placementIdentities.map((identity) => ({
+    identity,
+    pattern: new RegExp(escapeRegex(identity.alias), "iu"),
+  }));
+  const pairPatterns = new Map<string, RegExp>();
+  const pairPattern = (source: string) => {
+    let pattern = pairPatterns.get(source);
+    if (!pattern) {
+      pattern = new RegExp(source, "iu");
+      pairPatterns.set(source, pattern);
+    }
+    return pattern;
+  };
   const residencesBySubject = new Map<string, SpatialResidenceFact>();
   const anchorsBySlot = new Map<string, RelativeResidenceAnchor>();
   const placementsBySubject = new Map<string, TemporarySpatialPlacement>();
@@ -242,18 +255,21 @@ export function buildSpatialCanon(params: {
         };
       }
 
-      for (const left of placementIdentities) {
-        for (const right of placementIdentities) {
+      // Both literal names are required by either assignment pattern. Searching
+      // only present names avoids a roster-squared scan for every old clause.
+      const mentionedPlacements = placementMentions
+        .filter(({ pattern }) => pattern.test(clause))
+        .map(({ identity }) => identity);
+      for (const left of mentionedPlacements) {
+        for (const right of mentionedPlacements) {
           if (left.canonicalName === right.canonicalName) continue;
           const leftName = escapeRegex(left.alias);
           const rightName = escapeRegex(right.alias);
-          const subjectThenCompanion = new RegExp(
+          const subjectThenCompanion = pairPattern(
             `${leftName}${SUBJECT_PARTICLE_PATTERN}\\s*.{0,36}?${rightName}${PAIR_CONNECTOR_PATTERN}\\s*.{0,24}?${TOGETHER_PATTERN}`,
-            "iu"
           );
-          const joinedSubjects = new RegExp(
+          const joinedSubjects = pairPattern(
             `${leftName}${PAIR_CONNECTOR_PATTERN}\\s*${rightName}${SUBJECT_PARTICLE_PATTERN}\\s*.{0,40}?(?:${TOGETHER_PATTERN}|(?:안방|거실|창고|주방|침실|서재|다락방)\\s*(?:쓰|사용|자))`,
-            "iu"
           );
           const subjectMatch = clause.match(subjectThenCompanion);
           const joinedMatch = subjectMatch ? null : clause.match(joinedSubjects);

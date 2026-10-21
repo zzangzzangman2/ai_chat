@@ -168,6 +168,7 @@ import {
   selectHybridMemory,
 } from "./_server/memorySelection";
 import { buildCumulativeMemoryPrompt } from "./_server/cumulativeMemory";
+import { createProgressResponse } from "./_server/progressResponse";
 import { buildContinuityLedgerBlock } from "./_server/continuityState";
 import { buildMemoryRecallQuery, buildRecallEvidence, selectRecallSummary } from "./_server/memoryRecall";
 import {
@@ -1065,6 +1066,20 @@ async function buildPromptBreakdownWeights(params: {
 }
 
 export async function POST(req: Request) {
+  try {
+    const user = await getSessionUser();
+    if (!user) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    const body = await req.json();
+    if (body?.progress === true && body?.stream && !body?.continueFromAssistantId) {
+      return createProgressResponse(req.signal, (signal) => sendChat(req, user, body, signal));
+    }
+    return sendChat(req, user, body, req.signal);
+  } catch {
+    return NextResponse.json({ error: "요청을 읽지 못했습니다." }, { status: 500 });
+  }
+}
+
+async function sendChat(req: Request, u: NonNullable<Awaited<ReturnType<typeof getSessionUser>>>, body: any, requestSignal: AbortSignal) {
   const _reqId = `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
   const _url = new URL(req.url);
   console.log(`[chat/send][${_reqId}] -> ${req.method} ${_url.pathname}${_url.search}`);
@@ -1094,13 +1109,11 @@ export async function POST(req: Request) {
     }
   };
   try {
-    const u = await getSessionUser();
-  if (!u) return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+    requestSignal.throwIfAborted();
     const isConfiguredAdmin = isAdminEmail(u.email);
     const roleRow = isConfiguredAdmin ? null : (db.prepare(`SELECT role FROM users WHERE email=?`).get(u.email) as any);
     const canViewDeveloper = isConfiguredAdmin || String(roleRow?.role || "").toLowerCase() === "admin";
 
-	  const body = await req.json();
 	  const wantStreamRaw = Boolean((body as any)?.stream);
 	  // Respect client streaming flag. (Some models may be force-buffered later.)
 	  let wantStream = wantStreamRaw;
@@ -1386,13 +1399,13 @@ export async function POST(req: Request) {
     const abortGeneration = () => {
       if (generationAbortController.signal.aborted) return;
       try {
-        generationAbortController.abort(req.signal.reason);
+        generationAbortController.abort(requestSignal.reason);
       } catch {
         generationAbortController.abort();
       }
     };
-    if (req.signal.aborted) abortGeneration();
-    else req.signal.addEventListener("abort", abortGeneration, { once: true });
+    if (requestSignal.aborted) abortGeneration();
+    else requestSignal.addEventListener("abort", abortGeneration, { once: true });
 
     const opts = {
       model: chosenModel,
@@ -2072,12 +2085,14 @@ ${body}`.trim();
       focusNames: [personaNameFinal],
       authoritativeLifeStates: durableCharacterCanon.lifeStates,
     });
+    const tIdentityCanon = tStart("장기기억.인물관계");
     const identityCanon = buildIdentityCanonBlock({
       messages: all,
       knownNames: continuityIdentities.map((identity) => identity.name),
       personaName: personaNameFinal,
       characterSources: continuityIdentities,
     });
+    tEnd(tIdentityCanon);
     // Scene membership is persistent state. Earlier versions tried to retire
     // frequently mentioned NPCs automatically; that directly conflicted with
     // recent user-authored locations and caused arbitrary exits or incapacitation.
@@ -2251,6 +2266,7 @@ ${body}`.trim();
         }).text,
       };
     }
+    const tSpatialCanon = tStart("장기기억.위치");
     const spatialCanon = buildSpatialCanon({
       messages: all,
       knownNames: continuityIdentities.map((identity) => identity.name),
@@ -2326,6 +2342,7 @@ ${body}`.trim();
     //   (실제 사고: 사용자가 새 인물을 이름 없이 도입하자 최근 캐릭터로 오인)
     // - 관계도는 전체를 넣어도 1천자 내외라 비용이 미미하고, 관계 혼동을 크게 줄인다.
     // - 롤백: AI_ALWAYS_INJECT_ROSTER=0 이면 기존처럼 fallback 전용으로 동작.
+    tEnd(tSpatialCanon);
     const alwaysInjectRoster = String(process.env.AI_ALWAYS_INJECT_ROSTER || "1").trim() !== "0";
     let manualCharacterRosterFallback = "";
     if (alwaysInjectRoster || !dynamicCharacterContext.block) {
@@ -4232,7 +4249,7 @@ let cancelStreamWork: (() => void) | null = null;
 
           // Gemini 3.1 Pro는 항상 비스트리밍 generateText 경로를 사용한다.
           // 전송 연결은 ping을 보낼 수 있지만 생성 본문은 완료 후 한 번만 전달된다.
-          const PRO_DONE_ONLY = isGemini31Pro || isGemini4ArgonModel(modelName);
+          const PRO_DONE_ONLY = isGemini31Pro || isGemini4ArgonModel(modelName) || body?.responseMode === "done-only";
 
           // (2026-08-16) 거부 응답 자동 리롤 회차. 아래 생성 호출들이 이 값을 읽어
           // 리롤마다 샘플링을 넓힌다(같은 temperature로 다시 굴리면 같은 거부가 재현된다).

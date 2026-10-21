@@ -258,7 +258,8 @@ test("done-only output reports an incomplete connection or server error instead 
   ])), /test upstream error/);
 });
 
-test("postSend prints the canonical done body once through the real DOS output path", async () => {
+for (const model of ["gemini-3.1-pro-preview", "gemini-4-argon", "gemini-3.8-flash"]) {
+test(`postSend receives progress and prints the canonical done body once: ${model}`, async () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const vm = require("node:vm");
@@ -279,6 +280,8 @@ test("postSend prints the canonical done body once through the real DOS output p
     fetch: async (_url, options) => {
       calls += 1;
       assert.equal(JSON.parse(options.body).stream, true); // 진행 알림 연결 유지
+      assert.equal(JSON.parse(options.body).progress, true);
+      assert.equal(JSON.parse(options.body).responseMode, "done-only");
       return ndjsonResponse([
         { type: "ping" },
         { type: "delta", text: "*수정 전 초안이다.\n\n*다음 지문이다.*\n" },
@@ -290,7 +293,7 @@ test("postSend prints the canonical done body once through the real DOS output p
   // API/설정/유지보수만 격리한다. postSend와 화면 출력 함수는 실제 코드를 실행한다.
   vm.runInNewContext(source + `
     state.chatId = "test-chat";
-    loadSettings = async () => ({ model: "gemini-3.1-pro-preview" });
+    loadSettings = async () => ({ model: ${JSON.stringify(model)} });
     pauseBackgroundMaintenance = () => {};
     resumeBackgroundMaintenance = () => {};
     queueBackgroundMaintenance = () => {};
@@ -304,6 +307,7 @@ test("postSend prints the canonical done body once through the real DOS output p
   assert.equal(output.includes("수정 전 초안"), false);
   assert.equal(output.includes(ANSI_SOFT), false);
 });
+}
 
 test("background maintenance prioritizes memory and newest character work", () => {
   const characterJobs = new Map([
