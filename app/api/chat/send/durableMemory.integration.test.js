@@ -17,6 +17,8 @@ const durable=load(path.join(root,'lib/durable_character_state.ts'));
 const vital=load(path.join(root,'lib/vital_status_consistency_guard.ts'));
 const continuity=load(path.join(root,'app/api/chat/send/_server/continuityState.ts'));
 const conditions=load(path.join(root,'lib/persistent_character_conditions.ts'));
+const {buildCumulativeMemoryPrompt}=load(path.join(root,'app/api/chat/send/_server/cumulativeMemory.ts'));
+const {sanitizePromptForModel}=load(path.join(root,'app/api/chat/send/_server/textPolicy.ts'));
 const {withAssistantTurnNumbers}=load(path.join(root,'app/api/chat/send/_server/turnRange.ts'));
 // Exercise the actual send route's closure without starting a server or using DB/API.
 const route=fs.readFileSync(path.join(root,'app/api/chat/send/route.ts'),'utf8');
@@ -27,7 +29,7 @@ const promptInitializers=new Map();
 function visit(node){
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='sanitizeVitalStatus')initializer=node.initializer.getText(ast);
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='memoryRepairPending')repairInitializer=node.initializer.getText(ast);
-  if(ts.isVariableDeclaration(node)&&['system','systemForContinuationRaw','systemForStatus'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
+  if(ts.isVariableDeclaration(node)&&['cumulativeMemory','historySummaryForPromptRaw','memoryBlock','systemRaw','systemWithIdentityCanon','system','systemForContinuationRaw','systemForStatus'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
   ts.forEachChild(node,visit);
 }
 visit(ast);
@@ -128,6 +130,37 @@ test('normal, continuation and status prompts retain original pregnancy evidence
       });
       assert.match(prompt,/이서윤.*임신 확정.*3턴/u);
       assert.match(prompt,/NPC가 알고 있다는 뜻이 아니다/u);
+    }
+  }
+});
+
+test('all model prompt paths contain the whole cumulative story plus source-backed state and raw details',()=>{
+  const sections=Array.from({length:167},(_,i)=>`### 기록 ${i+1} (${i*3+1}-${i*3+3}턴)\n이서윤은 기록번호 ${i+1000}의 편지를 보관했다.`);
+  const historySummary=sections.join('\n\n');
+  const cumulativeMemory=evaluatePrompt('cumulativeMemory',{
+    buildCumulativeMemoryPrompt,historySummary,hybridMemory:{currentArcText:sections[166]},
+    relatedArchiveText:'',recallSummaryText:'',recallEvidence:{block:'[원문 u3] 편지는 북쪽 공방에 보관했다.'},
+  });
+  const historySummaryForPrompt=evaluatePrompt('historySummaryForPromptRaw',{cumulativeMemory});
+  assert.ok(historySummaryForPrompt.includes(historySummary));
+  const memoryBlock=evaluatePrompt('memoryBlock',{historySummaryForPrompt,keepUserTurns:7});
+  const {conditionCanon}=setup(timeline('*이서윤 임신함*'));
+  const persistentCharacterConditionsBlock=conditions.buildPersistentCharacterConditionsBlock(conditionCanon);
+  const fixtures={memoryBlock,persistentCharacterConditionsBlock,sanitizePromptCached:sanitizePromptForModel,dynamicCharacterContext:{block:''}};
+  for(const cacheFriendlyLayout of [true,false]){
+    const systemBase=evaluatePrompt('systemRaw',{...fixtures,cacheFriendlyLayout});
+    const systemWithIdentityCanon=evaluatePrompt('systemWithIdentityCanon',{...fixtures,systemBase});
+    const system=evaluatePrompt('system',{...fixtures,systemWithIdentityCanon});
+    const prompts=[system];
+    for(const lightweight of [true,false]){
+      for(const name of ['systemForContinuationRaw','systemForStatus']){
+        prompts.push(evaluatePrompt(name,{...fixtures,system,isGemini3ProFamilyModel:()=>lightweight}));
+      }
+    }
+    for(const prompt of prompts){
+      for(let i=0;i<167;i++) assert.ok(prompt.includes(`기록번호 ${i+1000}의 편지`));
+      assert.match(prompt,/이서윤.*임신 확정.*3턴/u);
+      assert.match(prompt,/원문 u3.*북쪽 공방/u);
     }
   }
 });

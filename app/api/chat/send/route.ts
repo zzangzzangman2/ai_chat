@@ -166,8 +166,8 @@ import {
   memorySearchTokens,
   rankMemoryRetrievalCandidates,
   selectHybridMemory,
-  selectBroadHistoryMemory,
 } from "./_server/memorySelection";
+import { buildCumulativeMemoryPrompt } from "./_server/cumulativeMemory";
 import { buildContinuityLedgerBlock } from "./_server/continuityState";
 import { buildMemoryRecallQuery, buildRecallEvidence, selectRecallSummary } from "./_server/memoryRecall";
 import {
@@ -2588,45 +2588,25 @@ ${body}`.trim();
           excludedSceneNames.has(name.trim().toLocaleLowerCase("ko-KR"))
         )
     );
-    // 장기기억 전문은 저장/검색 가능 상태로 유지하되, 매 턴 전부 넣지는 않는다.
-    // - 기존: 검색으로 최근 15턴(3200자) + 관련 과거 6섹션(2400자)만 주입 → 나머지 아카이브는 버려짐.
-    //   키워드 substring 매칭이라 다른 표현으로 물으면 회수 실패, 검색 실패 시 폴백도 '최신 2섹션'이라
-    //   초반 기억이 구조적으로 소환되지 않았다.
-    // - 기본(auto): 현재 장면 + 검색된 관련 과거만 넣어 오래된 오기와 현재 대상을 섞지 않는다.
-    // - 사용자가 전체 회고를 명시적으로 요청하면 그 턴에는 전문을 넣는다.
-    // - 상한(AI_FULL_LONG_MEMORY_MAX_CHARS, 기본 64000자 ≈ 4만 토큰) 초과 시에만
-    //   초기·최신·중간 범위를 나누어 보존하고, 생략 구간을 알린다.
-    // - AI_FULL_LONG_MEMORY=1/0으로 전문/검색 모드를 명시 고정할 수 있다.
-    const fullLongMemoryMode = String(process.env.AI_FULL_LONG_MEMORY ?? "auto").trim().toLowerCase();
-    const broadHistoryRequested = /(?:처음부터|지금까지|전\s*과정|일대기|전체\s*(?:대화|기억|내용|요약)|모든\s*(?:일|기억|대화|사건)|전부)/u.test(
-      userText
-    );
-    const fullLongMemoryEnabled =
-      ["1", "true", "on"].includes(fullLongMemoryMode) ||
-      (fullLongMemoryMode === "auto" && broadHistoryRequested);
-    const fullLongMemoryMaxChars = (() => {
-      const raw = Number(process.env.AI_FULL_LONG_MEMORY_MAX_CHARS ?? 64000);
-      if (!Number.isFinite(raw) || raw <= 0) return 64000;
-      return Math.max(4000, Math.floor(raw));
-    })();
-    const fullLongMemoryText = fullLongMemoryEnabled
-      ? selectBroadHistoryMemory(String(historySummary || "").trim(), fullLongMemoryMaxChars)
-      : "";
+    // The saved cumulative summary is already compressed from raw dialogue.
+    // Always include it; neither a missing recall phrase nor the old optional
+    // full-history settings may turn the baseline into a ranked subset.
+    // Source-backed canon remains separate, and retrieval adds detailed evidence.
     const recallSummaryText = selectRecallSummary(historySummary, memoryRecall);
     const recallEvidence = buildRecallEvidence({
       query: memoryRecall,
       messages: all,
       recentMessageIds: tail.map((message: any) => String(message.id || "")),
     });
-    const historySummaryForPromptRaw = [
-      fullLongMemoryText
-        ? [fullLongMemoryText, relatedArchiveText].filter(Boolean).join("\n\n")
-        : recallSummaryText || [hybridMemory.currentArcText, relatedArchiveText].filter(Boolean).join("\n\n"),
-      manualCharacterRosterFallback,
-      recallEvidence.block,
-    ]
-      .filter((x) => String(x || "").trim())
-      .join("\n\n");
+    const cumulativeMemory = buildCumulativeMemoryPrompt({
+      historySummary,
+      currentArcText: hybridMemory.currentArcText,
+      relatedArchiveText,
+      recallSummaryText,
+      rosterText: manualCharacterRosterFallback,
+      rawEvidenceText: recallEvidence.block,
+    });
+    const historySummaryForPromptRaw = cumulativeMemory.text;
     const historyEpistemicView = sanitizeSharedEpistemicText(
       historySummaryForPromptRaw,
       epistemicFirewall
@@ -2652,6 +2632,11 @@ ${body}`.trim();
     );
     const historyAddressDirectionView = sanitizeAddressDirections(historyCommunicationView.text);
     const historySummaryForPrompt = historyAddressDirectionView.text;
+    const deliveredMemoryRangeKeys = new Set(extractSummarySections(historySummaryForPrompt)
+      .map(({ startTurn, endTurn }) => `${startTurn}:${endTurn}`));
+    const filteredCumulativeMemoryRanges = cumulativeMemory.ranges.filter(
+      ({ startTurn, endTurn }) => !deliveredMemoryRangeKeys.has(`${startTurn}:${endTurn}`)
+    );
     dbg({
       tag: "send.memory.blocks",
       chatId: cid,
@@ -2710,14 +2695,13 @@ ${body}`.trim();
         evidence: item.evidence,
       })),
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
-      // (2026-08) 전체 주입 모드 진단
-      fullLongMemory: fullLongMemoryEnabled,
-      fullLongMemoryMode,
-      broadHistoryRequested,
-      fullLongMemoryChars: strlen(fullLongMemoryText),
-      fullLongMemoryTruncated: fullLongMemoryEnabled
-        ? strlen(String(historySummary || "").trim()) > strlen(fullLongMemoryText)
-        : false,
+      fullLongMemory: true,
+      fullLongMemoryMode: "cumulative",
+      fullLongMemoryChars: cumulativeMemory.summaryChars,
+      fullLongMemoryTruncated: false,
+      cumulativeMemoryRanges: cumulativeMemory.ranges,
+      cumulativeMemorySupplementChars: cumulativeMemory.supplementChars,
+      cumulativeMemoryFilteredRanges: filteredCumulativeMemoryRanges,
       alwaysInjectRoster,
       identityCanonChars: strlen(identityCanonBlock),
       canonicalCharacterFactChars: strlen(canonicalCharacterFactsBlock),
@@ -2744,21 +2728,18 @@ ${body}`.trim();
       relationshipClaimSummaryRewritten: historyRelationshipClaimView.rewritten,
     });
     const memoryBlock = [
-      fullLongMemoryText
-        ? `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 전체 요약 아카이브)`
-        : `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
-      fullLongMemoryText
-        ? `- 아래 요약 아카이브는 처음부터 최근까지 범위별로 보존한다. 생략 표시가 있으면 그 구간은 확인하지 못한 것이며 사건이 없었다고 단정하지 않는다.`
-        : `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
-      fullLongMemoryText
-        ? `- 사용자가 과거 사건/인물/약속을 물으면 이 아카이브에서 근거를 찾아 답하고, 근거가 없으면 지어내지 말고 모른다고 처리한다.`
-        : `- 과거 사건은 현재 입력과 관련된 구간만 복원하며, 검색 결과가 없으면 직전 과거 구간을 연속성 보호용으로 포함한다.`,
+      `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 전체 누적 요약 + 관련 원문 근거)`,
+      `- 전체 누적 요약은 검색 성공 여부와 무관하게 매번 참고한다. 처음·중간·최근의 사건 흐름을 함께 유지한다.`,
+      `- 사용자가 과거 사건/인물/약속을 물으면 누적 요약과 원문 근거를 확인한다. 관련 검색 결과만 보고 다른 과거 사건을 없던 일로 단정하지 않는다.`,
       `- 구간 정보가 충돌하면 명시적인 정정·상태 변화의 근거와 턴 순서를 확인한다. 뒤늦은 질문이나 근거 없는 부정만으로 이전에 확인된 사건을 지우지 않는다.`,
       `- 요약·관계표·검색 결과의 누락은 사건이 없었다는 증거가 아니다. 근거가 충분하지 않으면 발생 여부를 미확인으로 남기며, 단정적인 부정이나 긍정으로 메우지 않는다.`,
       `- 과거 원문 근거는 출처·참여자·당시 시점과 함께 확인한다. 미완료·가정·주장·사건 발생을 구분하고, 상세 묘사가 생략되어도 확인된 사실의 발생 여부를 반대로 바꾸지 않는다.`,
       `- 인물 연속성 장부가 있으면 과거 캐릭터 기록과 최신 일반 장면 지시보다 우선한다.`,
       `- 별도의 인물 정체성·가족관계 정사 블록이 있으면 이 통합 장기기억보다 우선한다.`,
       `- 별도의 공간 정본 블록이 있으면 집·거주지·아랫집·윗집 판단은 그 블록을 우선한다.`,
+      filteredCumulativeMemoryRanges.length
+        ? `- 지식 범위·근거 검증으로 공유 요약에서 제외된 구간: ${filteredCumulativeMemoryRanges.map(({ startTurn, endTurn }) => `${startTurn}-${endTurn}턴`).join(", ")}. 이 구간의 사건이 없었다는 뜻이 아니며, 인물별 지식과 별도의 원문 확정 상태를 따른다.`
+        : "",
       historySummaryForPrompt || "(없음)",
     ].join("\n");
     tEnd(tLongMemoryBlock);
@@ -3219,7 +3200,7 @@ const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
 
 // (2026-07) 캐시 친화 배치: Vertex implicit cache는 "앞에서부터 바이트 동일한 프리픽스"만
 // 적중하므로, 고정 블록(작품설정/페르소나/유저노트/관계규칙)을 앞에, 매턴 변동 블록
-// (로어=키워드 매칭, 장기기억=FTS 검색+N턴 요약)을 뒤에 배치한다. (블록 내용은 동일, 순서만 변경)
+// (로어=키워드 매칭, 장기기억=전체 누적 요약+관련 근거)을 뒤에 배치한다. (블록 내용은 동일, 순서만 변경)
 // - 카드/프로필/작품설정을 수정하면 바이트가 달라져 자동으로 캐시 미스→재캐싱된다(퍼지 불필요).
 // - formatGuide는 아래의 모든 동적 우선순위 블록 뒤에 붙여 실제 systemInstruction의 맨 끝을 유지한다.
 // - 롤백: AI_CACHE_FRIENDLY_PROMPT=0 → 기존 순서(장기기억이 중간).
@@ -3459,8 +3440,8 @@ const systemRaw = (cacheFriendlyLayout
 	
 	    // 이어쓰기/보강용 시스템 프롬프트
 	    // - 이어쓰기에서는 "상태창/메타"를 다시 출력하지 않도록 금지한다(상태창은 첫 호출의 맨 끝 1회만).
-	    // - Gemini 3 Pro는 프롬프트가 길수록(특히 memory/lore) 지연이 커져, 이어쓰기에서만 경량 시스템을 사용한다.
-	    //   (직전 출력 tail을 user 메시지로 제공하므로, 이어쓰기에는 format+persona 중심으로 충분)
+	    // - 이어쓰기에서도 누적 요약과 원문 확정 상태를 유지한다. 직전 출력 tail만
+	    //   제공하면 본문 생성 이후 다시 과거 사건을 잃을 수 있다.
 	    const systemForContinuationRaw = (isGemini3ProFamilyModel(String((opts as any)?.model || (settings as any)?.model || "")))
 	      ? [
 	          `너는 아래 설정을 따르며, 현재 장면의 상대방 캐릭터들과 NPC들을 각각 독립된 인물로 반응시킨다.`,
@@ -3468,6 +3449,8 @@ const systemRaw = (cacheFriendlyLayout
 	          sanitizePromptCached(personaBlock),
 	          ``,
 	          sanitizePromptCached(noteBlock),
+	          ``,
+	          sanitizePromptCached(memoryBlock),
 	          ``,
 	          sanitizePromptCached(relationshipConsistencyBlock),
 	          addressDirectionPriorityBlock ? `` : "",
@@ -3527,6 +3510,8 @@ const systemRaw = (cacheFriendlyLayout
 	          sanitizePromptCached(personaBlock),
 	          ``,
 	          sanitizePromptCached(noteBlock),
+	          ``,
+	          sanitizePromptCached(memoryBlock),
 	          ``,
 	          continuityPriorityBlock,
 	          continuityPriorityBlock ? `` : "",
