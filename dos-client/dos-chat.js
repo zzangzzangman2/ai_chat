@@ -2478,12 +2478,14 @@ async function goBackToPreviousPage(rl) {
 async function selectInitialChat() {
   if (state.chatId) {
     await loadSettings().catch(() => null);
+    restorePendingMemoryRefresh();
     return;
   }
   const chats = listChats(1);
   if (chats[0]) {
     state.chatId = chats[0].id;
     await loadSettings().catch(() => null);
+    restorePendingMemoryRefresh();
   }
 }
 
@@ -2573,6 +2575,7 @@ async function openChat(indexOrId) {
 
   state.chatId = chatId;
   await loadSettings().catch(() => null);
+  restorePendingMemoryRefresh();
   console.log(`채팅을 열었습니다: ${state.chatId}`);
   // (수정) 이전 12개만 보여줘서 "방금 한 메시지가 안 보인다"는 혼란이 있었음 → 40개로 늘림.
   // 더 보고 싶으면 /history 200 까지 확장 가능.
@@ -3128,7 +3131,12 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   if (response && response.ok) {
     if (kind === "memory") {
       const payload = await response.json().catch(() => null);
-      if (payload && payload.skipped && payload.morePending) {
+      // A 200 with a truncated/invalid body is not proof that durable work finished.
+      if (!payload || payload.ok !== true || payload.retryNeeded) {
+        job.attempts = Number(job.attempts || 0) + 1;
+        return "retry";
+      }
+      if (payload.skipped && payload.morePending) {
         job.attempts = Number(job.attempts || 0) + 1;
         return "retry";
       }
@@ -3207,6 +3215,41 @@ async function drainBackgroundMaintenance(generation) {
     if (!state.maintenancePaused) {
       scheduleBackgroundMaintenance(retryNeeded ? 30_000 : MAINTENANCE_IDLE_DELAY_MS);
     }
+  }
+}
+
+function restorePendingMemoryRefresh(chatId = state.chatId) {
+  const normalizedChatId = String(chatId || "").trim();
+  if (!normalizedChatId) return false;
+  try {
+    const messages = dbAll(
+      `SELECT role FROM messages WHERE chatId=? ORDER BY createdAt ASC, id ASC`, [normalizedChatId]
+    );
+    const firstUser = messages.findIndex(message => message.role === "user");
+    if (firstUser < 0) return false;
+    const completed = messages.slice(firstUser).filter(message =>
+      message.role === "assistant" || message.role === "model"
+    ).length;
+    const boundary = Math.floor(completed / 3) * 3;
+    if (!boundary) return false;
+    const cache = dbGet(`SELECT summarizedEndTurn FROM chat_memory_cache WHERE chatId=?`, [normalizedChatId]);
+    const blocks = dbAll(
+      `SELECT meta FROM chat_memory_blocks WHERE chatId=? AND endTurn<=?`, [normalizedChatId, boundary]
+    );
+    const needsRepair = blocks.some(row => {
+      try {
+        const meta = JSON.parse(String(row.meta || "{}"));
+        return meta && (meta.summaryRepairPending === true || meta.structuredGraphPending ||
+          (meta.deterministicFallbackUsed === true && meta.summaryRepairPending !== false));
+      } catch { return false; }
+    });
+    if (Number(cache?.summarizedEndTurn || 0) >= boundary && !needsRepair) return false;
+    queueBackgroundMaintenance({ chatId: normalizedChatId, memoryRefresh: { shouldRefresh: true, mode: "all" } });
+    return true;
+  } catch {
+    // Reading a legacy schema must not prevent opening the chat. The next
+    // completed response can still enqueue its normal maintenance request.
+    return false;
   }
 }
 

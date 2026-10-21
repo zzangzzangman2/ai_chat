@@ -38,6 +38,14 @@ export type ContinuityState = {
   lastConfirmedTurn?: number;
 };
 
+// Original-message state overrides lossy or contradictory summary claims.
+export type AuthoritativeLifeState = {
+  name: string;
+  kind: "deceased" | "alive";
+  turnNo: number;
+  evidence: string;
+};
+
 type StateMatch = { kind: ContinuityStateKind; index: number; priority: number };
 
 const STATE_LABEL: Record<ContinuityStateKind, string> = {
@@ -746,6 +754,7 @@ export function deriveContinuityStates(params: {
   historySummary: string;
   identities: ContinuityIdentity[];
   userText?: string;
+  authoritativeLifeStates?: AuthoritativeLifeState[];
 }) {
   const states: ContinuityState[] = [];
   const historySummary = String(params.historySummary || "");
@@ -755,12 +764,23 @@ export function deriveContinuityStates(params: {
   );
   for (const identity of params.identities) {
     if (!String(identity?.name || "").trim()) continue;
-    const terminalState = latestStateForIdentity(
-      historySummary,
-      identity,
-      parsedSections
+    const authoritative = params.authoritativeLifeStates?.find(
+      (state) => state.name.trim().normalize("NFKC").toLocaleLowerCase("ko-KR")
+        === identity.name.trim().normalize("NFKC").toLocaleLowerCase("ko-KR")
     );
-    const retconned = hasExplicitSurvivalRetcon(userText, identity);
+    const terminalState: ContinuityState | null = authoritative
+      ? {
+          name: identity.name,
+          kind: authoritative.kind,
+          startTurn: authoritative.turnNo,
+          endTurn: authoritative.turnNo,
+          title: "원문 확정 사건",
+          detail: authoritative.evidence,
+        }
+      : latestStateForIdentity(historySummary, identity, parsedSections);
+    const retconned = authoritative
+      ? authoritative.kind === "alive"
+      : hasExplicitSurvivalRetcon(userText, identity);
     if (terminalState && terminalState.kind !== "alive" && !retconned) states.push(terminalState);
 
     const persistent = persistentStatesForIdentity(
@@ -770,6 +790,7 @@ export function deriveContinuityStates(params: {
       parsedSections
     );
     for (const state of persistent) {
+      if (authoritative?.kind === "deceased") continue;
       // A later unresolved death/missing state makes an earlier duty or location
       // impossible; an explicit survival correction restores normal processing.
       if (
@@ -812,6 +833,7 @@ export function buildContinuityLedgerBlock(params: {
   identities: ContinuityIdentity[];
   userText?: string;
   focusNames?: string[];
+  authoritativeLifeStates?: AuthoritativeLifeState[];
 }) {
   const states = deriveContinuityStates(params);
   if (!states.length) {

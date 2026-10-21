@@ -6,9 +6,10 @@ const RECALL = /(?:기억|회상|회고|예전|이전에|지난번|아까|그때
 const FOLLOW_UP = /^(?:그리고|그게|그거|그것|그건|그때|또|더는|그뿐|그\s*외|아니|맞아|맞지)|(?:했지|했잖|했거든|했거덩|없었|끝이야|뿐이야)/u;
 const TOPIC_CHANGE = /(?:장면\s*(?:전환|바꿔)|다음\s*날|다른\s*(?:이야기|얘기|주제)|이제\s*(?:그만|다른))/u;
 const PAST_CONFIRMATION = /했(?:었)?(?:지|찌|징|죠|쥐|쥬|잖|거든|거덩|냐|니|나요)/u;
+const BROAD_RECALL = /(?:전체\s*(?:대화|기억|내용|요약)|모든\s*(?:일|기억|대화|사건)|(?:처음부터|지금까지|전\s*과정|일대기)[\s\S]*(?:정리|요약|회고|회상|복기|기억|알려))/u;
 
 function isRecall(text: string) {
-  return RECALL.test(text) || PAST_CONFIRMATION.test(text);
+  return RECALL.test(text) || PAST_CONFIRMATION.test(text) || BROAD_RECALL.test(text);
 }
 
 function isFollowUp(text: string) {
@@ -74,6 +75,7 @@ export function selectRecallSummary(historySummary: string, query: MemoryRecallQ
   const ranked = rankMemoryRetrievalCandidates({
     candidates,
     primaryQueryText: query.searchText,
+    focusNames: query.names,
     maxItems: 24,
     maxChars,
   });
@@ -97,9 +99,38 @@ function storyText(text: string) {
   return String(text || "").replace(/```[\s\S]*?(?:```|$)/gu, " ").trim();
 }
 
+function relevantWindow(text: string, tokens: string[], maxChars: number) {
+  if (text.length <= maxChars) return text;
+  const before = "[…앞부분 생략…]";
+  const after = "[…뒷부분 생략…]";
+  const size = Math.max(1, maxChars - before.length - after.length);
+  const lower = text.toLowerCase();
+  const starts = new Set([0, Math.max(0, text.length - size)]);
+  // Include both ends of each matching term. A common name at the beginning
+  // must not hide the specific event at the end of a long single paragraph.
+  for (const token of tokens) {
+    for (const index of [lower.indexOf(token), lower.lastIndexOf(token)]) {
+      if (index >= 0) starts.add(Math.max(0, Math.min(text.length - size, index - Math.floor(size / 3))));
+    }
+  }
+  let bestStart = 0;
+  let bestScore = -1;
+  for (const start of starts) {
+    const window = lower.slice(start, start + size);
+    const score = tokens.reduce((sum, token) => sum + Number(window.includes(token)), 0);
+    if (score > bestScore) { bestScore = score; bestStart = start; }
+  }
+  const end = Math.min(text.length, bestStart + size);
+  return `${bestStart > 0 ? before : ""}${text.slice(bestStart, end)}${end < text.length ? after : ""}`;
+}
+
 function excerpt(text: string, tokens: string[], maxChars: number) {
   if (text.length <= maxChars) return { text, excerpted: false };
+  const separator = "\n[…중간 생략…]\n";
   const paragraphs = text.split(/\n\s*\n/u).map((part, index) => ({
+    part: relevantWindow(part, tokens, maxChars),
+    index,
+  })).map(({ part, index }) => ({
     part,
     index,
     score: tokens.reduce((sum, token) => sum + Number(part.toLowerCase().includes(token)), 0),
@@ -107,16 +138,16 @@ function excerpt(text: string, tokens: string[], maxChars: number) {
   const selected: typeof paragraphs = [];
   let used = 0;
   for (const paragraph of [...paragraphs].sort((a, b) => b.score - a.score || a.index - b.index)) {
-    if (used + paragraph.part.length + 2 > maxChars) continue;
+    const extra = paragraph.part.length + (selected.length ? separator.length : 0);
+    if (used + extra > maxChars) continue;
     selected.push(paragraph);
-    used += paragraph.part.length + 2;
+    used += extra;
   }
-  // An oversized single paragraph is explicitly marked as an excerpt. The
-  // marker prevents an omitted ending from becoming evidence of non-occurrence.
+  // Excerpts retain the matching evidence and mark omitted context explicitly.
   return {
     text: selected.length
-      ? selected.sort((a, b) => a.index - b.index).map((p) => p.part).join("\n[…중간 생략…]\n")
-      : `${text.slice(0, Math.max(0, maxChars - 12))}[…이후 생략…]`,
+      ? selected.sort((a, b) => a.index - b.index).map((p) => p.part).join(separator)
+      : relevantWindow(text, tokens, maxChars),
     excerpted: true,
   };
 }
@@ -153,6 +184,7 @@ export function buildRecallEvidence(params: {
   const ranked = rankMemoryRetrievalCandidates({
     candidates,
     primaryQueryText: params.query.searchText,
+    focusNames: params.query.names,
     maxItems: 18,
     maxChars: 1000000,
   }).sort((a, b) => Number(b.explicitMatch) - Number(a.explicitMatch) || b.primaryMatches - a.primaryMatches || b.score - a.score);

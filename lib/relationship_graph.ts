@@ -176,6 +176,7 @@ export function narrativeRelationshipLabel(params: {
   memoryCount?: unknown;
   reason?: unknown;
   evidence?: unknown;
+  latestSourceRole?: "user" | "assistant";
 }) {
   const latestSource = [
     params.recentMemory,
@@ -185,6 +186,12 @@ export function narrativeRelationshipLabel(params: {
     .map(cleanRelationshipSource)
     .filter(Boolean)
     .join(" ");
+  // The latest encounter summary has no authority to reverse a pinned hostile
+  // relationship. A verified user transition or the canonical graph edge can.
+  const storedRelationshipSource = [params.relationshipNote, params.role, params.profile]
+    .map(cleanRelationshipSource).filter(Boolean).join(" ");
+  if (/(?:철천지원수|불구대천|원수|적대\s*관계)/u.test(storedRelationshipSource)
+    && params.latestSourceRole !== "user") return "원수";
   for (const [label, pattern] of LATEST_RELATIONSHIP_TRANSITIONS) {
     if (latestSource && pattern.test(latestSource)) return label;
   }

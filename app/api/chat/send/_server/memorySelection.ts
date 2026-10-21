@@ -369,6 +369,7 @@ export function rankMemoryRetrievalCandidates<T extends MemoryRetrievalCandidate
   candidates: T[];
   primaryQueryText: string;
   contextQueryText?: string;
+  focusNames?: string[];
   maxItems: number;
   maxChars: number;
 }): Array<RankedMemoryRetrievalCandidate<T>> {
@@ -497,10 +498,27 @@ export function rankMemoryRetrievalCandidates<T extends MemoryRetrievalCandidate
   const explicitAnchor = ranked.find((candidate) => candidate.explicitMatch);
   if (explicitAnchor) add(explicitAnchor);
 
+  // Reserve at most one historical cause for an explicitly focused person.
+  // This is evidence, not a canonical current-state override; later changes
+  // still come from the state ledger/current arc. No global critical-event scan.
+  const focusNames = (params.focusNames || []).map((name) => name.trim().toLowerCase()).filter((name) => name.length >= 2);
+  const bestPrimaryMatches = Math.max(...ranked.map((candidate) => candidate.primaryMatches));
+  const consequentialOrigin = !explicitAnchor && focusNames.length
+    ? ranked.filter((candidate) => {
+        const text = candidate.text.toLowerCase();
+        return candidate.primaryMatches >= Math.max(1, bestPrimaryMatches - 1)
+          && text.split(/(?<=[.!?。！？])\s*|\n+/u).some((sentence) =>
+            focusNames.some((name) => sentence.includes(name))
+            && /(?:사망|사살|숨졌|죽었|목숨을\s*잃|실종|행방불명|부활|되살아|원수|증오|절교|배신|결별|이혼|결혼|화해|약속|맹세|계약|구조|구출)/u.test(sentence)
+          );
+      }).sort((a, b) => a.startTurn - b.startTurn || a.endTurn - b.endTurn)[0]
+    : undefined;
+  if (consequentialOrigin) add(consequentialOrigin);
+
   // Two or more current-input token matches indicate a concrete event lookup.
   // Among equally strong matches, keep the earliest event as the origin anchor.
   // An explicit "N턴" request remains absolute and takes this reserved slot.
-  const strongMatches = explicitAnchor
+  const strongMatches = explicitAnchor || consequentialOrigin
     ? []
     : ranked.filter((candidate) => candidate.primaryMatches >= 2);
   if (strongMatches.length > 0) {
@@ -530,6 +548,74 @@ function sectionChars(section: StoredSummarySection) {
   return formatSection(section).length;
 }
 
+/** Bounded whole-history excerpts keep the origin and ending, then sample
+ * intervening ranges evenly. Omission notices prevent a partial archive from
+ * being interpreted as a complete account. Query-specific evidence is separate. */
+export function selectBroadHistoryMemory(historySummary: string, maxChars = 64000): string {
+  const source = String(historySummary || "").trim();
+  const budget = Math.max(0, Math.floor(Number(maxChars) || 0));
+  if (!budget) return "";
+  if (source.length <= budget) return source;
+  const notice = "[분량 제한으로 일부 과거 기록 생략: 조회되지 않은 사건을 없던 일로 판단하지 않는다.]";
+  if (budget <= notice.length) return notice.slice(0, budget);
+  const sections = extractSummarySections(source).sort((a, b) => a.startTurn - b.startTurn || a.endTurn - b.endTurn);
+  if (!sections.length) {
+    // Do not manufacture evidence from half a sentence in legacy text either.
+    const paragraphs = source.split(/\n\s*\n/u);
+    const kept: string[] = [];
+    for (const paragraph of [paragraphs[0], paragraphs[paragraphs.length - 1]]) {
+      if (!paragraph || kept.includes(paragraph)) continue;
+      if ([notice, ...kept, paragraph].join("\n\n").length <= budget) kept.push(paragraph);
+    }
+    return [notice, ...kept].join("\n\n");
+  }
+  const selected = new Map<number, string>();
+  const render = () => {
+    const parts = [notice];
+    let next = 0;
+    for (const [index, text] of [...selected].sort(([a], [b]) => a - b)) {
+      if (next < index) parts.push(`[${sections[next].startTurn}-${sections[index - 1].endTurn}턴 기록 생략]`);
+      parts.push(text);
+      next = index + 1;
+    }
+    if (next < sections.length) parts.push(`[${sections[next].startTurn}-${sections[sections.length - 1].endTurn}턴 기록 생략]`);
+    return parts.join("\n\n");
+  };
+  // Preserve whole paragraphs in oversized sections. Character slicing can
+  // detach a denial/qualification from the claim it negates.
+  const excerptBudget = Math.max(1, Math.floor((budget - notice.length - 8) / Math.min(2, sections.length)));
+  const add = (index: number, allowExcerpt = false) => {
+    if (selected.has(index)) return;
+    let text = formatSection(sections[index]);
+    if (allowExcerpt && text.length > excerptBudget) {
+      const section = sections[index];
+      const heading = `### ${section.title} (${section.startTurn}-${section.endTurn}턴)`;
+      const omitted = `[${section.startTurn}-${section.endTurn}턴 기록 일부 또는 전부 생략]`;
+      const paragraphs = section.body.split(/\n\s*\n/u);
+      const kept: string[] = [];
+      for (const paragraph of [paragraphs[0], paragraphs[paragraphs.length - 1]]) {
+        if (!paragraph || kept.includes(paragraph)) continue;
+        if ([heading, ...kept, paragraph, omitted].join("\n\n").length <= excerptBudget) kept.push(paragraph);
+      }
+      text = kept.length ? [heading, ...kept, omitted].join("\n\n") : `[${section.startTurn}-${section.endTurn}턴 기록 생략]`;
+    }
+    selected.set(index, text);
+    if (render().length > budget) selected.delete(index);
+  };
+  add(0, true);
+  add(sections.length - 1, true);
+  const ranges: Array<[number, number]> = [[1, sections.length - 2]];
+  for (let i = 0; i < ranges.length; i += 1) {
+    const [start, end] = ranges[i];
+    if (start > end) continue;
+    const middle = Math.floor((start + end) / 2);
+    add(middle);
+    ranges.push([start, middle - 1], [middle + 1, end]);
+  }
+  const result = render();
+  return result.length <= budget ? result : notice;
+}
+
 /**
  * Builds a bounded hybrid-memory prompt from the full stored summary archive.
  *
@@ -542,6 +628,7 @@ export function selectHybridMemory(params: {
   historySummary: string;
   queryText: string;
   primaryQueryText?: string;
+  focusNames?: string[];
   currentArcTurns?: number;
   currentArcMaxChars?: number;
   maxRelatedSections?: number;
@@ -598,6 +685,7 @@ export function selectHybridMemory(params: {
       };
     }),
     primaryQueryText: params.primaryQueryText ?? params.queryText,
+    focusNames: params.focusNames,
     contextQueryText: params.queryText,
     maxItems: maxRelatedSections,
     maxChars: maxRelatedChars,

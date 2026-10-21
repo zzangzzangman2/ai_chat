@@ -101,6 +101,41 @@ export function removeUnsupportedVitalStatusClaims(input: {
   const deceased = new Set(
     (input.establishedDeceasedNames || []).map((name) => clean(name).toLocaleLowerCase("ko-KR"))
   );
+  // Canon uses canonical names, while prose can use an unambiguous alias. Keep
+  // the existing death-claim guard from deleting a valid alias-based reference.
+  const aliasOwners = new Map<string, Set<string>>();
+  for (const identity of input.identities || []) {
+    for (const name of identityNames(identity)) {
+      const normalized = name.toLocaleLowerCase("ko-KR");
+      const owners = aliasOwners.get(normalized) || new Set<string>();
+      owners.add(identity.name);
+      aliasOwners.set(normalized, owners);
+    }
+  }
+  const namesBySubject = new Map<string, string[]>();
+  for (const identity of input.identities || []) {
+    const names = identityNames(identity).filter((name) => aliasOwners.get(name.toLocaleLowerCase("ko-KR"))?.size === 1);
+    const established = names.some((name) => deceased.has(name.toLocaleLowerCase("ko-KR")));
+    for (const name of names) {
+      const normalized = name.toLocaleLowerCase("ko-KR");
+      namesBySubject.set(normalized, names);
+      if (established) deceased.add(normalized);
+    }
+  }
+  // Called for streamed paragraphs and historical context too: do not scan the
+  // full user history for every registered person on every invocation. Only an
+  // actual, not-already-established death claim needs evidence, and aliases of
+  // the same person share its result for the rest of this invocation.
+  const trustedDeathCache = new Map<string, boolean>();
+  const hasTrustedSubjectEvidence = (subject: string) => {
+    const normalized = subject.toLocaleLowerCase("ko-KR");
+    if (trustedDeathCache.has(normalized)) return trustedDeathCache.get(normalized)!;
+    const names = namesBySubject.get(normalized) || [subject];
+    const trustedTexts = input.trustedUserTexts || [];
+    const trusted = names.some((name) => hasTrustedUserDeathEvidence(name, trustedTexts));
+    for (const name of names) trustedDeathCache.set(name.toLocaleLowerCase("ko-KR"), trusted);
+    return trusted;
+  };
   const removedSubjects = new Set<string>();
   let removed = 0;
   let inFence = false;
@@ -123,7 +158,7 @@ export function removeUnsupportedVitalStatusClaims(input: {
 
       const unsupported = claimed.filter((subject) => {
         const established = deceased.has(subject.toLocaleLowerCase("ko-KR"));
-        return !established && !hasTrustedUserDeathEvidence(subject, input.trustedUserTexts || []);
+        return !established && !hasTrustedSubjectEvidence(subject);
       });
       if (!unsupported.length) return true;
 

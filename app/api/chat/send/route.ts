@@ -47,6 +47,11 @@ import {
   isAuthorityClaimContext,
   removeUnsupportedAuthorityClaims,
 } from "@/lib/authority_claim_consistency_guard";
+import {
+  deriveDurableCharacterCanon,
+  buildDurableCharacterCanonBlock,
+  guardGeneratedDurableCharacterState,
+} from "@/lib/durable_character_state";
 import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import {
   formatRelationshipCanonGuardBlock,
@@ -155,6 +160,7 @@ import {
   memorySearchTokens,
   rankMemoryRetrievalCandidates,
   selectHybridMemory,
+  selectBroadHistoryMemory,
 } from "./_server/memorySelection";
 import { buildContinuityLedgerBlock } from "./_server/continuityState";
 import { buildMemoryRecallQuery, buildRecallEvidence, selectRecallSummary } from "./_server/memoryRecall";
@@ -289,6 +295,7 @@ function buildRelatedMemoryBlocks(params: {
   chatId: string;
   queryText: string;
   primaryQueryText?: string;
+  focusNames?: string[];
   historySummary: string;
   maxBlocks?: number;
   maxChars?: number;
@@ -571,6 +578,7 @@ function buildRelatedMemoryBlocks(params: {
     candidates,
     primaryQueryText,
     contextQueryText: queryText,
+    focusNames: params.focusNames,
     maxItems: maxBlocks,
     maxChars,
   });
@@ -1554,9 +1562,22 @@ const hasRangeBlock = (() => {
   return re.test(s);
 })();
 
+// Summary cursor alone is insufficient: interrupted extraction can leave a
+// committed range with work still pending. Keep the client repair signal alive.
+const memoryRepairPending = boundaryEndTurn > 0 && Boolean(db.prepare(`
+  SELECT 1 FROM chat_memory_blocks WHERE chatId=? AND endTurn<=?
+  AND CASE WHEN json_valid(meta) THEN
+    json_extract(meta, '$.summaryRepairPending')=1
+    OR json_type(meta, '$.structuredGraphPending')='object'
+    OR (json_extract(meta, '$.deterministicFallbackUsed')=1
+        AND coalesce(json_extract(meta, '$.summaryRepairPending'),1)<>0)
+  ELSE 0 END LIMIT 1
+`).get(cid, boundaryEndTurn));
 const shouldRefresh = (() => {
   if (completedTurnCountNext < summaryEveryVal) return false;
   if (boundaryEndTurn <= 0) return false;
+
+  if (memoryRepairPending) return true;
 
   // 이미 요약된 구간이면 갱신 불필요
   if (boundaryEndTurn <= summarizedEndTurn) return false;
@@ -1902,6 +1923,7 @@ ${body}`.trim();
       historySummary,
       queryText: memoryQueryText,
       primaryQueryText: memoryRecall.searchText,
+      focusNames: memoryRecall.names,
       currentArcTurns: 15,
       currentArcMaxChars: 3200,
       maxRelatedSections: 6,
@@ -1914,6 +1936,7 @@ ${body}`.trim();
       chatId: cid,
       queryText: memoryQueryText,
       primaryQueryText: memoryRecall.searchText,
+      focusNames: memoryRecall.names,
       historySummary: "",
       maxBlocks: 5,
       maxChars: 1800,
@@ -1949,6 +1972,7 @@ ${body}`.trim();
         candidates: hybridSupplementCandidates,
         primaryQueryText: memoryRecall.searchText,
         contextQueryText: memoryQueryText,
+        focusNames: memoryRecall.names,
         maxItems: 3,
         maxChars: 1200,
       });
@@ -2017,11 +2041,24 @@ ${body}`.trim();
     // Assistant narration is intentionally excluded here. A hallucinated speaker
     // must not become the next turn's interlocutor merely because the model named it.
     recentCharacterFocusText = activeCharacterFocus.anchorText;
+    // Derive state from source messages, not ranked summaries. Deleted turns
+    // disappear from this view automatically; summary mistakes cannot revive NPCs.
+    const durableStateIdentities = [
+      { name: personaNameFinal, aliases: "" },
+      ...continuityLedgerIdentities,
+    ];
+    const durableCharacterCanon = deriveDurableCharacterCanon({
+      messages: all,
+      identities: durableStateIdentities,
+      personaName: personaNameFinal,
+    });
+    const durableCharacterCanonBlock = buildDurableCharacterCanonBlock(durableCharacterCanon);
     const continuityLedger = buildContinuityLedgerBlock({
       historySummary,
       identities: continuityLedgerIdentities,
       userText,
       focusNames: [personaNameFinal],
+      authoritativeLifeStates: durableCharacterCanon.lifeStates,
     });
     const identityCanon = buildIdentityCanonBlock({
       messages: all,
@@ -2320,7 +2357,7 @@ ${body}`.trim();
       aliases: dynamicCharacterContext.personaAliases,
       isPersona: true,
     });
-    for (const identity of continuityIdentities) {
+    for (const identity of continuityLedgerIdentities) {
       let aliases: string[] = [];
       const rawAliases = String(identity.aliases || "").trim();
       try {
@@ -2375,16 +2412,28 @@ ${body}`.trim();
       name: identity.name,
       aliases: identity.aliases || [],
     }));
-    const establishedDeceasedNames = continuityLedger.states
-      .filter((state) => state.kind === "deceased")
-      .map((state) => state.name);
-    const sanitizeVitalStatus = (text: unknown) =>
-      removeUnsupportedVitalStatusClaims({
+    const establishedDeceasedNames = [...new Set([
+      ...continuityLedger.states.filter((state) => state.kind === "deceased").map((state) => state.name),
+      ...durableCharacterCanon.lifeStates.filter((state) => state.kind === "deceased").map((state) => state.name),
+    ])];
+    const sanitizeVitalStatus = (text: unknown, generated = false) => {
+      const vital = removeUnsupportedVitalStatusClaims({
         text,
         trustedUserTexts: trustedLegalStatusUserTexts,
         identities: vitalStatusIdentities,
         establishedDeceasedNames,
       });
+      // Historical passages may correctly show someone alive before their death.
+      // Apply present-state restrictions only to newly generated prose.
+      if (!generated) return vital;
+      const durable = guardGeneratedDurableCharacterState({
+        text: vital.text,
+        canon: durableCharacterCanon,
+        identities: durableStateIdentities,
+        personaName: personaNameFinal,
+      });
+      return { ...vital, text: durable.text, removed: vital.removed + durable.removed };
+    };
     const sanitizeRelationshipClaims = (text: unknown, contextText: unknown = "") =>
       removeUnsupportedRelationshipClaims({
         text,
@@ -2428,7 +2477,7 @@ ${body}`.trim();
         trustedNarrationTexts: trustedLegalStatusNarrationTexts,
         identities: legalStatusIdentities,
       });
-      const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+      const vitalStatus = sanitizeVitalStatus(legalStatus.text, true);
       const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
       const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
       const communication = sanitizeCommunicationAbilities(physicalOwnership.text);
@@ -2509,8 +2558,12 @@ ${body}`.trim();
         ),
       ])
     );
+    const durableDeceasedNames = new Set(durableCharacterCanon.lifeStates
+      .filter((state) => state.kind === "deceased")
+      .map((state) => state.name.trim().toLocaleLowerCase("ko-KR")));
     currentScenePresence = currentScenePresence.filter(
       (item) =>
+        !durableDeceasedNames.has(item.characterName.trim().toLocaleLowerCase("ko-KR")) &&
         ![
           item.characterName,
           ...(item.characterAliases || []),
@@ -2525,7 +2578,7 @@ ${body}`.trim();
     // - 기본(auto): 현재 장면 + 검색된 관련 과거만 넣어 오래된 오기와 현재 대상을 섞지 않는다.
     // - 사용자가 전체 회고를 명시적으로 요청하면 그 턴에는 전문을 넣는다.
     // - 상한(AI_FULL_LONG_MEMORY_MAX_CHARS, 기본 64000자 ≈ 4만 토큰) 초과 시에만
-    //   섹션 단위로 오래된 구간부터 탈락시킨다. (문장 중간 절단 방지)
+    //   초기·최신·중간 범위를 나누어 보존하고, 생략 구간을 알린다.
     // - AI_FULL_LONG_MEMORY=1/0으로 전문/검색 모드를 명시 고정할 수 있다.
     const fullLongMemoryMode = String(process.env.AI_FULL_LONG_MEMORY ?? "auto").trim().toLowerCase();
     const broadHistoryRequested = /(?:처음부터|지금까지|전\s*과정|일대기|전체\s*(?:대화|기억|내용|요약)|모든\s*(?:일|기억|대화|사건)|전부)/u.test(
@@ -2539,29 +2592,8 @@ ${body}`.trim();
       if (!Number.isFinite(raw) || raw <= 0) return 64000;
       return Math.max(4000, Math.floor(raw));
     })();
-    const clampLongMemoryBySection = (text: string, maxChars: number) => {
-      const s = String(text || "");
-      if (s.length <= maxChars) return s;
-      const sections = extractSummarySections(s);
-      if (!sections.length) return s.slice(-maxChars);
-      const kept: string[] = [];
-      let used = 0;
-      // 최신 섹션부터 채우고, 예산을 넘기면 더 오래된 구간은 제외한다.
-      for (let i = sections.length - 1; i >= 0; i -= 1) {
-        const section = sections[i];
-        const range =
-          section.startTurn === section.endTurn
-            ? `${section.endTurn}턴`
-            : `${section.startTurn}-${section.endTurn}턴`;
-        const piece = `### ${section.title} (${range})\n${section.body}`.trim();
-        if (used > 0 && used + piece.length + 2 > maxChars) break;
-        kept.unshift(piece);
-        used += piece.length + 2;
-      }
-      return kept.join("\n\n");
-    };
     const fullLongMemoryText = fullLongMemoryEnabled
-      ? clampLongMemoryBySection(String(historySummary || "").trim(), fullLongMemoryMaxChars)
+      ? selectBroadHistoryMemory(String(historySummary || "").trim(), fullLongMemoryMaxChars)
       : "";
     const recallSummaryText = selectRecallSummary(historySummary, memoryRecall);
     const recallEvidence = buildRecallEvidence({
@@ -2570,7 +2602,9 @@ ${body}`.trim();
       recentMessageIds: tail.map((message: any) => String(message.id || "")),
     });
     const historySummaryForPromptRaw = [
-      fullLongMemoryText || recallSummaryText || [hybridMemory.currentArcText, relatedArchiveText].filter(Boolean).join("\n\n"),
+      fullLongMemoryText
+        ? [fullLongMemoryText, relatedArchiveText].filter(Boolean).join("\n\n")
+        : recallSummaryText || [hybridMemory.currentArcText, relatedArchiveText].filter(Boolean).join("\n\n"),
       manualCharacterRosterFallback,
       recallEvidence.block,
     ]
@@ -2634,6 +2668,8 @@ ${body}`.trim();
       pickedChars: strlen(relatedArchiveText),
       continuityStates: continuityLedger.promptStates,
       continuityStateCount: continuityLedger.states.length,
+      durableLifeStateCount: durableCharacterCanon.lifeStates.length,
+      durableRelationshipCount: durableCharacterCanon.relationships.length,
       continuityPromptStateCount: continuityLedger.promptStates.length,
       continuityChars: strlen(continuityLedger.block),
       continuityIdentityCount: continuityLedgerIdentities.length,
@@ -2692,7 +2728,7 @@ ${body}`.trim();
         ? `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 전체 요약 아카이브)`
         : `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 최근 15턴 서사 + 관련 과거 사건)`,
       fullLongMemoryText
-        ? `- 아래 요약 아카이브는 이 대화의 처음부터 최근까지 전 구간이다. 오래된 구간도 사실 확인에 그대로 사용한다.`
+        ? `- 아래 요약 아카이브는 처음부터 최근까지 범위별로 보존한다. 생략 표시가 있으면 그 구간은 확인하지 못한 것이며 사건이 없었다고 단정하지 않는다.`
         : `- 최근 서사는 검색 실패와 무관하게 항상 유지한다.`,
       fullLongMemoryText
         ? `- 사용자가 과거 사건/인물/약속을 물으면 이 아카이브에서 근거를 찾아 답하고, 근거가 없으면 지어내지 말고 모른다고 처리한다.`
@@ -3339,7 +3375,7 @@ const systemRaw = (cacheFriendlyLayout
       `# [LIFE/DEATH CANON HARD GUARD — APPLIES TO EVERY CHAT]`,
       `- 죽음·사망·자살·살해는 인물의 등장 가능성을 영구 변경하는 최상위 정사다. 최신 사용자 지문이나 이미 검증된 연속성 장부에 실제 완료 사건으로 확정된 경우에만 발생한 사실로 쓴다.`,
       `- '죽을지도 모른다', '자살할 수 있다', '죽이면', '죽이겠다', '아빠 없는 게 싫지?' 같은 가정·가능성·협박·조건문·공포·회상은 실제 사망이 아니다. 절대로 '죽었다', '목숨을 잃었다', '죽음 이후'로 승격하거나 요약하지 않는다.`,
-      `- 최근 원문에서 그 인물이 말하거나 행동하거나 다른 방에 살아 있는 장면이 확인되면 생존 상태다. 충돌하는 과거 AI 지문이나 요약의 사망 단정은 오기이므로 반복하지 않는다.`,
+      `- 원문에서 완료된 사망은 이후의 명시적인 사용자 부활·생존 정정이 있기 전까지 유지한다. 뒤늦은 AI의 행동·대사·생존 묘사나 요약은 사망을 취소하는 근거가 아니다. 원문 확정 상태 블록의 출처와 변경 턴을 우선한다.`,
       `- 응답을 내기 직전에 새 사망 주장마다 누가, 언제, 어떤 완료 사건으로 죽었는지 근거를 확인한다. 명시적 근거가 없으면 그 문장을 삭제하고 생존한 현재 상황을 유지한다.`,
     ].join("\n");
     const activeInterlocutorPriorityBlock = activeCharacterFocus.locked
@@ -3377,6 +3413,7 @@ const systemRaw = (cacheFriendlyLayout
       legalStatusPriorityBlock,
       vitalStatusPriorityBlock,
       relationshipCanonGuardBlock,
+      durableCharacterCanonBlock,
       activeInterlocutorPriorityBlock,
       physicalFactOwnershipBlock,
       addressDirectionPriorityBlock,
@@ -3439,6 +3476,7 @@ const systemRaw = (cacheFriendlyLayout
 	          ``,
 	          vitalStatusPriorityBlock,
 	          relationshipCanonGuardBlock,
+	          durableCharacterCanonBlock,
 	          currentOocPriorityBlock ? `` : "",
 	          currentOocPriorityBlock
 	            ? sanitizePromptCached(currentOocPriorityBlock)
@@ -4065,7 +4103,7 @@ let cancelStreamWork: (() => void) | null = null;
             trustedNarrationTexts: trustedLegalStatusNarrationTexts,
             identities: legalStatusIdentities,
           });
-          const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+          const vitalStatus = sanitizeVitalStatus(legalStatus.text, true);
           const relationshipClaims = sanitizeRelationshipClaims(
             vitalStatus.text,
             streamRelationshipContext
@@ -4647,6 +4685,12 @@ if (!TRANSPORT_STREAMING) {
           const guardedTail = guardedTextStream.finish();
           if (guardedTail) enqueueWire({ type: "delta", text: guardedTail });
           assistantText = guardedTextStream.output();
+          const finalVitalStatus = sanitizeVitalStatus(assistantText, true);
+          if (finalVitalStatus.removed > 0) {
+            streamVitalStatusRedactions += finalVitalStatus.removed;
+            assistantText = finalVitalStatus.text;
+            postGenerationTextChanged = true;
+          }
           const finalRelationshipClaims = sanitizeRelationshipClaims(assistantText);
           if (
             finalRelationshipClaims.removed > 0 ||
@@ -4666,7 +4710,7 @@ if (!TRANSPORT_STREAMING) {
               trustedNarrationTexts: trustedLegalStatusNarrationTexts,
               identities: legalStatusIdentities,
             });
-            const vitalStatus = sanitizeVitalStatus(legalStatus.text);
+            const vitalStatus = sanitizeVitalStatus(legalStatus.text, true);
             const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
             const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
             const scenePresence = removeScenePresenceContradictionPassages({
@@ -6061,7 +6105,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
       trustedNarrationTexts: trustedLegalStatusNarrationTexts,
       identities: legalStatusIdentities,
     });
-    const vitalStatusOutputChecked = sanitizeVitalStatus(legalStatusOutputChecked.text);
+    const vitalStatusOutputChecked = sanitizeVitalStatus(legalStatusOutputChecked.text, true);
     const relationshipClaimOutputChecked = sanitizeRelationshipClaims(
       vitalStatusOutputChecked.text
     );

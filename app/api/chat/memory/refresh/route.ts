@@ -57,6 +57,56 @@ import {
   upsertSummaryRangeBlock,
 } from "@/app/api/chat/send/_server/memory";
 
+function throwIfMemoryRefreshAborted(signal?: AbortSignal, error?: unknown) {
+  const cause = error as { name?: unknown; message?: unknown } | undefined;
+  if (!signal?.aborted && cause?.name !== "AbortError" &&
+      !/\baborted\b|abortsignal|abort\s*error/i.test(String(cause?.message || ""))) return;
+  const aborted = new Error("memory_refresh_aborted");
+  aborted.name = "AbortError";
+  throw aborted;
+}
+
+function parseMemoryBlockMeta(value: unknown): Record<string, any> {
+  try {
+    const parsed = JSON.parse(String(value || "{}"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
+}
+
+function loadPendingMemoryWork(chatId: string, boundaryEndTurn: number) {
+  const rows = db.prepare(
+    `SELECT startTurn, endTurn, meta FROM chat_memory_blocks
+     WHERE chatId=? AND endTurn<=? ORDER BY startTurn`
+  ).all(chatId, boundaryEndTurn) as Array<{ startTurn: number; endTurn: number; meta: string }>;
+  let summary: { startTurn: number; endTurn: number; title: string; lastAttemptAt: number } | null = null;
+  let graph: { blockStartTurn: number; startTurn: number; endTurn: number; lastAttemptAt: number } | null = null;
+  for (const row of rows) {
+    const meta = parseMemoryBlockMeta(row.meta);
+    // Legacy deterministic fallbacks also need a real summary; their quality checker
+    // accepted truncated prose and cannot detect omitted events.
+    if (!summary && (meta.summaryRepairPending === true ||
+        (meta.deterministicFallbackUsed === true && meta.summaryRepairPending !== false))) {
+      summary = { startTurn: row.startTurn, endTurn: row.endTurn, title: "대화 자동 보존",
+        lastAttemptAt: Number(meta.summaryRepairAttemptedAt) || 0 };
+    }
+    const pending = meta.structuredGraphPending;
+    if (!graph && pending && Number.isInteger(pending.startTurn) && Number.isInteger(pending.endTurn) &&
+        pending.startTurn >= 1 && pending.endTurn >= pending.startTurn && pending.endTurn <= row.endTurn) {
+      graph = { blockStartTurn: row.startTurn, startTurn: pending.startTurn, endTurn: pending.endTurn,
+        lastAttemptAt: Number(meta.structuredGraphAttemptedAt) || 0 };
+    }
+  }
+  return { summary, graph };
+}
+
+function updateMemoryBlockMeta(chatId: string, startTurn: number, patch: Record<string, unknown>) {
+  const row = db.prepare(`SELECT meta FROM chat_memory_blocks WHERE chatId=? AND startTurn=?`)
+    .get(chatId, startTurn) as { meta?: string } | undefined;
+  if (!row) return;
+  db.prepare(`UPDATE chat_memory_blocks SET meta=? WHERE chatId=? AND startTurn=?`)
+    .run(JSON.stringify({ ...parseMemoryBlockMeta(row.meta), ...patch }), chatId, startTurn);
+}
+
 function clampInt(v: unknown, min: number, max: number, fallback: number) {
   const n = Number(v);
   if (!Number.isFinite(n)) return fallback;
@@ -559,6 +609,7 @@ async function detectCharactersFromWindow(params: {
     });
     outText = String((r as any)?.text || "").trim();
   } catch (e: any) {
+    throwIfMemoryRefreshAborted(params.llmOpts.signal, e);
     if (process.env.CHAT_DEBUG === "1") console.log(JSON.stringify({ tag: "autochar.llm.error", err: String(e?.message || e) }));
     return [];
   }
@@ -697,6 +748,7 @@ async function refreshStructuredCharacterState(params: {
       windowEndTurn: params.graphWindowEndTurn,
     });
 
+    throwIfMemoryRefreshAborted(params.signal);
     const acceptedNames = new Set(
       structuredGraph.characters
         .filter(
@@ -749,6 +801,7 @@ async function refreshStructuredCharacterState(params: {
       });
     }
 
+    throwIfMemoryRefreshAborted(params.signal);
     if (detected.length > 0) {
       const insertStmt = db.prepare(
         `INSERT INTO chat_character_roster
@@ -820,6 +873,7 @@ async function refreshStructuredCharacterState(params: {
     };
   } catch (error: unknown) {
     if (error instanceof StaleChatHistoryError) throw error;
+    throwIfMemoryRefreshAborted(params.signal, error);
     if (process.env.CHAT_DEBUG === "1") {
       console.log(JSON.stringify({
         tag: "structuredGraph.refresh_error",
@@ -1019,6 +1073,7 @@ export async function POST(req: Request) {
 
     const access = await requireChatAccess(chatId);
     if (!access.ok) return access.res;
+    throwIfMemoryRefreshAborted(req.signal);
 
     // settings (model + token budgets)
     const st = db
@@ -1187,7 +1242,59 @@ export async function POST(req: Request) {
     };
 
     // Existing corrupted sections are repaired automatically before new windows advance.
-    const repair = repairCorrupted ? firstBadSectionRange(recentSummary, boundaryEndTurn) : null;
+    const pendingWork = loadPendingMemoryWork(chatId, boundaryEndTurn);
+    const repair = repairCorrupted
+      ? firstBadSectionRange(recentSummary, boundaryEndTurn) ||
+        (summarizedEndTurn >= boundaryEndTurn ? pendingWork.summary : null)
+      : null;
+
+    const repairMetaRow = repair ? db.prepare(
+      `SELECT meta FROM chat_memory_blocks WHERE chatId=? AND startTurn=?`
+    ).get(chatId, repair.startTurn) as { meta?: string } | undefined : undefined;
+    const repairAttemptedAt = Number(parseMemoryBlockMeta(repairMetaRow?.meta).summaryRepairAttemptedAt) || 0;
+    const maintenanceAttemptAt = Math.max(Date.now(), repairAttemptedAt + 1,
+      Number(pendingWork.graph?.lastAttemptAt || 0) + 1);
+
+    // Catch up new summaries first. When both repairs remain, alternate by their
+    // durable last attempt so either provider failure cannot starve the other.
+    // A request still attempts at most one repair, and graph windows stay ordered.
+    if (pendingWork.graph && summarizedEndTurn >= boundaryEndTurn &&
+        (!repair || pendingWork.graph.lastAttemptAt < repairAttemptedAt)) {
+      const pending = pendingWork.graph;
+      withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(chatId, pending.blockStartTurn, {
+        structuredGraphAttemptedAt: maintenanceAttemptAt,
+      }));
+      const graphOutcome = await refreshStructuredCharacterState({
+        chatId, historySnapshot, personaName, personaAge, personaGender, personaInfo, summaryModel,
+        graphWindowText: stripUrlsAndMediaMarkdown(formatTurnsLocal(
+          selectMessagesForAssistantTurnRange(all, pending.startTurn, pending.endTurn)
+        )),
+        graphWindowStartTurn: pending.startTurn,
+        graphWindowEndTurn: pending.endTurn,
+        now: Date.now(), signal: req.signal,
+      });
+      throwIfMemoryRefreshAborted(req.signal);
+      if (graphOutcome.structuredGraphParsed) {
+        withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(
+          chatId, pending.blockStartTurn, { structuredGraphPending: null }
+        ));
+      }
+      const remaining = loadPendingMemoryWork(chatId, boundaryEndTurn);
+      return NextResponse.json({
+        ok: true, refreshed: graphOutcome.structuredGraphParsed,
+        skipped: !graphOutcome.structuredGraphParsed,
+        reason: graphOutcome.structuredGraphParsed ? "pending_graph_repaired" : "pending_graph_retry",
+        summarizedEndTurn, boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn || Boolean(remaining.graph || remaining.summary || repair),
+        ...graphOutcome,
+      });
+    }
+
+    if (repair) {
+      withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(chatId, repair.startTurn, {
+        summaryRepairAttemptedAt: maintenanceAttemptAt,
+      }));
+    }
 
     // 이미 장기요약이 끝난 기존 채팅이라도 roster가 비어 있으면 수동 새로고침에서
     // 마지막 12턴을 한 번 재분석한다. 관계 추출 실패가 요약 포인터 뒤에 영구히
@@ -1227,6 +1334,11 @@ export async function POST(req: Request) {
         const graphWindowText = stripUrlsAndMediaMarkdown(
           formatTurnsLocal(graphRangeTurns)
         );
+        const pendingBlockStartTurn = Math.max(1, boundaryEndTurn - summaryEveryVal + 1);
+        withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(chatId, pendingBlockStartTurn, {
+          structuredGraphPending: { startTurn: graphWindowStartTurn, endTurn: boundaryEndTurn },
+          structuredGraphAttemptedAt: maintenanceAttemptAt,
+        }));
         const graphOutcome = await refreshStructuredCharacterState({
           chatId,
           historySnapshot,
@@ -1241,6 +1353,12 @@ export async function POST(req: Request) {
           now: Date.now(),
           signal: req.signal,
         });
+        throwIfMemoryRefreshAborted(req.signal);
+        if (graphOutcome.structuredGraphParsed) {
+          withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(
+            chatId, pendingBlockStartTurn, { structuredGraphPending: null }
+          ));
+        }
         const autoCharactersBackfilled = await backfillAutoCharacterMemories({
           req,
           chatId,
@@ -1256,6 +1374,7 @@ export async function POST(req: Request) {
           ok: true,
           refreshed: graphChanged,
           skipped: !graphChanged,
+          morePending: !graphOutcome.structuredGraphParsed,
           reason: graphChanged
             ? wasRosterEmpty
               ? "uptodate_graph_bootstrapped"
@@ -1300,7 +1419,7 @@ export async function POST(req: Request) {
         windowEndTurn,
         summarizedEndTurn,
         boundaryEndTurn,
-        morePending: summarizedEndTurn < boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn || Boolean(repair),
       });
     }
 
@@ -1352,7 +1471,7 @@ export async function POST(req: Request) {
         windowEndTurn,
         summarizedEndTurn,
         boundaryEndTurn,
-        morePending: summarizedEndTurn < boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn || Boolean(repair),
         capIndex,
       });
     }
@@ -1489,8 +1608,11 @@ export async function POST(req: Request) {
     const generationErrors: string[] = [];
     const runSummaryAttempt = async (label: string, run: () => Promise<string>) => {
       try {
-        return String((await run()) || "");
+        const text = String((await run()) || "");
+        throwIfMemoryRefreshAborted(req.signal);
+        return text;
       } catch (error: any) {
+        throwIfMemoryRefreshAborted(req.signal, error);
         generationErrors.push(`${label}:${String(error?.message || error || "failed").slice(0, 180)}`);
         return "";
       }
@@ -1760,7 +1882,7 @@ export async function POST(req: Request) {
         windowEndTurn,
         summarizedEndTurn,
         boundaryEndTurn,
-        morePending: summarizedEndTurn < boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn || Boolean(repair),
         relationshipDrift,
         identityDrift,
         canonicalFactDrift,
@@ -1778,7 +1900,7 @@ export async function POST(req: Request) {
           windowEndTurn,
           summarizedEndTurn,
           boundaryEndTurn,
-          morePending: summarizedEndTurn < boundaryEndTurn,
+          morePending: summarizedEndTurn < boundaryEndTurn || Boolean(repair),
           quality: q,
           nameDrift: ndrift,
           relationshipDrift,
@@ -1874,7 +1996,7 @@ export async function POST(req: Request) {
         windowEndTurn,
         summarizedEndTurn,
         boundaryEndTurn,
-        morePending: summarizedEndTurn < boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn || Boolean(repair),
         sourceSig0,
         sourceSig1,
       });
@@ -1914,7 +2036,7 @@ export async function POST(req: Request) {
         windowEndTurn,
         summarizedEndTurn,
         boundaryEndTurn,
-        morePending: summarizedEndTurn < boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn || Boolean(repair),
         prevSectionCount,
         nextSectionCount,
         prevChars: strlenSummary(recentSummary),
@@ -1928,7 +2050,7 @@ export async function POST(req: Request) {
         windowEndTurn,
         summarizedEndTurn,
         boundaryEndTurn,
-        morePending: summarizedEndTurn < boundaryEndTurn,
+        morePending: summarizedEndTurn < boundaryEndTurn || Boolean(repair),
         prevSectionCount,
         nextSectionCount,
       });
@@ -1936,7 +2058,33 @@ export async function POST(req: Request) {
 
     const nextEndTurn = Math.max(summarizedEndTurn, getSummarizedEndTurn(nextSummary));
 
-    // Persist
+    // 새 채팅은 첫 완성 구간(3턴)에서 roster를 만들고, 이후에는 12턴마다
+    // 관계·별칭을 갱신한다. roster 부트스트랩이 실패한 동안에는 다음 3턴
+    // 구간에서 다시 시도해 캐릭터 기억이 영구히 0개로 고정되지 않게 한다.
+    const rosterCountBeforeGraph = Number(
+      (
+        db
+          .prepare(`SELECT COUNT(*) AS count FROM chat_character_roster WHERE chatId=? AND enabled != 0`)
+          .get(chatId) as { count?: unknown }
+      )?.count || 0
+    );
+    const isRosterBootstrap = rosterCountBeforeGraph === 0;
+    const shouldRefreshStructuredGraph =
+      isRosterBootstrap ||
+      (windowEndTurn >= STRUCTURED_GRAPH_WINDOW_TURNS &&
+        windowEndTurn % STRUCTURED_GRAPH_WINDOW_TURNS === 0);
+    const graphWindowTurnCount = isRosterBootstrap
+      ? Math.min(STRUCTURED_GRAPH_WINDOW_TURNS, windowEndTurn)
+      : STRUCTURED_GRAPH_WINDOW_TURNS;
+    const graphWindowStartTurn = Math.max(1, windowEndTurn - graphWindowTurnCount + 1);
+
+    // A summary repair may share a block with an older pending graph extraction.
+    // Keep that independent work and its scheduling position when replacing prose.
+    const previousBlockRow = db.prepare(`SELECT meta FROM chat_memory_blocks WHERE chatId=? AND startTurn=?`)
+      .get(chatId, windowStartTurn) as { meta?: string } | undefined;
+    const previousBlockMeta = parseMemoryBlockMeta(previousBlockRow?.meta);
+    // Persist the graph retry range atomically with its summary, before any LLM call.
+    throwIfMemoryRefreshAborted(req.signal);
     const now = Date.now();
     const recentSummaryChars = strlenSummary(nextSummary);
 
@@ -1977,6 +2125,11 @@ export async function POST(req: Request) {
         source: "memory_refresh",
         forcedBadOutputSaved,
         deterministicFallbackUsed,
+        summaryRepairPending: deterministicFallbackUsed || forcedBadOutputSaved,
+        summaryRepairAttemptedAt: deterministicFallbackUsed || forcedBadOutputSaved ? maintenanceAttemptAt : null,
+        structuredGraphPending: previousBlockMeta.structuredGraphPending || (shouldRefreshStructuredGraph
+          ? { startTurn: graphWindowStartTurn, endTurn: windowEndTurn } : null),
+        structuredGraphAttemptedAt: Number(previousBlockMeta.structuredGraphAttemptedAt) || 0,
         deterministicFallbackReason,
         generationErrors,
         quality: q,
@@ -1990,21 +2143,6 @@ export async function POST(req: Request) {
     memoryBlocksBackfilled += 1;
     });
 
-    // 새 채팅은 첫 완성 구간(3턴)에서 roster를 만들고, 이후에는 12턴마다
-    // 관계·별칭을 갱신한다. roster 부트스트랩이 실패한 동안에는 다음 3턴
-    // 구간에서 다시 시도해 캐릭터 기억이 영구히 0개로 고정되지 않게 한다.
-    const rosterCountBeforeGraph = Number(
-      (
-        db
-          .prepare(`SELECT COUNT(*) AS count FROM chat_character_roster WHERE chatId=? AND enabled != 0`)
-          .get(chatId) as { count?: unknown }
-      )?.count || 0
-    );
-    const isRosterBootstrap = rosterCountBeforeGraph === 0;
-    const shouldRefreshStructuredGraph =
-      isRosterBootstrap ||
-      (windowEndTurn >= STRUCTURED_GRAPH_WINDOW_TURNS &&
-        windowEndTurn % STRUCTURED_GRAPH_WINDOW_TURNS === 0);
     let autoCharactersAdded: string[] = [];
     let autoAliasesUpdated: string[] = [];
     let autoRelationshipsUpserted = 0;
@@ -2014,14 +2152,10 @@ export async function POST(req: Request) {
     let structuredGraphFallbackUsed = false;
     let structuredGraphCandidateNames: string[] = [];
     let structuredGraphMissingCandidateNames: string[] = [];
-    if (shouldRefreshStructuredGraph) {
-      const graphWindowTurnCount = isRosterBootstrap
-        ? Math.min(STRUCTURED_GRAPH_WINDOW_TURNS, windowEndTurn)
-        : STRUCTURED_GRAPH_WINDOW_TURNS;
-      const graphWindowStartTurn = Math.max(
-        1,
-        windowEndTurn - graphWindowTurnCount + 1
-      );
+    if (shouldRefreshStructuredGraph && !pendingWork.graph) {
+      withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(chatId, windowStartTurn, {
+        structuredGraphAttemptedAt: maintenanceAttemptAt,
+      }));
       const graphRangeTurns = selectMessagesForAssistantTurnRange(
         all,
         graphWindowStartTurn,
@@ -2044,6 +2178,12 @@ export async function POST(req: Request) {
         now,
         signal: req.signal,
       });
+      throwIfMemoryRefreshAborted(req.signal);
+      if (graphOutcome.structuredGraphParsed) {
+        withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(
+          chatId, windowStartTurn, { structuredGraphPending: null }
+        ));
+      }
       autoCharactersAdded = graphOutcome.autoCharactersAdded;
       autoAliasesUpdated = graphOutcome.autoAliasesUpdated;
       autoRelationshipsUpserted = graphOutcome.autoRelationshipsUpserted;
@@ -2062,7 +2202,9 @@ export async function POST(req: Request) {
       turnLimit: Math.min(AUTO_CHARACTER_BACKFILL_TURNS, windowEndTurn),
     }).catch(() => null);
 
-    const morePending = nextEndTurn < boundaryEndTurn;
+    throwIfMemoryRefreshAborted(req.signal);
+    const remainingWork = loadPendingMemoryWork(chatId, boundaryEndTurn);
+    const morePending = nextEndTurn < boundaryEndTurn || Boolean(remainingWork.summary || remainingWork.graph);
 
     return NextResponse.json({
       ok: true,
@@ -2072,6 +2214,8 @@ export async function POST(req: Request) {
       summarizedEndTurn: nextEndTurn,
       boundaryEndTurn,
       morePending,
+      retryNeeded: deterministicFallbackUsed || forcedBadOutputSaved ||
+        (shouldRefreshStructuredGraph && !pendingWork.graph && !structuredGraphParsed),
       forcedBadOutputSaved,
       deterministicFallbackUsed,
       deterministicFallbackReason,
@@ -2100,6 +2244,9 @@ export async function POST(req: Request) {
       },
     });
   } catch (e: any) {
+    if (req.signal.aborted || e?.name === "AbortError") {
+      return NextResponse.json({ ok: false, error: "memory_refresh_aborted", morePending: true }, { status: 503 });
+    }
     if (e instanceof StaleChatHistoryError) {
       return NextResponse.json({ ok: true, skipped: true, reason: "stale_source_changed", morePending: true });
     }
