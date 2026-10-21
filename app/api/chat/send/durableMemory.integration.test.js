@@ -16,14 +16,18 @@ function load(file){
 const durable=load(path.join(root,'lib/durable_character_state.ts'));
 const vital=load(path.join(root,'lib/vital_status_consistency_guard.ts'));
 const continuity=load(path.join(root,'app/api/chat/send/_server/continuityState.ts'));
+const conditions=load(path.join(root,'lib/persistent_character_conditions.ts'));
+const {withAssistantTurnNumbers}=load(path.join(root,'app/api/chat/send/_server/turnRange.ts'));
 // Exercise the actual send route's closure without starting a server or using DB/API.
 const route=fs.readFileSync(path.join(root,'app/api/chat/send/route.ts'),'utf8');
 const ast=ts.createSourceFile('route.ts',route,ts.ScriptTarget.Latest,true);
 let initializer;
 let repairInitializer;
+const promptInitializers=new Map();
 function visit(node){
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='sanitizeVitalStatus')initializer=node.initializer.getText(ast);
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='memoryRepairPending')repairInitializer=node.initializer.getText(ast);
+  if(ts.isVariableDeclaration(node)&&['system','systemForContinuationRaw','systemForStatus'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
   ts.forEachChild(node,visit);
 }
 visit(ast);
@@ -31,19 +35,36 @@ assert.ok(initializer,'send route must define the shared generated-state sanitiz
 const closureJs=ts.transpileModule(`const result=${initializer};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
 const identities=[{name:'박도훈'},{name:'이서윤'}];
 function setup(messages,historySummary=''){
-  const canon=durable.deriveDurableCharacterCanon({messages,identities});
+  const sourceMessages=withAssistantTurnNumbers(messages);
+  const canon=durable.deriveDurableCharacterCanon({messages:sourceMessages,identities});
+  const conditionCanon=conditions.derivePersistentCharacterConditions({messages:sourceMessages,identities});
   const ledger=continuity.buildContinuityLedgerBlock({historySummary,identities,authoritativeLifeStates:canon.lifeStates});
-  const sanitize=Function('removeUnsupportedVitalStatusClaims','guardGeneratedDurableCharacterState','trustedLegalStatusUserTexts','vitalStatusIdentities','establishedDeceasedNames','durableCharacterCanon','durableStateIdentities','personaNameFinal',closureJs+'\nreturn result;')(
+  const sanitize=Function('removeUnsupportedVitalStatusClaims','guardGeneratedDurableCharacterState','trustedLegalStatusUserTexts','vitalStatusIdentities','establishedDeceasedNames','durableCharacterCanon','durableStateIdentities','personaNameFinal','guardGeneratedPersistentCharacterConditions','persistentCharacterConditions',closureJs+'\nreturn result;')(
     vital.removeUnsupportedVitalStatusClaims,durable.guardGeneratedDurableCharacterState,
     messages.filter(m=>m.role==='user').map(m=>m.content),identities,
-    ledger.states.filter(s=>s.kind==='deceased').map(s=>s.name),canon,identities,'이서윤');
-  return {canon,ledger,sanitize};
+    ledger.states.filter(s=>s.kind==='deceased').map(s=>s.name),canon,identities,'이서윤',
+    conditions.guardGeneratedPersistentCharacterConditions,conditionCanon);
+  return {canon,ledger,sanitize,conditionCanon};
 }
 function timeline(event){
   return Array.from({length:500},(_,i)=>[
     {id:`u${i+1}`,role:'user',content:i===2?event:'마을의 풍경을 본다.'},
     {id:`a${i+1}`,role:'assistant',content:'조용한 하루가 지나갔다.'},
   ]).flat();
+}
+function evaluatePrompt(name,values){
+  const expression=promptInitializers.get(name);
+  assert.ok(expression,`production prompt ${name} must exist`);
+  const dependencies=new Set();
+  function collect(node){
+    if(ts.isIdentifier(node)&&!(ts.isPropertyAccessExpression(node.parent)&&node.parent.name===node))dependencies.add(node.text);
+    ts.forEachChild(node,collect);
+  }
+  collect(expression);
+  const names=[...dependencies];
+  const fixtures={Boolean,String,sanitizePromptCached:value=>value,spatialCanon:{block:''},opts:{},settings:{},...values};
+  const js=ts.transpileModule(`const result=${expression.getText(ast)};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  return Function(...names,js+'\nreturn result;')(...names.map(key=>fixtures[key]??''));
 }
 test('send sanitizer preserves historical life while blocking resurrection after 500 turns',()=>{
   const messages=timeline('박도훈은 칼에 찔려 죽었다.');
@@ -71,6 +92,44 @@ test('turn 3 hostility survives ordinary later narration until explicit reconcil
   assert.ok(setup(messages).sanitize(friendly,true).removed>0);
   messages.push({id:'reconcile',role:'user',content:'박도훈과 이서윤은 서로 용서하고 화해했다.'});
   assert.equal(setup(messages).sanitize(friendly,true).removed,0);
+});
+
+test('pregnancy remains available after 500 turns even without a matching summary',()=>{
+  const messages=timeline('*이서윤 임신함*');
+  const {conditionCanon,sanitize}=setup(messages,'### 최근 일상 (499-501턴)\n이서윤은 서류를 정리했다.');
+  const state=conditionCanon.pregnancies.find(state=>state.name==='이서윤');
+  assert.equal(state.status,'pregnant');
+  assert.equal(state.history.some(event=>event.sourceMessageId==='u3'&&event.turnNo===3),true);
+  assert.match(conditions.buildPersistentCharacterConditionsBlock(conditionCanon),/이서윤/);
+  const falseNarration='*이서윤은 임신한 적이 없었다.*';
+  assert.equal(sanitize(falseNarration).text,falseNarration,'historical context is retained');
+  assert.ok(sanitize(falseNarration,true).removed>0,'new objective denial is rejected');
+  assert.equal(sanitize('"이서윤은 임신한 적이 없어."',true).removed,0,'dialogue is not world-state evidence');
+});
+
+test('source turn numbers follow completed responses rather than failed user submissions',()=>{
+  const messages=[{role:'assistant',content:'서문'},
+    {role:'user',content:'첫 요청'}, {role:'user',content:'재전송'},
+    {role:'assistant',content:'첫 답변'}, {role:'user',content:'*이서윤 임신함*'},
+    {role:'model',content:'진료 기록을 확인했다.'}];
+  assert.deepEqual(withAssistantTurnNumbers(messages).map(m=>m.turnNo),[0,1,1,1,2,2]);
+  assert.equal(setup(messages).conditionCanon.pregnancies[0].turnNo,2);
+});
+
+test('normal, continuation and status prompts retain original pregnancy evidence when retrieval is empty',()=>{
+  const {conditionCanon}=setup(timeline('*이서윤 임신함*'));
+  const persistentCharacterConditionsBlock=conditions.buildPersistentCharacterConditionsBlock(conditionCanon);
+  const system=evaluatePrompt('system',{persistentCharacterConditionsBlock});
+  assert.match(system,/이서윤.*임신 확정.*3턴/u);
+  for(const lightweight of [true,false]){
+    for(const name of ['systemForContinuationRaw','systemForStatus']){
+      const prompt=evaluatePrompt(name,{
+        system,persistentCharacterConditionsBlock,isGemini3ProFamilyModel:()=>lightweight,
+      });
+      assert.match(prompt,/이서윤.*임신 확정.*3턴/u);
+      assert.match(prompt,/NPC가 알고 있다는 뜻이 아니다/u);
+    }
+  }
 });
 
 test('completed summary cursor still signals pending repair, including legacy fallbacks',()=>{

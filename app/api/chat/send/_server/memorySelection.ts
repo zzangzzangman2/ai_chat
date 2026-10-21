@@ -28,7 +28,19 @@ const STOPWORDS = new Set([
   "블록",
 ]);
 
+const PREGNANCY_MEMORY_REFERENCE = /(?:임신|잉태|회임|태중|태아|(?:뱃속|배\s*속)[^.!?\n]{0,12}(?:아기|애기|아이|자식)|아이를\s*(?:가졌|가진|가지게))/u;
+
+export function isPregnancyMemoryReference(text: string) {
+  return PREGNANCY_MEMORY_REFERENCE.test(String(text || ""));
+}
+
 const SEMANTIC_SEARCH_GROUPS: Array<{ pattern: RegExp; tokens: string[] }> = [
+  {
+    // Retrieve the original confirmation even when later dialogue says
+    // conception or "the baby in her womb" instead of repeating "pregnant".
+    pattern: PREGNANCY_MEMORY_REFERENCE,
+    tokens: ["임신", "잉태", "회임", "태중", "태아", "뱃속", "배 속", "아이를 가졌", "아이를 가진"],
+  },
   {
     // Korean prompts are frequently written without spaces (for example,
     // "순찰조들이랑인사"). Match meaningful stems inside those compounds so
@@ -509,7 +521,7 @@ export function rankMemoryRetrievalCandidates<T extends MemoryRetrievalCandidate
         return candidate.primaryMatches >= Math.max(1, bestPrimaryMatches - 1)
           && text.split(/(?<=[.!?。！？])\s*|\n+/u).some((sentence) =>
             focusNames.some((name) => sentence.includes(name))
-            && /(?:사망|사살|숨졌|죽었|목숨을\s*잃|실종|행방불명|부활|되살아|원수|증오|절교|배신|결별|이혼|결혼|화해|약속|맹세|계약|구조|구출)/u.test(sentence)
+            && /(?:사망|사살|숨졌|죽었|목숨을\s*잃|실종|행방불명|부활|되살아|원수|증오|절교|배신|결별|이혼|결혼|화해|약속|맹세|계약|구조|구출|임신|잉태|회임|출산|유산)/u.test(sentence)
           );
       }).sort((a, b) => a.startTurn - b.startTurn || a.endTurn - b.endTurn)[0]
     : undefined;

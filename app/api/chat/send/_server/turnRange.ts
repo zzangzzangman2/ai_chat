@@ -2,6 +2,19 @@
 // A "turn" here means one assistant response (completed). The slice includes
 // user+assistant messages around those turns.
 
+/** Give source evidence the same turn numbers as summaries, including retries
+ * whose user inputs did not receive a completed assistant response. */
+export function withAssistantTurnNumbers<T extends { role?: unknown }>(messages: T[]) {
+  const firstUser = messages.findIndex((message) => message.role === "user");
+  let completed = 0;
+  return messages.map((message, index) => {
+    const turnNo = firstUser < 0 || index < firstUser ? 0 : completed + 1;
+    if (firstUser >= 0 && index > firstUser &&
+        (message.role === "assistant" || message.role === "model")) completed += 1;
+    return { ...message, turnNo };
+  });
+}
+
 export function selectMessagesForAssistantTurnRange(msgs: any[], startTurn: number, endTurn: number) {
   const st = Math.max(1, Math.floor(startTurn));
   const ed = Math.max(st, Math.floor(endTurn));

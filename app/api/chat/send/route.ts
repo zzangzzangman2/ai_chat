@@ -52,6 +52,11 @@ import {
   buildDurableCharacterCanonBlock,
   guardGeneratedDurableCharacterState,
 } from "@/lib/durable_character_state";
+import {
+  derivePersistentCharacterConditions,
+  buildPersistentCharacterConditionsBlock,
+  guardGeneratedPersistentCharacterConditions,
+} from "@/lib/persistent_character_conditions";
 import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import {
   formatRelationshipCanonGuardBlock,
@@ -113,6 +118,7 @@ import {
 import {
   selectMessagesForAssistantTurnRange,
   selectMessagesForAssistantTurnRangeCapped,
+  withAssistantTurnNumbers,
 } from "./_server/turnRange";
 import { computeSendOutputBudget, strlen } from "./_server/charBudget";
 import { distribute } from "./_server/distribute";
@@ -2047,12 +2053,18 @@ ${body}`.trim();
       { name: personaNameFinal, aliases: "" },
       ...continuityLedgerIdentities,
     ];
+    const sourceStateMessages = withAssistantTurnNumbers(all);
     const durableCharacterCanon = deriveDurableCharacterCanon({
-      messages: all,
+      messages: sourceStateMessages,
       identities: durableStateIdentities,
       personaName: personaNameFinal,
     });
     const durableCharacterCanonBlock = buildDurableCharacterCanonBlock(durableCharacterCanon);
+    const persistentCharacterConditions = derivePersistentCharacterConditions({
+      messages: sourceStateMessages,
+      identities: durableStateIdentities,
+    });
+    const persistentCharacterConditionsBlock = buildPersistentCharacterConditionsBlock(persistentCharacterConditions);
     const continuityLedger = buildContinuityLedgerBlock({
       historySummary,
       identities: continuityLedgerIdentities,
@@ -2432,7 +2444,12 @@ ${body}`.trim();
         identities: durableStateIdentities,
         personaName: personaNameFinal,
       });
-      return { ...vital, text: durable.text, removed: vital.removed + durable.removed };
+      const conditions = guardGeneratedPersistentCharacterConditions({
+        text: durable.text,
+        canon: persistentCharacterConditions,
+        identities: durableStateIdentities,
+      });
+      return { ...vital, text: conditions.text, removed: vital.removed + durable.removed + conditions.removed };
     };
     const sanitizeRelationshipClaims = (text: unknown, contextText: unknown = "") =>
       removeUnsupportedRelationshipClaims({
@@ -2670,6 +2687,9 @@ ${body}`.trim();
       continuityStateCount: continuityLedger.states.length,
       durableLifeStateCount: durableCharacterCanon.lifeStates.length,
       durableRelationshipCount: durableCharacterCanon.relationships.length,
+      persistentPregnancyStates: persistentCharacterConditions.pregnancies.map((state) => ({
+        name: state.name, status: state.status, turnNo: state.turnNo,
+      })),
       continuityPromptStateCount: continuityLedger.promptStates.length,
       continuityChars: strlen(continuityLedger.block),
       continuityIdentityCount: continuityLedgerIdentities.length,
@@ -3414,6 +3434,7 @@ const systemRaw = (cacheFriendlyLayout
       vitalStatusPriorityBlock,
       relationshipCanonGuardBlock,
       durableCharacterCanonBlock,
+      persistentCharacterConditionsBlock,
       activeInterlocutorPriorityBlock,
       physicalFactOwnershipBlock,
       addressDirectionPriorityBlock,
@@ -3477,6 +3498,7 @@ const systemRaw = (cacheFriendlyLayout
 	          vitalStatusPriorityBlock,
 	          relationshipCanonGuardBlock,
 	          durableCharacterCanonBlock,
+	          persistentCharacterConditionsBlock,
 	          currentOocPriorityBlock ? `` : "",
 	          currentOocPriorityBlock
 	            ? sanitizePromptCached(currentOocPriorityBlock)
@@ -3508,6 +3530,8 @@ const systemRaw = (cacheFriendlyLayout
 	          ``,
 	          continuityPriorityBlock,
 	          continuityPriorityBlock ? `` : "",
+	          durableCharacterCanonBlock,
+	          persistentCharacterConditionsBlock,
 	          // 상태창만 출력하도록 강제
 	          `지금부터는 '2단계 메타/상태'만 작성한다.`,
 	          `출력은 반드시 하나의 fenced 코드블록으로만 구성한다.`,

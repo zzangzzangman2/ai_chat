@@ -1,5 +1,5 @@
 import { findMentionedCharacterIds, type CharacterNameIdentity } from "../../../../../lib/character_mentions";
-import { memorySearchTokens, rankMemoryRetrievalCandidates } from "./memorySelection";
+import { isPregnancyMemoryReference, memorySearchTokens, rankMemoryRetrievalCandidates } from "./memorySelection";
 import { extractSummarySections } from "./summaryStored";
 
 const RECALL = /(?:기억|회상|회고|예전|이전에|지난번|아까|그때|당시|처음에|전에는|했었|했던|했잖|했거든|했거덩|했지|없었|안\s*했|일어났|겪었|무슨\s*일|\d+\s*턴)/u;
@@ -33,7 +33,10 @@ export function buildMemoryRecallQuery(params: {
   const current = String(params.userText || "").trim();
   const ids = findMentionedCharacterIds(params.identities, current);
   let anchorText = "";
-  let requested = isRecall(current) && !TOPIC_CHANGE.test(current);
+  // A named pregnancy reference needs its source confirmation during ordinary
+  // scene continuation too. It remains historical evidence, not a new status.
+  let requested = (isRecall(current) && !TOPIC_CHANGE.test(current))
+    || (ids.size > 0 && isPregnancyMemoryReference(current));
   if (!TOPIC_CHANGE.test(current) && current.length <= 240 && (requested || isFollowUp(current))) {
     for (const previous of params.previousUserTexts.slice(0, 4)) {
       if (TOPIC_CHANGE.test(previous)) break;

@@ -34,6 +34,14 @@ const FAMILY_RELATIONS = new Set([
   "자매", "형제", "형제자매", "배우자",
 ]);
 
+// A family noun used as an object is not the subject's identity:
+// "A는 B의 아이를 임신했다" does not mean "A is B's child".
+// Apply the same boundary to generated claims and user evidence, so neither
+// path turns pregnancy, childbirth, or care of a child into a false parent edge.
+const FAMILY_IDENTITY_TAIL =
+  "(?!\\s*(?:를|을|에게|한테|의|와|과|랑|하고|이랑|처럼|보다|임신|출산|피임|잉태|수태|낳|유산))" +
+  "(?=$|[^가-힣]|이(?:다|라|었|고|며|면|지|죠|니|겠|든|오|자)|입|였|인|가\\s*(?:되|맞|아니))";
+
 const CHILD_TERMS = new Set(["딸", "아들", "자녀", "아이", "애", "아기", "애기"]);
 const PARENT_TERMS = new Set(["아버지", "아빠", "어머니", "엄마", "부모"]);
 const SIBLING_TERMS = new Set([
@@ -292,12 +300,12 @@ function trustedUserPairClaim(
     if (/[?？]|(?:아니|아니다|아닌|아니라고|착각|오해|거짓|가짜|인\s*척)/u.test(text)) return false;
     const directPatterns = [
       new RegExp(`${ownerPattern}(?:이|가)?(?:의)?\\s*(?:${relationPattern})(?:은|는|이|가|인)?\\s*${targetPattern}`, "u"),
-      new RegExp(`${targetPattern}(?:은|는|이|가)?[^.!?。！？\\n]{0,30}${ownerPattern}(?:이|가)?(?:의)?\\s*(?:${relationPattern})`, "u"),
+      new RegExp(`${targetPattern}(?:은|는|이|가)?[^.!?。！？\\n]{0,30}${ownerPattern}(?:이|가)?(?:의)?\\s*(?:${relationPattern})${FAMILY_IDENTITY_TAIL}`, "u"),
       new RegExp(`${ownerPattern}(?:은|는|이|가)?[^.!?。！？\\n]{0,30}${targetPattern}(?:을|를)\\s*(?:자기|자신|본인)?(?:의)?\\s*(?:${relationPattern})(?:로|라고|이다|야|다)`, "u"),
     ];
     if (inversePattern) {
       directPatterns.push(
-        new RegExp(`${ownerPattern}(?:은|는|이|가)?[^.!?。！？\\n]{0,30}${targetPattern}(?:이|가)?(?:의)?\\s*(?:${inversePattern})`, "u")
+        new RegExp(`${ownerPattern}(?:은|는|이|가)?[^.!?。！？\\n]{0,30}${targetPattern}(?:이|가)?(?:의)?\\s*(?:${inversePattern})${FAMILY_IDENTITY_TAIL}`, "u")
       );
     }
     return directPatterns.some((pattern) => pattern.test(text));
@@ -386,7 +394,7 @@ function explicitClaims(
   const found: Array<{ owner: string; target: string; relation: string }> = [];
   const patterns = [
     {
-      regex: new RegExp(`(${names})(?:은|는|이|가)\\s*(${names})(?:의)?\\s*(${term})(?:이|가|였|인|이다|입니다|라고|라는|로)?`, "gu"),
+      regex: new RegExp(`(${names})(?:은|는|이|가)\\s*(${names})(?:의)?\\s*(${term})${FAMILY_IDENTITY_TAIL}`, "gu"),
       map: (m: RegExpMatchArray) => ({ owner: resolve(m[2]), target: resolve(m[1]), relation: normalizeFamilyTerm(m[3]) }),
     },
     {
