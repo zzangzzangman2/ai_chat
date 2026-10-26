@@ -29,7 +29,7 @@ const promptInitializers=new Map();
 function visit(node){
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='sanitizeVitalStatus')initializer=node.initializer.getText(ast);
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='memoryRepairPending')repairInitializer=node.initializer.getText(ast);
-  if(ts.isVariableDeclaration(node)&&['cumulativeMemory','historySummaryForPromptRaw','memoryBlock','systemRaw','systemWithIdentityCanon','system','systemForContinuationRaw','systemForStatus'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
+  if(ts.isVariableDeclaration(node)&&['cumulativeMemory','historySummaryForPromptRaw','memoryBlock','systemRaw','systemWithIdentityCanon','system','systemForContinuationRaw','systemForStatus','sceneViewpointPriorityBlock','worldDirectorBlock','oneShotLengthContract'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
   ts.forEachChild(node,visit);
 }
 visit(ast);
@@ -98,6 +98,33 @@ test('anti-recap guidance follows canon once in both main layouts and continuati
     }
   }
 });
+test('both generation and continuation keep scene viewpoint after memory without removing it',()=>{
+  const scope=evaluatePrompt('sceneViewpointPriorityBlock',{});
+  assert.match(scope,/CURRENT SCENE VIEWPOINT/);
+  assert.match(scope,/옆방·문밖·먼 곳/);
+  assert.match(scope,/전화·무전/);
+  assert.match(scope,/명시적으로 다른 장소/);
+  const system=evaluatePrompt('system',{systemWithIdentityCanon:'[FULL_HISTORY]',durableCharacterCanonBlock:'[REMOTE_CANON]',sceneViewpointPriorityBlock:scope});
+  for(const lightweight of [false,true]){
+    const continuation=evaluatePrompt('systemForContinuationRaw',{system,memoryBlock:'[FULL_HISTORY]',durableCharacterCanonBlock:'[REMOTE_CANON]',sceneViewpointPriorityBlock:scope,scenePresencePriorityBlock:'[LOCAL_CAST]',isGemini3ProFamilyModel:()=>lightweight});
+    for(const output of [system,continuation]){
+      assert.equal(output.split('CURRENT SCENE VIEWPOINT').length-1,1);
+      assert.ok(output.includes('[FULL_HISTORY]'));
+      assert.ok(output.indexOf(scope)>output.indexOf('[REMOTE_CANON]'));
+    }
+    if(lightweight)assert.ok(continuation.includes('[LOCAL_CAST]'));
+  }
+  assert.match(evaluatePrompt('oneShotLengthContract',{}),/옆방·먼 곳 인물의 대화·속마음·상태 재방송으로 길이를 늘리지 않는다/);
+});
+
+test('a two-person scene suppresses automatic world intervention without losing explicit requests',()=>{
+  const director=load(path.join(root,'app/api/chat/send/_server/worldDirector.ts'));
+  const messages=Array.from({length:6},()=>({role:'assistant',content:'*지아는 같은 방에서 고개를 들었다.*'}));
+  const fixtures={all:messages,activeCharacterFocus:{locked:false},currentScenePresence:[{characterName:'지아'}],continuityIdentities:[{name:'지아'}],cid:'private-chat',userText:'계속 이야기해.',buildWorldDirectorBlock:director.buildWorldDirectorBlock};
+  for(let userTurnCount=3;userTurnCount<15;userTurnCount++)assert.equal(evaluatePrompt('worldDirectorBlock',{...fixtures,userTurnCount}),'');
+  assert.match(evaluatePrompt('worldDirectorBlock',{...fixtures,userTurnCount:5,userText:'새로운 인물이 등장하게 해줘'}),/CURRENT WORLD ACTIVITY DIRECTIVE/);
+});
+
 test('send sanitizer preserves historical life while blocking resurrection after 500 turns',()=>{
   const messages=timeline('박도훈은 칼에 찔려 죽었다.');
   messages.push({id:'bad-summary-source',role:'assistant',content:'박도훈은 살아서 돌아왔다.'});

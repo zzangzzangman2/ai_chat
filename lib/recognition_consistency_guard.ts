@@ -255,6 +255,62 @@ function passageShowsActivePresence(passage: string, names: string[]) {
   return false;
 }
 
+// These are relative locations outside the current viewpoint, not remembered
+// residences. A voice through a door is not physical co-presence.
+const OFF_SCENE_LOCATION = /(?:옆\s*방|다른\s*방|건넛\s*방|건너편\s*방|문\s*밖|현장\s*밖|멀리\s*떨어진\s*[가-힣]+|먼\s*(?:곳|마을|도시))/gu;
+const PERCEPTION_BRIDGE = /(?:소리|목소리|기척|울음|비명|전언|연락|메시지|전화|무전)|(?:들려|들리|들었|들으|듣고|전해)/u;
+
+function sceneNarrationOnly(value: string) {
+  // Speech can mention someone elsewhere or describe a plan. Neither establishes
+  // that person's location. Preserve paragraph boundaries for narrated evidence.
+  return value.replace(/["“][\s\S]*?["”]/gu, (speech) => speech.replace(/[^\n]/gu, " "));
+}
+
+function offSceneSubjects(passage: string, identities: ScenePresenceIdentity[], viewpointLocation: string) {
+  const subjects: { name: string; start: number; end: number }[] = [];
+  for (const identity of identities) {
+    for (const name of usableEntityNames([identity.name, ...(identity.aliases || [])])) {
+      const pattern = new RegExp(`${escapeRegex(name)}(?:은|는|이|가|도|와|과|(?=\\s*[,，]))`, "giu");
+      for (const match of passage.matchAll(pattern)) {
+        subjects.push({ name: normalized(identity.name), start: match.index!, end: match.index! + match[0].length });
+      }
+    }
+  }
+  subjects.sort((a, b) => a.start - b.start || b.end - a.end);
+  const locations = [...passage.matchAll(OFF_SCENE_LOCATION)].filter(
+    (match) => normalized(match[0]).replace(/\s/g, "") !== viewpointLocation
+  );
+  const result = new Set<string>();
+  for (const subject of subjects) {
+    const nextSubject = subjects.find((other) => other.start > subject.start);
+    for (const location of locations) {
+      const start = location.index!;
+      // A local listener after "문밖에서 들려오는 소리에" stays local. A named
+      // object ("설영을 타이르며") is not a second speaker outside the door.
+      if (start < subject.start) {
+        const between = passage.slice(start + location[0].length, subject.start);
+        if (!PERCEPTION_BRIDGE.test(between)) result.add(subject.name);
+      } else if (start >= subject.end && start < (nextSubject?.start ?? passage.length)) {
+        const clause = passage.slice(subject.end, nextSubject?.start);
+        if (!PERCEPTION_BRIDGE.test(clause)) result.add(subject.name);
+      }
+    }
+  }
+  return result;
+}
+
+function requestedSceneLocation(passage: string, identities: ScenePresenceIdentity[]) {
+  if (/(?:가지|들어가지|이동하지|보여\s*주지|전환하지|바꾸지|쓰지|넣지|다루지)\s*(?:마|말|않)/u.test(passage)) return "";
+  const location = [...passage.matchAll(OFF_SCENE_LOCATION)][0];
+  if (!location) return "";
+  if (/시점\s*(?:을|으로|은|:)|장면\s*전환/u.test(passage)) return location[0];
+  // Moving an NPC elsewhere is not a camera/user move to that NPC's room.
+  if (!/가서|이동(?:한다|했다|하자)|들어가(?:서|자)/u.test(passage)) return "";
+  const prefix = passage.slice(0, location.index);
+  if (identities.some((identity) => passageMentionsName(prefix, usableEntityNames([identity.name, ...(identity.aliases || [])])))) return "";
+  return location[0];
+}
+
 /**
  * Reconstructs only high-confidence transient scene presence from recent raw
  * turns. This deliberately does not use residence or long-memory locations:
@@ -280,22 +336,45 @@ export function deriveCurrentScenePresence(args: {
     : 14;
   const recent = (args.messages || []).slice(-maxMessages);
   const states = new Map<string, ScenePresenceFact>();
+  const outside = new Set<string>();
+  const userPlacedHere = new Set<string>();
   let latestUserText = "";
+  let viewpointLocation = "";
 
   recent.forEach((message, messageIndex) => {
     const story = stripFencedBlocks(message?.content || "");
     if (!story.trim()) return;
     const isUserMessage = normalized(message?.role) === "user";
     if (isUserMessage) latestUserText = story;
+    let remoteViewpoint = false;
 
-    for (const passage of splitStoryPassages(story)) {
-      if (SCENE_RESET_PATTERN.test(passage)) states.clear();
+    for (const passage of splitStoryPassages(sceneNarrationOnly(story))) {
+      const requestedLocation = isUserMessage
+        ? requestedSceneLocation(passage, args.identities)
+        : "";
+      const returnsToOriginal = isUserMessage && /원래\s*(?:방|장소|현장).{0,12}돌아/u.test(passage);
+      if (SCENE_RESET_PATTERN.test(passage) || requestedLocation || returnsToOriginal) {
+        states.clear();
+        outside.clear();
+        userPlacedHere.clear();
+        viewpointLocation = normalized(requestedLocation).replace(/\s/g, "");
+        remoteViewpoint = false;
+      }
+      const remoteSubjects = offSceneSubjects(passage, args.identities, viewpointLocation);
+      if (remoteSubjects.size) remoteViewpoint = true;
+      else if (PERCEPTION_BRIDGE.test(passage) && [...passage.matchAll(OFF_SCENE_LOCATION)].length) remoteViewpoint = false;
+      else if ([...states.values()].some((fact) =>
+        usableEntityNames([fact.characterName, ...fact.characterAliases]).some((name) =>
+          new RegExp(`${escapeRegex(name)}(?:은|는|이|가)`, "iu").test(passage)
+        )
+      )) remoteViewpoint = false;
       for (const identity of identities) {
         const names = usableEntityNames([
           identity.characterName,
           ...identity.characterAliases,
         ]);
         if (!passageMentionsName(passage, names)) continue;
+        const key = normalized(identity.characterName);
 
         // Exit wins when a compact sentence contains both movement directions;
         // a later passage in the same turn can still establish a true re-entry.
@@ -307,15 +386,38 @@ export function deriveCurrentScenePresence(args: {
             isUserMessage ||
             currentTurnAllowsExit(latestUserText, names)
           ) {
-            states.delete(normalized(identity.characterName));
+            states.delete(key);
+            outside.add(key);
+            userPlacedHere.delete(key);
           }
           continue;
         }
 
         const entered = Boolean(findNamedEntryCue(passage, names));
-        if (!entered && !passageShowsActivePresence(passage, names)) continue;
+        const entersFromOutside = entered && /(?:옆\s*방|문\s*밖)에서[^.!?。！？\n]{0,60}(?:이\s*방|방\s*안|안으로|현재\s*현장|곁으로)/u.test(passage);
+        if (remoteSubjects.has(key) && !entersFromOutside) {
+          // Explicit user placement wins over a later model cutaway. Otherwise
+          // a static location outside the door corrects earlier ambiguous prose.
+          if (isUserMessage || !userPlacedHere.has(key)) {
+            states.delete(key);
+            outside.add(key);
+            userPlacedHere.delete(key);
+          }
+          continue;
+        }
 
-        states.set(normalized(identity.characterName), {
+        if (!entered && !passageShowsActivePresence(passage, names)) continue;
+        if (remoteViewpoint && !states.has(key) && !entered && !isUserMessage) {
+          outside.add(key);
+          continue;
+        }
+        // Later dialogue/action in the same cutaway cannot silently bring an
+        // off-scene person back. A real entry or new user placement can.
+        if (outside.has(key) && !entered && !isUserMessage) continue;
+        outside.delete(key);
+        if (isUserMessage) userPlacedHere.add(key);
+
+        states.set(key, {
           characterName: identity.characterName,
           characterAliases: identity.characterAliases,
           evidence: compactEvidence(passage),

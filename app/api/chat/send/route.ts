@@ -3207,13 +3207,13 @@ const recentExpressionAvoidanceBlock = buildRecentExpressionAvoidanceBlock(tail)
 const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
   ? ""
   : buildWorldDirectorBlock({
-      messages: tail,
+      messages: all,
       currentUserText: userText,
       authorConstraintText: [presetBlock, noteBlock].join("\n"),
       registeredNames: continuityIdentities.map((identity) => String(identity?.name || "")),
       chatId: cid,
       userTurnCount,
-      focusedConversation: activeCharacterFocus.locked,
+      focusedConversation: activeCharacterFocus.locked || currentScenePresence.length === 1,
     });
 
 // (2026-07) 캐시 친화 배치: Vertex implicit cache는 "앞에서부터 바이트 동일한 프리픽스"만
@@ -3287,7 +3287,7 @@ const systemRaw = (cacheFriendlyLayout
           `# [CURRENT USER NARRATION — COMPLETED SCENE FACT]`,
           `- 최신 사용자 입력의 *...* 구간은 현재 턴에 이미 일어난 관찰 가능한 사건·행동·장면 변화다.`,
           `- 이를 시도, 상상, 오해, 실패, 취소된 행동으로 바꾸거나 NPC가 선제적으로 막았다고 재작성하지 않는다.`,
-          `- 완료된 행동 자체는 존중하되, 그 행동만으로 진행 중인 감시·경호·추적·구금·입원·담당 상태가 자동 해제되지는 않는다. 연속성 장부에 남은 담당자의 관찰·발각·후속 반응을 함께 반영한다.`,
+          `- 완료된 행동 자체는 존중하되, 그 행동만으로 진행 중인 감시·경호·추적·구금·입원·담당 상태가 자동 해제되지는 않는다. 담당자의 반응은 실제 관찰·전달 근거가 있고 현재 시점에서 접할 수 있는 범위에만 반영한다. 담당 상태만으로 현장 밖 담당자의 시점·대사를 삽입하지 않는다.`,
           `- 사용자 지문을 반복하지 말고 그 직후의 NPC 반응과 실제 결과부터 이어간다.`,
           `- 지문 밖의 일반 문장은 주인공 대사다. 지문만으로 고정된 이름·혈연·과거 정사를 바꾸지 않으며, 그런 변경은 OOC/설정/정정 표식을 따른다.`,
         ].join("\n")
@@ -3356,6 +3356,15 @@ const systemRaw = (cacheFriendlyLayout
       `- 현재 현장 인물을 새로 들어오거나, 끌려오거나, 나타나거나, 도착한 사람처럼 다시 연출하지 않는다. 이미 한 자기소개도 반복시키지 않는다.`,
       `- 현장 안에서 자리 이동·표정·대사·반응을 이어가는 것은 허용한다. 재입장은 최근 원문에 실제 퇴장 후 사용자가 귀환을 명시한 경우에만 허용한다.`,
       `- 응답을 내기 직전에 (1) 현재 인물을 임의로 내보냈는지, (2) 제외 인물을 임의로 들였는지, (3) 사용자가 지칭한 인물을 다른 인물로 바꿨는지 검사한다. 하나라도 맞으면 해당 전개를 폐기하고 현재 구성 그대로 다시 쓴다.`,
+    ].join("\n");
+    const sceneViewpointPriorityBlock = [
+      `# [CURRENT SCENE VIEWPOINT — MEMORY IS NOT A SPEAKING ROSTER]`,
+      `- 본문은 사용자가 현재 참여하는 현장의 시점을 유지한다. 옆방·문밖·먼 곳에 있는 인물들의 사적인 대화, 속마음, 독립 행동을 중간 문단이나 마무리 장면으로 끼워 넣지 않는다.`,
+      `- 장기기억·전체 요약·관계 장부·활성 로어에 이름이 있거나 최근 답변에서 언급됐다는 것은 현장 참석 또는 발언권의 근거가 아니다. focus=true도 기억 검색 표시일 뿐이다.`,
+      `- 현장 밖 인물의 위치·관계·상태는 기억에 보존하되 본문에서 매번 확인하지 않는다. 이전 AI 답변이 옆방 인물에게 별도 대사를 줬더라도 그 실수를 이번 턴의 장면 구성으로 이어받지 않는다.`,
+      `- 사용자가 명시적으로 다른 장소의 장면·시점을 요청하면 그 범위에서 전환한다. 전화·무전·문 너머 소리처럼 실제 전달된 정보는 현장 인물이 듣고 보는 범위까지만 짧게 쓴다. 전달되지 않은 원격 대화나 내면까지 중계하지 않는다.`,
+      `- 사용자가 정한 독대·둘만 남은 장면은 유지한다. 분량·대사 비율을 채우려고 다른 장소의 인물을 발화시키거나 외부 사건을 새로 만들지 않는다.`,
+      `- 출력 전 각 대사·행동 문단의 주체가 현재 현장에 있는지 확인한다. 현장 밖이면 사용자가 요청한 시점 전환 또는 실제 전달 경로가 있는 부분만 남긴다.`,
     ].join("\n");
     const epistemicPriorityBlock = epistemicFirewall.facts.length
       ? [
@@ -3437,6 +3446,7 @@ const systemRaw = (cacheFriendlyLayout
       // State constraints must not turn into a compulsory recap in every reply.
       // Keep this delivery rule after canon, while preserving explicit OOC priority.
       sanitizePromptCached(recentExpressionAvoidanceBlock),
+      sceneViewpointPriorityBlock,
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -3497,7 +3507,9 @@ const systemRaw = (cacheFriendlyLayout
 	          relationshipCanonGuardBlock,
 	          durableCharacterCanonBlock,
 	          persistentCharacterConditionsBlock,
+	          scenePresencePriorityBlock,
 	          sanitizePromptCached(recentExpressionAvoidanceBlock),
+	          sceneViewpointPriorityBlock,
 	          currentOocPriorityBlock ? `` : "",
 	          currentOocPriorityBlock
 	            ? sanitizePromptCached(currentOocPriorityBlock)
@@ -3720,6 +3732,7 @@ const systemRaw = (cacheFriendlyLayout
       `[이번 턴 완료 조건]`,
       `- 첫 호출에서 약 ${targetChars}자(최소 약 ${oneShotBodyFloorChars}자)의 완결된 서사 본문을 작성한다. 문장·대사·지문을 중간에 끊지 않는다.`,
       `- 주인공의 다음 행동이나 대사를 대신 쓰지 않고, 현재 NPC 반응과 장면만 전개한다.`,
+      `- 목표 분량은 현재 현장의 의미 있는 반응·대사로 채운다. 옆방·먼 곳 인물의 대화·속마음·상태 재방송으로 길이를 늘리지 않는다.`,
       `- 현재 입력이 둘 다·각자·모두·너네·너희처럼 복수 NPC에게 답변을 요구하면, 대상 전원의 관찰 가능한 반응과 대답을 본문에서 모두 끝낸 뒤에만 상태창으로 넘어간다. 한 명만 답하고 종료하지 않는다.`,
       `- 메타/상태창이 필요하면 완결된 본문 뒤에 전체 fenced 코드블록을 한 번만 붙이고 닫는다.`,
     ].join("\n");

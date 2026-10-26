@@ -49,7 +49,21 @@ const TOKEN_STOPWORDS = new Set([
 const EXPLICIT_WORLD_REQUEST_RE =
   /(?:새(?:로운)?\s*(?:인물|캐릭터|사람|NPC)|처음\s*보는\s*사람).{0,24}(?:등장|추가|투입|나오|만나)|(?:누군가|새\s*손님|새\s*학생|새\s*동료).{0,16}(?:오게|찾아오|등장)/i;
 const SCENE_LOCK_RE =
-  /(?:새(?:로운)?\s*(?:인물|캐릭터|사람|NPC)|제3자).{0,28}(?:등장\s*금지|추가\s*금지|등장하지|추가하지|나오지|오지\s*마)|(?:아무도|누구도|제3자는?).{0,20}(?:오지\s*마|들어오지\s*마|등장하지\s*마|방해하지\s*마)|(?:단둘이|둘만의|혼자만의).{0,20}(?:유지|계속)|(?:외부와|바깥과).{0,12}(?:완전히\s*)?차단/i;
+  /(?:새(?:로운)?\s*(?:인물|캐릭터|사람|NPC)|제3자).{0,28}(?:등장\s*금지|추가\s*금지|등장하지|추가하지|나오지|오지\s*마)|(?:아무도|누구도|제3자는?).{0,20}(?:오지\s*마|들어오지\s*마|등장하지\s*마|방해하지\s*마)|(?:단둘이|둘만의|혼자만의).{0,20}(?:유지|계속)|(?:단둘이|둘만|둘뿐).{0,20}(?:있|남|대화|이야기|지내|보내)|독대\s*(?:중|한다|하자)|(?:외부와|바깥과).{0,12}(?:완전히\s*)?차단/i;
+const USER_SCENE_CHANGE_RE = /장면\s*전환|다음\s*날|장소를\s*(?:옮기|이동)|새로운\s*장소|(?:독대|고립).{0,12}(?:끝|해제)|(?:단둘이|둘만|둘뿐).{0,8}(?:아니|아닌)/u;
+
+function hasUserSceneLock(input: WorldDirectorInput) {
+  let locked = false;
+  // An assistant cutaway cannot unlock a private scene; a later nameless user
+  // reply must retain the last explicit scene instruction.
+  for (const message of [...(input.messages || []), { role: "user", content: input.currentUserText }]) {
+    if (String(message.role || "").toLowerCase() !== "user") continue;
+    const text = stripFencedBlocks(message.content);
+    if (USER_SCENE_CHANGE_RE.test(text) || EXPLICIT_WORLD_REQUEST_RE.test(text)) locked = false;
+    if (SCENE_LOCK_RE.test(text) && !/(?:단둘이|둘만|둘뿐).{0,8}(?:아니|아닌)/u.test(text)) locked = true;
+  }
+  return locked;
+}
 
 function stripFencedBlocks(raw: unknown) {
   return String(raw || "").replace(/```[\s\S]*?```/g, " ");
@@ -157,7 +171,7 @@ export function assessWorldActivity(input: WorldDirectorInput): WorldActivityAss
   const authorConstraintText = String(input.authorConstraintText || "")
     .replace(/\s+/g, " ")
     .trim();
-  const sceneLocked = SCENE_LOCK_RE.test(`${authorConstraintText}\n${currentUserText}`);
+  const sceneLocked = SCENE_LOCK_RE.test(authorConstraintText) || hasUserSceneLock(input);
   const explicitRequest = EXPLICIT_WORLD_REQUEST_RE.test(currentUserText);
   const focusedConversation = Boolean(input.focusedConversation);
   const scheduled = scheduledDirectorTurn(
@@ -206,6 +220,7 @@ export function buildWorldDirectorBlock(input: WorldDirectorInput) {
     "- 신규 NPC는 2~4글자 한글 실명, 장면에 온 구체적 이유, 현재 인물들과 다른 독립 목적·태도, 첫 행동 또는 직접 대사를 가진다. 이름은 첫 등장 답변에서 자연스럽게 2회 이상 명시해 후속 기억 등록이 가능하게 한다.",
     "- 신규·재등장 인물은 기존 인물의 감정과 대사를 복제하는 구경꾼이 아니라, 선택지·정보·갈등·도움 중 최소 하나를 실제로 바꾸어야 한다.",
     "- 한 답변에 새로 직접 등장하는 인물은 최대 1명이다. 현재 핵심 인물의 장면을 빼앗거나 여러 인물을 한꺼번에 쏟아내지 않는다.",
+    "- 세계 활성화는 원격 시점 전환 지시가 아니다. 현재 현장에서 실제로 접하는 변화만 쓰며, 옆방·먼 곳 인물들의 사적인 대화나 속마음을 별도 문단으로 끼워 넣지 않는다.",
     "- 문이 잠겼거나 고립된 장소라면 순간이동시키지 않는다. 접근 과정과 물리적 원인을 먼저 보여주고, 직접 진입이 불가능하면 외부 접촉까지만 진행한다.",
     "- 사용자의 최신 행동을 대신 결정하지 않으며, OOC·제작자 설정·사용자가 명시한 독대/고립 조건과 충돌하면 그 조건을 우선한다.",
   ].join("\n");

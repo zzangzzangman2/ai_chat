@@ -51,4 +51,13 @@ assert.equal(
   }).shouldActivate,
   true
 );
+const privateScene = [{ role: "user", content: "*지아와 단둘이 방에 남아 이야기를 나눈다.*" }, ...messages];
+const privateInput = { messages: privateScene, currentUserText: "계속 말해봐.", chatId: "focus-test", userTurnCount: scheduledTurn };
+assert.equal(assessWorldActivity(privateInput).sceneLocked, true);
+assert.equal(assessWorldActivity(privateInput).shouldActivate, false);
+assert.equal(assessWorldActivity({ ...privateInput, messages: [...privateScene, { role: "assistant", content: "*장면 전환. 새 인물이 나타났다.*" }] }).sceneLocked, true);
+assert.equal(assessWorldActivity({ ...privateInput, currentUserText: "새로운 인물이 등장하게 해줘" }).shouldActivate, true);
+assert.equal(assessWorldActivity({ ...privateInput, currentUserText: "*다음 날. 장소를 옮겨 마을로 이동한다.*" }).sceneLocked, false);
+assert.equal(assessWorldActivity({ ...privateInput, currentUserText: "이제 단둘이 있는 것이 아니야." }).sceneLocked, false);
+assert.equal(assessWorldActivity({ ...privateInput, authorConstraintText: "제3자는 등장하지 마.", currentUserText: "새로운 인물이 등장하게 해줘" }).sceneLocked, true);
 console.log("worldDirector tests passed");
