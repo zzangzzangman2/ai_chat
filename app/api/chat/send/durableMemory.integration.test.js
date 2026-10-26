@@ -68,6 +68,36 @@ function evaluatePrompt(name,values){
   const js=ts.transpileModule(`const result=${expression.getText(ast)};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
   return Function(...names,js+'\nreturn result;')(...names.map(key=>fixtures[key]??''));
 }
+
+test('anti-recap guidance follows canon once in both main layouts and continuation paths',()=>{
+  for(const cacheFriendlyLayout of [true,false]){
+    const recentExpressionAvoidanceBlock='[ANTI_RECAP]';
+    const raw=evaluatePrompt('systemRaw',{
+      cacheFriendlyLayout,memoryBlock:'[FULL_MEMORY]',dynamicCharacterContext:{block:''},recentExpressionAvoidanceBlock,
+    });
+    const identity=evaluatePrompt('systemWithIdentityCanon',{
+      systemBase:raw,canonicalCharacterFactsBlock:'[BODY_CANON]',
+    });
+    const system=evaluatePrompt('system',{
+      systemWithIdentityCanon:identity,continuityPriorityBlock:'[ACTIVE_STATES]',
+      physicalFactOwnershipBlock:'[BODY_OWNERSHIP]',recentExpressionAvoidanceBlock,currentOocPriorityBlock:'[CURRENT_OOC]',
+    });
+    for(const lightweight of [true,false]){
+      const prompt=evaluatePrompt('systemForContinuationRaw',{
+        system,memoryBlock:'[FULL_MEMORY]',canonicalCharacterFactsBlock:'[BODY_CANON]',
+        continuityPriorityBlock:'[ACTIVE_STATES]',recentExpressionAvoidanceBlock,currentOocPriorityBlock:'[CURRENT_OOC]',
+        isGemini3ProFamilyModel:()=>lightweight,
+      });
+      for(const output of [system,prompt]){
+        assert.equal(output.split('[ANTI_RECAP]').length-1,1);
+        assert.ok(output.includes('[FULL_MEMORY]'));
+        assert.ok(output.indexOf('[ANTI_RECAP]')>output.indexOf('[BODY_CANON]'));
+        assert.ok(output.indexOf('[ANTI_RECAP]')>output.indexOf('[ACTIVE_STATES]'));
+        assert.ok(output.indexOf('[CURRENT_OOC]')>output.indexOf('[ANTI_RECAP]'));
+      }
+    }
+  }
+});
 test('send sanitizer preserves historical life while blocking resurrection after 500 turns',()=>{
   const messages=timeline('박도훈은 칼에 찔려 죽었다.');
   messages.push({id:'bad-summary-source',role:'assistant',content:'박도훈은 살아서 돌아왔다.'});

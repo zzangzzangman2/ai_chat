@@ -348,7 +348,9 @@ export function formatCanonicalCharacterFactsBlock(params: {
     "- 아래 수치·직업·외형·정체·거주지를 뜻이 바뀌는 동의어로 바꾸지 말고, 모순되는 묘사를 새로 만들지 않는다.",
     "- 특히 AI가 반복해서 쓴 키·체중·체형·외모는 사용자 확정 없이 정본이 되지 않는다.",
     "- 관계·나이·직업·신체·거주지가 실제로 변한 경우에만 최신 사용자의 명시적 서술/OOC로 갱신한다.",
+    "- 아래 정본은 모순 방지를 위한 참고 자료다. 키·체중·나이 같은 고정 정보를 이름 앞 수식어로 매번 붙이지 않는다. 사용자가 묻거나 현재 행동에 수치가 직접 필요한 경우에만 서술한다.",
   ];
+  const guidanceRowCount = rows.length;
   if (persona.name) {
     const personaParts: string[] = [];
     if (persona.age > 0) personaParts.push(`나이 ${persona.age}세`);
@@ -373,7 +375,7 @@ export function formatCanonicalCharacterFactsBlock(params: {
         `(근거: ${fact.sourceRole === "user" ? "사용자 확정" : "검증된 이전 서술"}, ${fact.turnNo}턴)`
     );
   }
-  return rows.length > 5 ? rows.join("\n") : "";
+  return rows.length > guidanceRowCount ? rows.join("\n") : "";
 }
 
 function taggedUserText(sourceText: string) {

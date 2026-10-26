@@ -2747,6 +2747,7 @@ ${body}`.trim();
     const memoryBlock = [
       `# (2) 통합 장기기억(최근 원문 ${keepUserTurns}턴 + 전체 누적 요약 + 관련 원문 근거)`,
       `- 전체 누적 요약은 검색 성공 여부와 무관하게 매번 참고한다. 처음·중간·최근의 사건 흐름을 함께 유지한다.`,
+      `- 전체 기억을 참고하되 이미 전달한 사건·명단을 매 응답에서 재요약하지 않는다. 현재 행동에 직접 필요한 사실·상태 변화·사용자가 요청한 과거사만 본문에 드러낸다.`,
       `- 사용자가 과거 사건/인물/약속을 물으면 누적 요약과 원문 근거를 확인한다. 관련 검색 결과만 보고 다른 과거 사건을 없던 일로 단정하지 않는다.`,
       `- 구간 정보가 충돌하면 명시적인 정정·상태 변화의 근거와 턴 순서를 확인한다. 뒤늦은 질문이나 근거 없는 부정만으로 이전에 확인된 사건을 지우지 않는다.`,
       `- 요약·관계표·검색 결과의 누락은 사건이 없었다는 증거가 아니다. 근거가 충분하지 않으면 발생 여부를 미확인으로 남기며, 단정적인 부정이나 긍정으로 메우지 않는다.`,
@@ -3242,8 +3243,6 @@ const systemRaw = (cacheFriendlyLayout
           ? sanitizePromptCached(dynamicCharacterContext.block)
           : "",
         dynamicCharacterContext.block ? `` : "",
-        recentExpressionAvoidanceBlock ? `` : "",
-        recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
         worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
       ]
@@ -3266,8 +3265,6 @@ const systemRaw = (cacheFriendlyLayout
           ? sanitizePromptCached(dynamicCharacterContext.block)
           : "",
         dynamicCharacterContext.block ? `` : "",
-        recentExpressionAvoidanceBlock ? `` : "",
-        recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
         worldDirectorBlock ? `` : "",
         worldDirectorBlock ? sanitizePromptCached(worldDirectorBlock) : "",
       ]).join("\n");
@@ -3437,6 +3434,9 @@ const systemRaw = (cacheFriendlyLayout
       physicalFactOwnershipBlock,
       addressDirectionPriorityBlock,
       statusContinuityPriorityBlock,
+      // State constraints must not turn into a compulsory recap in every reply.
+      // Keep this delivery rule after canon, while preserving explicit OOC priority.
+      sanitizePromptCached(recentExpressionAvoidanceBlock),
       currentOocPriorityBlock,
     ]
       .filter(Boolean)
@@ -3472,8 +3472,6 @@ const systemRaw = (cacheFriendlyLayout
 	          sanitizePromptCached(relationshipConsistencyBlock),
 	          addressDirectionPriorityBlock ? `` : "",
 	          addressDirectionPriorityBlock ? sanitizePromptCached(addressDirectionPriorityBlock) : "",
-	          recentExpressionAvoidanceBlock ? `` : "",
-	          recentExpressionAvoidanceBlock ? sanitizePromptCached(recentExpressionAvoidanceBlock) : "",
 	          identityCanonBlock ? `` : "",
 	          identityCanonBlock ? sanitizePromptCached(identityCanonBlock) : "",
 	          canonicalCharacterFactsBlock ? `` : "",
@@ -3499,6 +3497,7 @@ const systemRaw = (cacheFriendlyLayout
 	          relationshipCanonGuardBlock,
 	          durableCharacterCanonBlock,
 	          persistentCharacterConditionsBlock,
+	          sanitizePromptCached(recentExpressionAvoidanceBlock),
 	          currentOocPriorityBlock ? `` : "",
 	          currentOocPriorityBlock
 	            ? sanitizePromptCached(currentOocPriorityBlock)
