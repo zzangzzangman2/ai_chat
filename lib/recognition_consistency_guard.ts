@@ -259,6 +259,20 @@ function passageShowsActivePresence(passage: string, names: string[]) {
 // residences. A voice through a door is not physical co-presence.
 const OFF_SCENE_LOCATION = /(?:옆\s*방|다른\s*방|건넛\s*방|건너편\s*방|문\s*밖|현장\s*밖|멀리\s*떨어진\s*[가-힣]+|먼\s*(?:곳|마을|도시))/gu;
 const PERCEPTION_BRIDGE = /(?:소리|목소리|기척|울음|비명|전언|연락|메시지|전화|무전)|(?:들려|들리|들었|들으|듣고|전해)/u;
+const ROOM_LOCATION = /^(?:안방|침실|서재|거실|회의실|객실|병실|방)$/u;
+const OUTSIDE_ROOM_LOCATION = /(?:툇마루|마당|담장|복도|문(?:짝)?[^.!?。！？\n]{0,16}(?:사이|너머|건너))/gu;
+const LOCAL_ROOM_ANCHOR = /(?:방\s*안|실내|책상|탁자|침대|창가|내\s*곁)(?:에서|에|으로|의|옆|\s)/u;
+
+function userSceneMove(text: string, identities: ScenePresenceIdentity[]) {
+  if (/(?:가지|들어가지|이동하지|옮기지)\s*(?:마|말|않)|(?:가면|들어가면)\s*안/u.test(text)) return "";
+  const move = /(?:안방|침실|서재|거실|회의실|객실|병실|옆방|다른\s*방|마당|광장|식당|방)(?:으로|로)\s*(?:가자|가서|가겠|이동하|이동했|들어가|들어갔|옮겨)/u.exec(text);
+  if (!move) return "";
+  const prefix = text.slice(0, move.index);
+  if (identities.some((identity) => usableEntityNames([identity.name, ...(identity.aliases || [])]).some(
+    (name) => new RegExp(`${escapeRegex(name)}(?:은|는|이|가)[^.!?。！？]*$`, "iu").test(prefix)
+  ))) return "";
+  return move[0].split(/(?:으로|로)/u)[0].replace(/\s/g, "");
+}
 
 function sceneNarrationOnly(value: string) {
   // Speech can mention someone elsewhere or describe a plan. Neither establishes
@@ -277,7 +291,10 @@ function offSceneSubjects(passage: string, identities: ScenePresenceIdentity[], 
     }
   }
   subjects.sort((a, b) => a.start - b.start || b.end - a.end);
-  const locations = [...passage.matchAll(OFF_SCENE_LOCATION)].filter(
+  const locations = [
+    ...passage.matchAll(OFF_SCENE_LOCATION),
+    ...(ROOM_LOCATION.test(viewpointLocation) ? passage.matchAll(OUTSIDE_ROOM_LOCATION) : []),
+  ].filter(
     (match) => normalized(match[0]).replace(/\s/g, "") !== viewpointLocation
   );
   const result = new Set<string>();
@@ -289,7 +306,8 @@ function offSceneSubjects(passage: string, identities: ScenePresenceIdentity[], 
       // object ("설영을 타이르며") is not a second speaker outside the door.
       if (start < subject.start) {
         const between = passage.slice(start + location[0].length, subject.start);
-        if (!PERCEPTION_BRIDGE.test(between)) result.add(subject.name);
+        if (!PERCEPTION_BRIDGE.test(between) &&
+            !(ROOM_LOCATION.test(viewpointLocation) && (LOCAL_ROOM_ANCHOR.test(between) || between.includes(viewpointLocation)))) result.add(subject.name);
       } else if (start >= subject.end && start < (nextSubject?.start ?? passage.length)) {
         const clause = passage.slice(subject.end, nextSubject?.start);
         if (!PERCEPTION_BRIDGE.test(clause)) result.add(subject.name);
@@ -317,29 +335,52 @@ function requestedSceneLocation(passage: string, identities: ScenePresenceIdenti
  * present/absent is a short-lived scene fact and must be cleared by an exit or
  * an explicit time/location cut.
  */
-export function deriveCurrentScenePresence(args: {
+export function deriveCurrentSceneState(args: {
   messages: ScenePresenceMessage[];
   identities: ScenePresenceIdentity[];
   maxMessages?: number;
-}): ScenePresenceFact[] {
+}): { present: ScenePresenceFact[]; offScene: ScenePresenceFact[]; location: string } {
   const identities = args.identities
     .map((identity) => ({
       characterName: String(identity.name || "").trim(),
       characterAliases: usableEntityNames(identity.aliases || []),
     }))
     .filter((identity) => normalized(identity.characterName).length >= 2);
-  if (!identities.length) return [];
-
   const requestedMax = Number(args.maxMessages || 14);
   const maxMessages = Number.isFinite(requestedMax)
     ? Math.max(2, Math.floor(requestedMax))
     : 14;
-  const recent = (args.messages || []).slice(-maxMessages);
+  const messages = args.messages || [];
+  let lastMove = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (normalized(messages[index]?.role) === "user" &&
+        userSceneMove(sceneNarrationOnly(stripFencedBlocks(messages[index]?.content)), args.identities)) {
+      lastMove = index;
+      break;
+    }
+  }
+  // Keep the current room's boundary even after it scrolls out of the recent
+  // prompt window. An unnamed follow-up cannot bring the previous room along.
+  const recent = messages.slice(lastMove >= 0 ? lastMove : -maxMessages);
   const states = new Map<string, ScenePresenceFact>();
-  const outside = new Set<string>();
+  const outside = new Map<string, ScenePresenceFact>();
   const userPlacedHere = new Set<string>();
   let latestUserText = "";
   let viewpointLocation = "";
+  if (lastMove > 0) {
+    const previous = deriveCurrentSceneState({
+      ...args,
+      messages: messages.slice(Math.max(0, lastMove - maxMessages), lastMove),
+    });
+    const moveText = sceneNarrationOnly(stripFencedBlocks(messages[lastMove].content));
+    const destination = userSceneMove(moveText, args.identities);
+    const bringsGroup = /(?:모두|다\s*같이|다들|전부).{0,24}(?:가자|이동|들어가)/u.test(moveText);
+    for (const fact of [...previous.offScene, ...previous.present]) {
+      const invited = bringsGroup || usableEntityNames([fact.characterName, ...fact.characterAliases])
+        .some((name) => new RegExp(`${escapeRegex(name)}(?:와|과|랑|이랑|아|야)`, "iu").test(moveText));
+      if (!invited && !fact.evidence.includes(destination)) outside.set(normalized(fact.characterName), fact);
+    }
+  }
 
   recent.forEach((message, messageIndex) => {
     const story = stripFencedBlocks(message?.content || "");
@@ -350,18 +391,19 @@ export function deriveCurrentScenePresence(args: {
 
     for (const passage of splitStoryPassages(sceneNarrationOnly(story))) {
       const requestedLocation = isUserMessage
-        ? requestedSceneLocation(passage, args.identities)
+        ? userSceneMove(passage, args.identities) || requestedSceneLocation(passage, args.identities)
         : "";
       const returnsToOriginal = isUserMessage && /원래\s*(?:방|장소|현장).{0,12}돌아/u.test(passage);
       if (SCENE_RESET_PATTERN.test(passage) || requestedLocation || returnsToOriginal) {
         states.clear();
-        outside.clear();
+        if (!(lastMove >= 0 && messageIndex === 0 && requestedLocation)) outside.clear();
         userPlacedHere.clear();
         viewpointLocation = normalized(requestedLocation).replace(/\s/g, "");
         remoteViewpoint = false;
       }
       const remoteSubjects = offSceneSubjects(passage, args.identities, viewpointLocation);
       if (remoteSubjects.size) remoteViewpoint = true;
+      else if (ROOM_LOCATION.test(viewpointLocation) && (LOCAL_ROOM_ANCHOR.test(passage) || passage.includes(viewpointLocation))) remoteViewpoint = false;
       else if (PERCEPTION_BRIDGE.test(passage) && [...passage.matchAll(OFF_SCENE_LOCATION)].length) remoteViewpoint = false;
       else if ([...states.values()].some((fact) =>
         usableEntityNames([fact.characterName, ...fact.characterAliases]).some((name) =>
@@ -375,6 +417,12 @@ export function deriveCurrentScenePresence(args: {
         ]);
         if (!passageMentionsName(passage, names)) continue;
         const key = normalized(identity.characterName);
+        const fact = {
+          characterName: identity.characterName,
+          characterAliases: identity.characterAliases,
+          evidence: compactEvidence(passage),
+          messageIndex,
+        };
 
         // Exit wins when a compact sentence contains both movement directions;
         // a later passage in the same turn can still establish a true re-entry.
@@ -387,20 +435,23 @@ export function deriveCurrentScenePresence(args: {
             currentTurnAllowsExit(latestUserText, names)
           ) {
             states.delete(key);
-            outside.add(key);
+            outside.set(key, fact);
             userPlacedHere.delete(key);
           }
           continue;
         }
 
         const entered = Boolean(findNamedEntryCue(passage, names));
-        const entersFromOutside = entered && /(?:옆\s*방|문\s*밖)에서[^.!?。！？\n]{0,60}(?:이\s*방|방\s*안|안으로|현재\s*현장|곁으로)/u.test(passage);
+        const entersFromOutside = entered && (
+          /(?:옆\s*방|문\s*밖|툇마루|마당|복도)에서[^.!?。！？\n]{0,60}(?:이\s*방|방\s*안|안으로|현재\s*현장|곁으로)/u.test(passage) ||
+          Boolean(viewpointLocation && new RegExp(`(?:옆\\s*방|문\\s*밖|툇마루|마당|복도)에서[^.!?。！？\\n]{0,60}${escapeRegex(viewpointLocation)}(?:으로|로)`, "u").test(passage))
+        );
         if (remoteSubjects.has(key) && !entersFromOutside) {
           // Explicit user placement wins over a later model cutaway. Otherwise
           // a static location outside the door corrects earlier ambiguous prose.
           if (isUserMessage || !userPlacedHere.has(key)) {
             states.delete(key);
-            outside.add(key);
+            outside.set(key, fact);
             userPlacedHere.delete(key);
           }
           continue;
@@ -408,7 +459,7 @@ export function deriveCurrentScenePresence(args: {
 
         if (!entered && !passageShowsActivePresence(passage, names)) continue;
         if (remoteViewpoint && !states.has(key) && !entered && !isUserMessage) {
-          outside.add(key);
+          outside.set(key, fact);
           continue;
         }
         // Later dialogue/action in the same cutaway cannot silently bring an
@@ -417,17 +468,20 @@ export function deriveCurrentScenePresence(args: {
         outside.delete(key);
         if (isUserMessage) userPlacedHere.add(key);
 
-        states.set(key, {
-          characterName: identity.characterName,
-          characterAliases: identity.characterAliases,
-          evidence: compactEvidence(passage),
-          messageIndex,
-        });
+        states.set(key, fact);
       }
     }
   });
 
-  return [...states.values()];
+  return { present: [...states.values()], offScene: [...outside.values()], location: viewpointLocation };
+}
+
+export function deriveCurrentScenePresence(args: {
+  messages: ScenePresenceMessage[];
+  identities: ScenePresenceIdentity[];
+  maxMessages?: number;
+}): ScenePresenceFact[] {
+  return deriveCurrentSceneState(args).present;
 }
 
 function findNamedIncapacitationCue(passage: string, names: string[]) {

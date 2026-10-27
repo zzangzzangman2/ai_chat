@@ -65,7 +65,7 @@ import {
 import { createGuardedTextStream } from "@/lib/guarded_text_stream";
 import {
   deriveCurrentSceneExclusions,
-  deriveCurrentScenePresence,
+  deriveCurrentSceneState,
   findRecognitionContradiction,
   findScenePresenceContradiction,
   removeRecognitionContradictionPassages,
@@ -89,6 +89,7 @@ import {
 } from "@/lib/physical_fact_consistency_guard";
 import { buildSpatialCanon } from "@/lib/spatial_canon";
 import { resolveActiveCharacterFocus } from "@/lib/active_character_focus";
+import { removeUnrequestedOffSceneSpeech } from "@/lib/scene_speech_scope";
 import {
   normalizeNovelParagraphMarkers,
   repairUnbalancedNovelBodyMarkers,
@@ -2555,8 +2556,8 @@ ${body}`.trim();
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
     // the current scene until a recent exit or explicit scene cut removes them.
-    let currentScenePresence = deriveCurrentScenePresence({
-      messages: tail.map((message: any) => ({
+    const currentSceneState = deriveCurrentSceneState({
+      messages: all.map((message: any) => ({
         role: String(message?.role || ""),
         content: String(message?.content || ""),
       })),
@@ -2568,6 +2569,7 @@ ${body}`.trim();
         })),
       maxMessages: 14,
     });
+    let currentScenePresence = currentSceneState.present;
     const currentSceneExclusions = deriveCurrentSceneExclusions({
       messages: [
         ...tail.map((message: any) => ({
@@ -2711,6 +2713,8 @@ ${body}`.trim();
         name: item.characterName,
         evidence: item.evidence,
       })),
+      currentSceneLocation: currentSceneState.location,
+      offSceneCharacters: currentSceneState.offScene.map((item) => item.characterName),
       manualCharacterFallbackChars: strlen(manualCharacterRosterFallback),
       fullLongMemory: true,
       fullLongMemoryMode: "cumulative",
@@ -3213,7 +3217,7 @@ const worldDirectorBlock = currentOocInstruction || hasCurrentUserNarration
       registeredNames: continuityIdentities.map((identity) => String(identity?.name || "")),
       chatId: cid,
       userTurnCount,
-      focusedConversation: activeCharacterFocus.locked || currentScenePresence.length === 1,
+      focusedConversation: activeCharacterFocus.locked || currentScenePresence.length === 1 || /^(?:안방|침실)$/u.test(currentSceneState.location),
     });
 
 // (2026-07) 캐시 친화 배치: Vertex implicit cache는 "앞에서부터 바이트 동일한 프리픽스"만
@@ -3359,11 +3363,15 @@ const systemRaw = (cacheFriendlyLayout
     ].join("\n");
     const sceneViewpointPriorityBlock = [
       `# [CURRENT SCENE VIEWPOINT — MEMORY IS NOT A SPEAKING ROSTER]`,
+      ...(currentSceneState.location ? [`- 사용자가 마지막으로 이동을 지시한 현재 장소: ${currentSceneState.location}. 이전 장소의 인원 명단을 새 장소로 자동 이월하지 않는다.`] : []),
+      ...(currentSceneState.offScene.length ? [`- 현장 밖 인물(발언 대상 아님): ${currentSceneState.offScene.map((item) => item.characterName).join(", ")}. 상태와 기억은 보존하고 이번 본문에 확인 문단을 붙이지 않는다.`] : []),
       `- 본문은 사용자가 현재 참여하는 현장의 시점을 유지한다. 옆방·문밖·먼 곳에 있는 인물들의 사적인 대화, 속마음, 독립 행동을 중간 문단이나 마무리 장면으로 끼워 넣지 않는다.`,
       `- 장기기억·전체 요약·관계 장부·활성 로어에 이름이 있거나 최근 답변에서 언급됐다는 것은 현장 참석 또는 발언권의 근거가 아니다. focus=true도 기억 검색 표시일 뿐이다.`,
       `- 현장 밖 인물의 위치·관계·상태는 기억에 보존하되 본문에서 매번 확인하지 않는다. 이전 AI 답변이 옆방 인물에게 별도 대사를 줬더라도 그 실수를 이번 턴의 장면 구성으로 이어받지 않는다.`,
       `- 사용자가 명시적으로 다른 장소의 장면·시점을 요청하면 그 범위에서 전환한다. 전화·무전·문 너머 소리처럼 실제 전달된 정보는 현장 인물이 듣고 보는 범위까지만 짧게 쓴다. 전달되지 않은 원격 대화나 내면까지 중계하지 않는다.`,
       `- 사용자가 정한 독대·둘만 남은 장면은 유지한다. 분량·대사 비율을 채우려고 다른 장소의 인물을 발화시키거나 외부 사건을 새로 만들지 않는다.`,
+      `- 현장에 남아 있는 배경 인물도 매번 말할 의무가 없다. 현재 직접 대화 상대가 자기 반응과 대사를 담당한다. 옆에서 훈수·재촉·응원·대리 설명을 덧붙이는 합창식 반응을 만들지 않는다.`,
+      `- 문 너머로 들릴 수 있다는 가능성만으로 새 대사·참견·전화·고함을 만들지 않는다. 사용자가 실제로 연락·질문·호출하거나 이미 진행 중인 구체적 사건이 현재 행동에 직접 영향을 주는 경우만 짧게 반영한다.`,
       `- 출력 전 각 대사·행동 문단의 주체가 현재 현장에 있는지 확인한다. 현장 밖이면 사용자가 요청한 시점 전환 또는 실제 전달 경로가 있는 부분만 남긴다.`,
     ].join("\n");
     const epistemicPriorityBlock = epistemicFirewall.facts.length
@@ -3946,6 +3954,28 @@ const systemRaw = (cacheFriendlyLayout
       return { text, usage };
     };
 
+    const sanitizeScenePresence = (text: string, contextText = "") => {
+      const presence = removeScenePresenceContradictionPassages({
+        text,
+        currentUserText: userText,
+        presentCharacters: currentScenePresence,
+        excludedCharacters: currentSceneExclusions,
+      });
+      const speech = removeUnrequestedOffSceneSpeech({
+        text: presence.text,
+        contextText,
+        offSceneCharacters: currentSceneState.offScene,
+        currentUserText: userText,
+        allowExternalContact: Boolean(worldDirectorBlock || currentOocInstruction),
+      });
+      return {
+        ...presence,
+        text: speech.text,
+        removed: presence.removed + speech.removed,
+        kinds: [...presence.kinds, ...(speech.removed ? ["off_scene_speech"] : [])],
+      };
+    };
+
     const enforceScenePresenceConsistency = async (args: {
       text: string;
       usage: any;
@@ -4148,12 +4178,7 @@ let cancelStreamWork: (() => void) | null = null;
           );
           streamRelationshipContext = `${streamRelationshipContext}\n${text}`.slice(-1200);
           const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
-          const scenePresence = removeScenePresenceContradictionPassages({
-            text: physicalOwnership.text,
-            currentUserText: userText,
-            presentCharacters: currentScenePresence,
-            excludedCharacters: currentSceneExclusions,
-          });
+          const scenePresence = sanitizeScenePresence(physicalOwnership.text, streamCommunicationContext);
           const communication = sanitizeCommunicationAbilities(
             scenePresence.text,
             streamCommunicationContext
@@ -4172,7 +4197,7 @@ let cancelStreamWork: (() => void) | null = null;
           streamCommunicationRewritten += communication.rewritten;
           streamAddressDirectionReplacements += addressDirection.replaced;
           return addressDirection.text;
-        });
+        }, { paragraphs: true });
         const safeEnqueue = (obj: any) => {
           if (obj?.type !== "delta" || typeof obj?.text !== "string") {
             return enqueueWire(obj);
@@ -4739,7 +4764,9 @@ if (!TRANSPORT_STREAMING) {
             assistantText = finalRelationshipClaims.text;
             postGenerationTextChanged = true;
           }
-          if (shortContinue.replaced || postGenerationTextChanged) {
+          // Buffered/done-only generation never traverses the live delta gate.
+          // Always validate its full draft before replacement and persistence.
+          if (usedBufferedTransport || shortContinue.replaced || postGenerationTextChanged) {
             const epistemic = sanitizeGeneratedFacts(factGuardRecoverySource);
             const authorityClaims = sanitizeAuthorityClaims(epistemic.text);
             const legalStatus = removeUnsupportedLegalStatusClaims({
@@ -4751,12 +4778,7 @@ if (!TRANSPORT_STREAMING) {
             const vitalStatus = sanitizeVitalStatus(legalStatus.text, true);
             const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
             const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
-            const scenePresence = removeScenePresenceContradictionPassages({
-              text: physicalOwnership.text,
-              currentUserText: userText,
-              presentCharacters: currentScenePresence,
-              excludedCharacters: currentSceneExclusions,
-            });
+            const scenePresence = sanitizeScenePresence(physicalOwnership.text);
             const communication = sanitizeCommunicationAbilities(scenePresence.text);
             streamEpistemicRedactions += epistemic.redactedSegments;
             streamAuthorityClaimRedactions += authorityClaims.removed;
@@ -4771,7 +4793,12 @@ if (!TRANSPORT_STREAMING) {
             assistantText = communication.text;
           }
           if (!assistantText.trim()) {
-            const recovered = recoverAfterOverfilter(factGuardRecoverySource).trim();
+            const recovered = removeUnrequestedOffSceneSpeech({
+              text: recoverAfterOverfilter(factGuardRecoverySource),
+              offSceneCharacters: currentSceneState.offScene,
+              currentUserText: userText,
+              allowExternalContact: Boolean(worldDirectorBlock || currentOocInstruction),
+            }).text.trim();
             if (recovered) {
               // Epistemic/legal guards have passed. Only the transient scene
               // presence guard over-filtered the draft, so preserve the scene
@@ -6150,12 +6177,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     const physicalOwnershipOutputChecked = sanitizePhysicalOwnership(
       relationshipClaimOutputChecked.text
     );
-    const scenePresenceOutputChecked = removeScenePresenceContradictionPassages({
-      text: physicalOwnershipOutputChecked.text,
-      currentUserText: userText,
-      presentCharacters: currentScenePresence,
-      excludedCharacters: currentSceneExclusions,
-    });
+    const scenePresenceOutputChecked = sanitizeScenePresence(physicalOwnershipOutputChecked.text);
     const communicationOutputChecked = sanitizeCommunicationAbilities(
       scenePresenceOutputChecked.text
     );

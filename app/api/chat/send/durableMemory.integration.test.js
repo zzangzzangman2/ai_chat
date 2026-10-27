@@ -25,10 +25,20 @@ const route=fs.readFileSync(path.join(root,'app/api/chat/send/route.ts'),'utf8')
 const ast=ts.createSourceFile('route.ts',route,ts.ScriptTarget.Latest,true);
 let initializer;
 let repairInitializer;
+let bufferedGuardSource;
 const promptInitializers=new Map();
 function visit(node){
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='sanitizeVitalStatus')initializer=node.initializer.getText(ast);
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='memoryRepairPending')repairInitializer=node.initializer.getText(ast);
+  if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='sanitizeScenePresence')promptInitializers.set(node.name.getText(ast),node.initializer);
+  if(ts.isBlock(node)){
+    const start=node.statements.findIndex(statement=>ts.isVariableStatement(statement)&&statement.declarationList.declarations.some(d=>d.name.getText(ast)==='factGuardRecoverySource'));
+    const end=node.statements.findIndex((statement,index)=>index>start&&ts.isIfStatement(statement)&&statement.expression.getText(ast)==='!assistantText.trim()'&&statement.getText(ast).includes('recoverAfterOverfilter'));
+    if(start>=0&&end>start){
+      const source=node.statements.slice(start,end+1).map(s=>s.getText(ast)).join('\n');
+      if(source.includes('guardedTextStream.finish()'))bufferedGuardSource=source;
+    }
+  }
   if(ts.isVariableDeclaration(node)&&['cumulativeMemory','historySummaryForPromptRaw','memoryBlock','systemRaw','systemWithIdentityCanon','system','systemForContinuationRaw','systemForStatus','sceneViewpointPriorityBlock','worldDirectorBlock','oneShotLengthContract'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
   ts.forEachChild(node,visit);
 }
@@ -64,7 +74,7 @@ function evaluatePrompt(name,values){
   }
   collect(expression);
   const names=[...dependencies];
-  const fixtures={Boolean,String,sanitizePromptCached:value=>value,spatialCanon:{block:''},opts:{},settings:{},...values};
+  const fixtures={Boolean,String,sanitizePromptCached:value=>value,spatialCanon:{block:''},currentSceneState:{location:'',offScene:[]},opts:{},settings:{},...values};
   const js=ts.transpileModule(`const result=${expression.getText(ast)};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
   return Function(...names,js+'\nreturn result;')(...names.map(key=>fixtures[key]??''));
 }
@@ -123,6 +133,71 @@ test('a two-person scene suppresses automatic world intervention without losing 
   const fixtures={all:messages,activeCharacterFocus:{locked:false},currentScenePresence:[{characterName:'지아'}],continuityIdentities:[{name:'지아'}],cid:'private-chat',userText:'계속 이야기해.',buildWorldDirectorBlock:director.buildWorldDirectorBlock};
   for(let userTurnCount=3;userTurnCount<15;userTurnCount++)assert.equal(evaluatePrompt('worldDirectorBlock',{...fixtures,userTurnCount}),'');
   assert.match(evaluatePrompt('worldDirectorBlock',{...fixtures,userTurnCount:5,userText:'새로운 인물이 등장하게 해줘'}),/CURRENT WORLD ACTIVITY DIRECTIVE/);
+});
+
+test('production scene sanitizer blocks a bystander before streaming and in the final saved text',()=>{
+  const recognition=load(path.join(root,'lib/recognition_consistency_guard.ts'));
+  const speech=load(path.join(root,'lib/scene_speech_scope.ts'));
+  const stream=load(path.join(root,'lib/guarded_text_stream.ts'));
+  const scene=recognition.deriveCurrentSceneState({identities:[{name:'지아'},{name:'민서'}],messages:[
+    {role:'assistant',content:'*민서는 마당에 서 있었다.*'},
+    {role:'user',content:'서재로가자'},
+    {role:'assistant',content:'*지아는 책상에 앉아 있었다.*'},
+  ]});
+  const sanitize=evaluatePrompt('sanitizeScenePresence',{
+    removeScenePresenceContradictionPassages:recognition.removeScenePresenceContradictionPassages,
+    removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,
+    currentScenePresence:scene.present,currentSceneExclusions:[],currentSceneState:scene,userText:'계속 읽어줘.',
+  });
+  const raw='*지아는 문서를 펼쳤다.*\n\n"첫 항목부터 읽을게요."\n\n*민서는 문밖에서 말을 보탰다.*\n\n"어서 승인해 주세요!"\n\n*지아는 다음 항목을 짚었다.*\n\n"날짜도 확인해요."\n\n```INFO\n장소: 서재\n```';
+  const result=sanitize(raw);
+  assert.equal(result.removed,2);
+  assert.ok(result.kinds.includes('off_scene_speech'));
+  let context='';
+  const gate=stream.createGuardedTextStream(text=>{
+    const filtered=sanitize(text,context);
+    context=(context+'\n'+text).slice(-1600);
+    return filtered.text;
+  },{paragraphs:true});
+  let emitted='';
+  for(const ch of raw)emitted+=gate.push(ch);
+  emitted+=gate.finish();
+  assert.equal(emitted.trim(),result.text.trim());
+  assert.doesNotMatch(emitted,/민서|어서 승인/);
+  assert.match(emitted,/첫 항목부터/);
+  assert.match(emitted,/날짜도 확인/);
+});
+
+test('unchanged done-only drafts run the production final guard despite having no live deltas',()=>{
+  assert.ok(bufferedGuardSource);
+  const speech=load(path.join(root,'lib/scene_speech_scope.ts'));
+  const raw='*지아는 책을 펼쳤다.*\n\n"함께 읽어요."\n\n*민서는 문밖에서 외쳤다.*\n\n"어서 읽으세요!"';
+  let fullGuardCalls=0;
+  const pass=text=>({text,removed:0,rewritten:0,qualified:0,redactedSegments:0});
+  const offScene=[{characterName:'민서'}];
+  const fixtures={
+    Boolean,assistantText:raw,usedBufferedTransport:true,shortContinue:{replaced:false},postGenerationTextChanged:false,
+    guardedTextStream:{finish:()=>'',output:()=>''},enqueueWire:()=>{},
+    sanitizeGeneratedFacts:pass,sanitizeAuthorityClaims:pass,sanitizeVitalStatus:pass,
+    sanitizeRelationshipClaims:pass,sanitizePhysicalOwnership:pass,sanitizeCommunicationAbilities:pass,
+    removeUnsupportedLegalStatusClaims:({text})=>pass(text),
+    sanitizeScenePresence:text=>{fullGuardCalls++;return speech.removeUnrequestedOffSceneSpeech({text,offSceneCharacters:offScene});},
+    recoverAfterOverfilter:text=>text,removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,
+    currentSceneState:{offScene},userText:'계속 읽어줘.',worldDirectorBlock:'',currentOocInstruction:'',
+  };
+  const expression=ts.createSourceFile('guard.ts',`const run=()=>{${bufferedGuardSource}\nreturn assistantText;};`,ts.ScriptTarget.Latest,true);
+  const dependencies=new Set();
+  function collect(node){
+    if(ts.isIdentifier(node)&&!(ts.isPropertyAccessExpression(node.parent)&&node.parent.name===node))dependencies.add(node.text);
+    ts.forEachChild(node,collect);
+  }
+  collect(expression);
+  const names=[...dependencies].filter(name=>name!=='run');
+  const js=ts.transpileModule(expression.text,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  const result=Function(...names,js+'\nreturn run();')(...names.map(name=>fixtures[name]??0));
+  assert.equal(fullGuardCalls,1,'buffered response must enter the full final guard, not the overfilter recovery');
+  assert.match(result,/함께 읽어요/);
+  assert.doesNotMatch(result,/민서|어서 읽으세요/);
 });
 
 test('send sanitizer preserves historical life while blocking resurrection after 500 turns',()=>{

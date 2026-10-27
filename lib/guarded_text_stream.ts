@@ -4,7 +4,7 @@ export type GuardedTextStream = {
   output: () => string;
 };
 
-function completePrefixLength(source: string) {
+function completePrefixLength(source: string, paragraphs: boolean) {
   let inFence = false;
   let lastSafe = 0;
 
@@ -17,6 +17,14 @@ function completePrefixLength(source: string) {
     if (inFence) continue;
 
     const ch = source[i];
+    if (paragraphs) {
+      const boundary = /^\r?\n[\t ]*\r?\n+/u.exec(source.slice(i));
+      if (boundary) {
+        lastSafe = i + boundary[0].length;
+        i = lastSafe - 1;
+      }
+      continue;
+    }
     if (ch === "\n") {
       lastSafe = i + 1;
       continue;
@@ -40,7 +48,8 @@ function completePrefixLength(source: string) {
  * ordinary text and all of its whitespace remain byte-for-byte unchanged.
  */
 export function createGuardedTextStream(
-  sanitize: (text: string) => string
+  sanitize: (text: string) => string,
+  options: { paragraphs?: boolean } = {}
 ): GuardedTextStream {
   let pending = "";
   let emitted = "";
@@ -65,7 +74,7 @@ export function createGuardedTextStream(
 
   const flush = (all: boolean) => {
     if (!pending) return "";
-    const length = all ? pending.length : completePrefixLength(pending);
+    const length = all ? pending.length : completePrefixLength(pending, Boolean(options.paragraphs));
     if (length <= 0) return "";
     const raw = pending.slice(0, length);
     pending = pending.slice(length);
