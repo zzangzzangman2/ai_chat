@@ -325,6 +325,14 @@ function neutralFamilyReference(rawTerm: unknown) {
   return CHILD_TERMS.has(normalizeFamilyTerm(rawTerm)) ? "그 아이" : "그 사람";
 }
 
+function isEverydaySiblingReference(term: string, modifier: string, following: string) {
+  if (!SIBLING_TERMS.has(term) || /^(?:친|양)$/u.test(modifier)) return false;
+  // Calling/referencing someone as 언니/오빠/동생 is also ordinary social
+  // address. It does not assert a blood relationship. Explicit identity
+  // predicates ("내 동생이다") still go through the family-canon check.
+  return !/^\s*(?:이(?:다|야|라|었|고|며|면|지|죠|니|겠|든|오|자)|입|였|인(?:\s|$)|가\s*(?:되|맞|아니))/u.test(following);
+}
+
 function repairNameReferenceArtifacts(
   text: string,
   variants: Array<{ value: string; canonical: string }>
@@ -415,8 +423,8 @@ function explicitClaims(
 /**
  * Removes explicit family assertions between already-known characters when
  * the relationship is absent from user/manual/identity canon. Ambiguous
- * possessive dialogue such as "우리 애" is rewritten to the referenced name,
- * preventing an affectionate phrase from becoming a new parent-child edge.
+ * child/spouse claims are neutralized without guessing a nearby person's
+ * name. Everyday sibling address is not itself a claim of blood kinship.
  */
 export function removeUnsupportedRelationshipClaims(input: {
   text: unknown;
@@ -437,9 +445,27 @@ export function removeUnsupportedRelationshipClaims(input: {
   const inferenceSource = contextText ? `${contextText}\n${source}` : source;
   const inferenceOffset = inferenceSource.length - source.length;
 
-  const possessive = /(?:우리|저희|내|제)\s*(?:(?:첫째|둘째|셋째|막내|친|양)\s*)?(딸|아들|자녀|아이|애|아기|애기|아버지|아빠|어머니|엄마|부모|할아버지|할머니|조부모|손녀|손자|손자녀|언니|누나|오빠|형|동생|여동생|남동생|자매|형제|형제자매|배우자|남편|아내)/gu;
-  let rewrittenText = source.replace(possessive, (matched, rawTerm: string, offset: number) => {
+  // Match complete words, not the suffix of 막내/이제 or the prefix of
+  // 형편/아이디어. Longest family terms must win before their shorter forms.
+  const familyTerms = [
+    "딸", "아들", "자녀", "아이", "애", "아기", "애기", "아버지", "아빠", "어머니", "엄마", "부모",
+    "할아버지", "할머니", "조부모", "손녀", "손자", "손자녀", ...SIBLING_TERMS, "배우자", "남편", "아내",
+  ].sort((a, b) => b.length - a.length).join("|");
+  const wordEnd = "(?=$|[^\\p{L}\\p{N}_])";
+  const particles = "(?:은|는|이|가|을|를|의|와|과|랑|이랑|도|만|한테서|에게서|한테|에게|께서|께|으로|로|부터|까지|처럼|보다)";
+  const possessive = new RegExp(
+    `(?<![\\p{L}\\p{N}_])(?:우리|저희|내|제)\\s*(?:(첫째|둘째|셋째|막내|친|양)\\s*)?(${familyTerms})` +
+    `(?=${wordEnd}|${particles}{1,3}${wordEnd}|이(?:다|야|라|었|고|며|면|지|죠|니|겠|든|오|자)|입|였|인${wordEnd})`,
+    "gu"
+  );
+  const fences = [...source.matchAll(/```[\s\S]*?(?:```|$)/gu)]
+    .map((match) => ({ start: match.index!, end: match.index! + match[0].length }));
+  let rewrittenText = source.replace(possessive, (matched, modifier: string, rawTerm: string, offset: number) => {
+    if (fences.some((fence) => offset >= fence.start && offset < fence.end)) return matched;
     const relation = normalizeFamilyTerm(rawTerm);
+    if (isEverydaySiblingReference(relation, modifier || "", source.slice(offset + matched.length))) {
+      return matched;
+    }
     const inferenceAt = inferenceOffset + offset;
     const speaker = inferSpeaker(inferenceSource, inferenceAt, variants);
     if (!speaker) return matched;
@@ -523,7 +549,9 @@ export function formatRelationshipCanonGuardBlock(input: {
     "- 등록된 기존 인물 사이의 혈연·혼인 관계는 사용자 직접 설정, 관계도 수동값, 정체성 정본에 있는 항목만 확정 사실이다.",
     "- 아래 목록에 없는 기존 인물 둘을 부모·자녀·형제자매·조부모·배우자로 새로 묶지 않는다. 이전 AI 대사·지문·요약만으로 새 가족관계를 만들거나 기존 가족관계를 다른 인물에게 복사하지 않는다.",
     "- '우리 애/우리 아이/내 딸/내 아들/우리 엄마/우리 아빠' 같은 소유형 가족 표현도 실제 화자와 실제 대상을 먼저 실명으로 해석한 뒤 아래 정사와 일치할 때만 쓴다. 애칭·보호 본능·친근감은 혈연 증거가 아니다.",
+    "- 언니·오빠·누나·형·동생은 사회적 호칭으로도 쓰인다. '우리 언니/내 동생'이라는 일상 호칭만으로 혈연을 확정하거나, 혈연 목록에 없다는 이유로 정상 호칭을 익명화하지 않는다. 친혈연·입양·가족관계의 명시적 주장은 정본으로 별도 확인한다.",
     "- 보정 과정에서도 모호한 가족 호칭을 주변 인물의 이름으로 추측 치환하지 않는다. 같은 인물명을 나열하거나 같은 이름·조사구를 연달아 반복하지 않으며, 한 사람의 고유명사에 '들'을 붙여 집단처럼 쓰지 않는다.",
+    "- 대상이 명확한 인물은 이름이나 이미 정해진 호칭으로 자연스럽게 지칭한다. 최근 답변의 '그 사람' 같은 중립 치환을 말버릇처럼 반복하지 않는다. 대상이 불명확할 때는 이름을 추측하지 않는다.",
     "- 관계가 불확실하면 가족 호칭을 쓰지 말고 대상의 이름이나 중립 표현을 쓴다. 새 관계가 필요하면 사용자가 설정하기 전까지 확정하지 않는다.",
   ];
   if (exact.length) {
