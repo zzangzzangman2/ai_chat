@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { createHash } from "crypto";
+import { CHARACTER_IDENTITY_CONTINUITY_RULES } from "./character_identity_rules";
 import {
   GEMINI_3_FLASH_MODEL,
   isGemini25ProModel,
@@ -1473,6 +1474,7 @@ export async function summarizeKorean(params: {
       : "";
 
   const system = `너는 소설/대화 로그의 '장기 기억 요약 작가'다.
+${CHARACTER_IDENTITY_CONTINUITY_RULES}
 주어진 [대화]를 읽고, 이후 대화에 참고할 수 있도록 '라벨링 요약'을 만든다.
 
 반드시 한국어로만 답하고, 아래 출력 형식을 절대 어기지 마라.
@@ -1697,6 +1699,7 @@ export async function summarizeLongMemoryKorean(params: {
   const extraGuide = guidance ? `\n- 추가 지침: ${guidance}` : "";
 
   const system = `너는 소설/대화 로그의 장기기억 요약가다.
+${CHARACTER_IDENTITY_CONTINUITY_RULES}
 주어진 내용을 다음 대화에서도 참고할 수 있도록, '핵심만' 자연스러운 한국어 문장으로 압축한다.
 
 출력 규칙(절대 준수):
@@ -1896,6 +1899,7 @@ export async function summarizeLongMemorySectionKorean(params: {
     : "- 주인공 이름이 명시되어 있으면 그 고유명칭을 그대로 쓰고, 불명확하면 '주인공'으로 표기(\{\{USER\}\} 토큰 금지).";
 
   const system = `너는 '장기 기억(요약.txt)'에 추가될 한 개의 섹션을 작성하는 요약가다.
+${CHARACTER_IDENTITY_CONTINUITY_RULES}
 
 대상: 대화의 특정 구간(${turnLabel}).
 

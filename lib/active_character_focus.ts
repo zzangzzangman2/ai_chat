@@ -1,4 +1,5 @@
 import { findMentionedCharacterIds, findAddressedCharacterIds, characterNamePattern, characterAliases } from "./character_mentions";
+import { requestedSceneViewpoint } from "./recognition_consistency_guard";
 
 export type ActiveCharacterIdentity = {
   id: string;
@@ -36,7 +37,7 @@ function requestsExclusiveReply(text: string, names: string[] = []) {
 }
 
 function conversationBreak(text: string, identities: ActiveCharacterIdentity[]) {
-  if (ADDRESS_BREAK.test(text) || GROUP_ADDRESS.test(text)) return true;
+  if (ADDRESS_BREAK.test(text) || GROUP_ADDRESS.test(text) || requestedSceneViewpoint(text)) return true;
   const action = text.replace(/^[\s*\[\(]+|[\s*\]\).!]+$/gu, "");
   // Short stage directions are scene progression, not an unnamed line to the
   // last person addressed. Questions/plans about somebody's arrival are not.

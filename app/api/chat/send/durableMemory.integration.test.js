@@ -17,6 +17,7 @@ const durable=load(path.join(root,'lib/durable_character_state.ts'));
 const vital=load(path.join(root,'lib/vital_status_consistency_guard.ts'));
 const continuity=load(path.join(root,'app/api/chat/send/_server/continuityState.ts'));
 const conditions=load(path.join(root,'lib/persistent_character_conditions.ts'));
+const {CHARACTER_IDENTITY_CONTINUITY_RULES}=load(path.join(root,'lib/character_identity_rules.ts'));
 const {buildCumulativeMemoryPrompt}=load(path.join(root,'app/api/chat/send/_server/cumulativeMemory.ts'));
 const {sanitizePromptForModel}=load(path.join(root,'app/api/chat/send/_server/textPolicy.ts'));
 const {withAssistantTurnNumbers}=load(path.join(root,'app/api/chat/send/_server/turnRange.ts'));
@@ -30,7 +31,7 @@ const promptInitializers=new Map();
 function visit(node){
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='sanitizeVitalStatus')initializer=node.initializer.getText(ast);
   if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='memoryRepairPending')repairInitializer=node.initializer.getText(ast);
-  if(ts.isVariableDeclaration(node)&&node.name.getText(ast)==='sanitizeScenePresence')promptInitializers.set(node.name.getText(ast),node.initializer);
+  if(ts.isVariableDeclaration(node)&&['sanitizeScenePresence','currentSceneState','currentSceneExclusions'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
   if(ts.isBlock(node)){
     const start=node.statements.findIndex(statement=>ts.isVariableStatement(statement)&&statement.declarationList.declarations.some(d=>d.name.getText(ast)==='factGuardRecoverySource'));
     const end=node.statements.findIndex((statement,index)=>index>start&&ts.isIfStatement(statement)&&statement.expression.getText(ast)==='!assistantText.trim()'&&statement.getText(ast).includes('recoverAfterOverfilter'));
@@ -83,7 +84,7 @@ function evaluatePrompt(name,values){
   }
   collect(expression);
   const names=[...dependencies];
-  const fixtures={Boolean,String,sanitizePromptCached:value=>value,spatialCanon:{block:''},currentSceneState:{location:'',offScene:[]},opts:{},settings:{},...values};
+  const fixtures={Boolean,String,CHARACTER_IDENTITY_CONTINUITY_RULES,sanitizePromptCached:value=>value,spatialCanon:{block:''},currentSceneState:{location:'',offScene:[]},opts:{},settings:{},...values};
   const js=ts.transpileModule(`const result=${expression.getText(ast)};`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
   return Function(...names,js+'\nreturn result;')(...names.map(key=>fixtures[key]??''));
 }
@@ -294,6 +295,82 @@ test('a partial registered cast keeps unnamed affected participants eligible in 
   }
   const completion=evaluatePrompt('oneShotLengthContract',{});
   assert.match(completion,/대표자의 대사를 여러 번 쓰는 것으로 다른 당사자의 답을 대신하지 않는다/);
+});
+
+test('a camera cut keeps known names in the actual scene prompt and preserves their subsequent dialogue',()=>{
+  const focusModule=load(path.join(root,'lib/active_character_focus.ts'));
+  const recognition=load(path.join(root,'lib/recognition_consistency_guard.ts'));
+  const speech=load(path.join(root,'lib/scene_speech_scope.ts'));
+  const stream=load(path.join(root,'lib/guarded_text_stream.ts'));
+  const identities=['지아','민서','하린'].map(name=>({id:name,name}));
+  const messages=[
+    {role:'assistant',content:'*지아와 민서는 마당에 서 있었다. 하린은 옆에 앉아 있었다.*'},
+    {role:'user',content:'서재로 가자'},
+    {role:'user',content:'*식당상황*'},
+    {role:'assistant',content:'*식당에서 민서는 탁자에 앉아 있었다. 하린은 고개를 들었다.*'},
+    {role:'assistant',content:'*민서의 어깨를 감싸 쥐고 있던 지아 역시 창가를 바라본다.*'},
+    ...Array.from({length:20},()=>[{role:'user',content:'계속해'},{role:'assistant',content:'*세 사람은 일정표를 읽었다.*'}]).flat(),
+  ];
+  const scene=recognition.deriveCurrentSceneState({identities,messages});
+  assert.equal(scene.location,'식당');
+  assert.deepEqual(scene.present.map(f=>f.characterName).sort(),['민서','지아','하린']);
+  assert.deepEqual(scene.offScene,[]);
+  const activeCharacterFocus=focusModule.resolveActiveCharacterFocus({identities,currentUserText:'그래, 다음은?',previousUserTexts:messages.filter(m=>m.role==='user').reverse().map(m=>m.content)});
+  const fixtures={activeCharacterFocus,legalStatusIdentities:identities,currentSceneState:scene};
+  const scenePresencePriorityBlock=evaluatePrompt('scenePresencePriorityBlock',{JSON,currentScenePresence:scene.present,currentSceneExclusions:[]});
+  for(const identity of identities)assert.ok(scenePresencePriorityBlock.includes('현재 현장에 있음: '+identity.name));
+  assert.match(scenePresencePriorityBlock,/이미 확인된 이름을 잃거나 새 인물로 바꾸지 않는다/);
+  const focusBlock=evaluatePrompt('activeInterlocutorPriorityBlock',{activeCharacterFocus});
+  assert.match(focusBlock,/원문에서도 이름이 아직 정해지지 않은 인물에게만 적용/);
+  const {buildFormatGuide}=load(path.join(root,'app/api/chat/send/_server/formatGuide.ts'));
+  const formatGuide=buildFormatGuide({statusRequired:'NO',targetChars:1200,promptMinChars:900,promptMaxChars:1600});
+  assert.match(formatGuide,/이미 이름이 나온 사람을.*이름 미정으로 되돌리지 않는다/);
+  const sanitize=evaluatePrompt('sanitizeScenePresence',{
+    removeScenePresenceContradictionPassages:recognition.removeScenePresenceContradictionPassages,
+    removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,
+    currentScenePresence:scene.present,currentSceneExclusions:[],currentSceneState:scene,userText:'그래, 다음은?',
+    addressedSpeakers:evaluatePrompt('addressedSpeakers',fixtures),unrequestedSpeakers:evaluatePrompt('unrequestedSpeakers',fixtures),
+  });
+  const raw='*지아는 일정표를 펼쳤다.*\n\n"저는 오전이 좋아요."\n\n*민서는 고개를 들었다.*\n\n"오후가 좋겠습니다."\n\n*하린은 날짜를 짚었다.*\n\n"그 날짜도 확인해 주세요."';
+  assert.equal(sanitize(raw).text,raw);
+  let context='',emitted='';
+  const gate=stream.createGuardedTextStream(text=>{const result=sanitize(text,context);context=(context+'\n'+text).slice(-1600);return result.text;},{paragraphs:true});
+  for(const char of raw)emitted+=gate.push(char);
+  emitted+=gate.finish();
+  assert.equal(emitted.trim(),raw);
+});
+
+test('production scene preparation preserves names and bans beyond the prompt tail in every generation layout',()=>{
+  const recognition=load(path.join(root,'lib/recognition_consistency_guard.ts'));
+  const {applyActiveFocusToScene}=load(path.join(root,'lib/active_character_focus.ts'));
+  const legalStatusIdentities=['지아','민서','하린'].map(name=>({name,aliases:[]}));
+  const all=[
+    {role:'user',content:'*지아는 곁에 앉아 있었다. 민서는 탁자 앞에 서 있었다. 하린은 문밖으로 나갔다.*'},
+    ...Array.from({length:500},()=>[{role:'user',content:'계속 읽어줘.'},{role:'assistant',content:'*두 사람은 자료를 읽었다.*'}]).flat(),
+  ];
+  const fixtures={all,tail:all.slice(-14),userText:'다음 내용을 읽어줘.',legalStatusIdentities,
+    activeCharacterFocus:{locked:false,names:[],reason:'none'},applyActiveFocusToScene,...recognition};
+  const scene=evaluatePrompt('currentSceneState',fixtures);
+  const exclusions=evaluatePrompt('currentSceneExclusions',fixtures);
+  assert.deepEqual(scene.present.map(row=>row.characterName),['지아','민서']);
+  assert.deepEqual(exclusions.map(row=>row.characterName),['하린']);
+  const scenePresencePriorityBlock=evaluatePrompt('scenePresencePriorityBlock',{
+    JSON,currentScenePresence:scene.present,currentSceneExclusions:exclusions,
+  });
+  const system=evaluatePrompt('system',{scenePresencePriorityBlock});
+  for(const lightweight of [true,false]){
+    const continuation=evaluatePrompt('systemForContinuationRaw',{
+      system,scenePresencePriorityBlock,isGemini3ProFamilyModel:()=>lightweight,
+    });
+    for(const prompt of [system,continuation]){
+      assert.ok(prompt.includes(CHARACTER_IDENTITY_CONTINUITY_RULES));
+      assert.match(prompt,/현재 현장에 있음: 지아/);
+      assert.match(prompt,/현재 현장에 있음: 민서/);
+      assert.match(prompt,/현재 현장 출입 제외: 하린/);
+    }
+  }
+  assert.equal(evaluatePrompt('currentSceneState',{...fixtures,all:all.slice(1)}).present.length,0);
+  assert.equal(evaluatePrompt('currentSceneExclusions',{...fixtures,all:all.slice(1)}).length,0);
 });
 
 test('a manager address preserves unnamed local employees own replies, regardless of gender, during streaming and saving',()=>{

@@ -248,7 +248,7 @@ function passageShowsActivePresence(passage: string, names: string[]) {
   // subject: "무릎을 꿇고 있던 안유진은 ...".
   for (const name of names) {
     const stateBeforeSubject = new RegExp(
-      `(?:무릎을\\s*꿇고|앉아|서|누워|기대어|붙잡혀|포박(?:되어|돼)|묶여|갇혀)[^.!?。！？\\n]{0,45}(?:있던|있는)\\s*(?:[\\p{L}\\p{N}_-]+\\s+){0,4}${characterNamePattern(name)}(?:은|는|이|가)?`,
+      `(?:무릎을\\s*꿇고|앉아|서|누워|기대어|붙잡혀|포박(?:되어|돼)|묶여|갇혀|감싸\\s*쥐고|부축하고|붙들고|손을\\s*잡고)[^.!?。！？\\n]{0,45}(?:있던|있는)\\s*(?:[\\p{L}\\p{N}_-]+\\s+){0,4}${characterNamePattern(name)}(?:은|는|이|가)?`,
       "iu"
     );
     if (stateBeforeSubject.test(passage)) return true;
@@ -263,6 +263,31 @@ const PERCEPTION_BRIDGE = /(?:소리|목소리|기척|울음|비명|전언|연�
 const ROOM_LOCATION = /^(?:안방|침실|서재|거실|회의실|객실|병실|방)$/u;
 const OUTSIDE_ROOM_LOCATION = /(?:툇마루|마당|담장|복도|문(?:짝)?[^.!?。！？\n]{0,16}(?:사이|너머|건너))/gu;
 const LOCAL_ROOM_ANCHOR = /(?:방\s*안|실내|책상|탁자|침대|창가|내\s*곁)(?:에서|에|으로|의|옆|\s)/u;
+
+// Resolve names once for the scene. A shared alias or generic relationship is
+// not enough to identify one person; a registered canonical name takes priority.
+function sceneIdentities(rows: ScenePresenceIdentity[]) {
+  const owners = new Map<string, Set<string>>();
+  const canonical = new Set(rows.map(row => normalized(row.name)));
+  for (const row of rows) {
+    for (const alias of usableEntityNames(row.aliases || [])) {
+      const names = owners.get(alias) || new Set<string>();
+      names.add(normalized(row.name));
+      owners.set(alias, names);
+    }
+  }
+  return rows.map(row => ({
+    characterName: String(row.name || "").trim(),
+    characterAliases: usableEntityNames(row.aliases || []).filter(alias =>
+      owners.get(alias)?.size === 1 && !canonical.has(alias) &&
+      !/^(?:그녀|그 사람|한 사람|한 처자|처자|여자|남자|소녀|소년|언니|누나|오빠|형님?|장인(?:어른)?|장모님?|아버지|어머니|주인님?|선생님?|공주|왕자)$/u.test(alias)),
+  })).filter(row => normalized(row.characterName).length >= 2);
+}
+
+function resetsScene(passage: string) {
+  if (/(?:전환|이동|옮기|돌아가|바꾸).{0,8}(?:하지\s*마|지\s*마|말아|않|할까|하면|할지)|(?:장면\s*전환|다음\s*날).{0,12}(?:어때|궁금|계획|물었|말했)/u.test(passage)) return false;
+  return SCENE_RESET_PATTERN.test(passage);
+}
 
 function userSceneMove(text: string, identities: ScenePresenceIdentity[]) {
   if (/(?:가지|들어가지|이동하지|옮기지)\s*(?:마|말|않)|(?:가면|들어가면)\s*안/u.test(text)) return "";
@@ -318,8 +343,22 @@ function offSceneSubjects(passage: string, identities: ScenePresenceIdentity[], 
   return result;
 }
 
+export function requestedSceneViewpoint(value: unknown) {
+  // A short camera direction ("*식당상황*") changes viewpoint even when the
+  // user/persona does not physically walk there. Anchor it across later turns.
+  // Keep questions, reports, hypothetical plans and NPC-only moves separate.
+  const directive = sceneNarrationOnly(stripFencedBlocks(value)).trim().replace(/^[*\[\s]+|[*\]\s.!]+$/gu, "");
+  const places = "(?:[가-힣A-Za-z0-9]+(?:\\s+[가-힣A-Za-z0-9]+){0,3}\\s*)?(?:방|실|재|당|관|궁|마당|광장|주막|객잔|정원|공터|숲|산|항구|시장|훈련장|초소|마을|촌|성|가게|문\\s*밖)";
+  const camera = new RegExp(
+    `^(?:(${places})(?:의)?\\s*(?:상황|장면|시점)(?:을|으로)?\\s*(?:보여\\s*줘|보여준다|전환해|전환한다)?|(?:장면|시점)\\s*전환\\s*[:：]?\\s*(${places})(?:으로|로)?)$`, "u"
+  ).exec(directive);
+  return camera ? camera[1] || camera[2] : "";
+}
+
 function requestedSceneLocation(passage: string, identities: ScenePresenceIdentity[]) {
   if (/(?:가지|들어가지|이동하지|보여\s*주지|전환하지|바꾸지|쓰지|넣지|다루지)\s*(?:마|말|않)/u.test(passage)) return "";
+  const camera = requestedSceneViewpoint(passage);
+  if (camera) return camera;
   const location = [...passage.matchAll(OFF_SCENE_LOCATION)][0];
   if (!location) return "";
   if (/시점\s*(?:을|으로|은|:)|장면\s*전환/u.test(passage)) return location[0];
@@ -331,57 +370,36 @@ function requestedSceneLocation(passage: string, identities: ScenePresenceIdenti
 }
 
 /**
- * Reconstructs only high-confidence transient scene presence from recent raw
- * turns. This deliberately does not use residence or long-memory locations:
- * present/absent is a short-lived scene fact and must be cleared by an exit or
- * an explicit time/location cut.
+ * Replay source scene events, not a fixed last-N-message window. Presence lasts
+ * until an exit/cut, even when names disappear from hundreds of follow-ups.
+ * Replaying raw history also makes undo/branching work without stale cache state.
  */
 export function deriveCurrentSceneState(args: {
   messages: ScenePresenceMessage[];
   identities: ScenePresenceIdentity[];
   maxMessages?: number;
 }): { present: ScenePresenceFact[]; offScene: ScenePresenceFact[]; location: string } {
-  const identities = args.identities
-    .map((identity) => ({
-      characterName: String(identity.name || "").trim(),
-      characterAliases: usableEntityNames(identity.aliases || []),
-    }))
-    .filter((identity) => normalized(identity.characterName).length >= 2);
-  const requestedMax = Number(args.maxMessages || 14);
-  const maxMessages = Number.isFinite(requestedMax)
-    ? Math.max(2, Math.floor(requestedMax))
-    : 14;
+  const identities = sceneIdentities(args.identities);
+  const resolvedIdentities = identities.map(row => ({ name: row.characterName, aliases: row.characterAliases }));
   const messages = args.messages || [];
-  let lastMove = -1;
+  // A camera/time cut starts a new epoch. Physical moves need the preceding
+  // roster to distinguish companions from people who stayed behind.
+  let sceneStart = 0;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (normalized(messages[index]?.role) === "user" &&
-        userSceneMove(sceneNarrationOnly(stripFencedBlocks(messages[index]?.content)), args.identities)) {
-      lastMove = index;
+    const narration = sceneNarrationOnly(stripFencedBlocks(messages[index]?.content));
+    const user = normalized(messages[index]?.role) === "user";
+    if (splitStoryPassages(narration).some(passage => resetsScene(passage) ||
+      (user && requestedSceneLocation(passage, resolvedIdentities) && !userSceneMove(passage, resolvedIdentities)))) {
+      sceneStart = index;
       break;
     }
   }
-  // Keep the current room's boundary even after it scrolls out of the recent
-  // prompt window. An unnamed follow-up cannot bring the previous room along.
-  const recent = messages.slice(lastMove >= 0 ? lastMove : -maxMessages);
+  const recent = messages.slice(sceneStart);
   const states = new Map<string, ScenePresenceFact>();
   const outside = new Map<string, ScenePresenceFact>();
   const userPlacedHere = new Set<string>();
   let latestUserText = "";
   let viewpointLocation = "";
-  if (lastMove > 0) {
-    const previous = deriveCurrentSceneState({
-      ...args,
-      messages: messages.slice(Math.max(0, lastMove - maxMessages), lastMove),
-    });
-    const moveText = sceneNarrationOnly(stripFencedBlocks(messages[lastMove].content));
-    const destination = userSceneMove(moveText, args.identities);
-    const bringsGroup = /(?:모두|다\s*같이|다들|전부).{0,24}(?:가자|이동|들어가)/u.test(moveText);
-    for (const fact of [...previous.offScene, ...previous.present]) {
-      const invited = bringsGroup || usableEntityNames([fact.characterName, ...fact.characterAliases])
-        .some((name) => new RegExp(`${characterNamePattern(name)}(?:와|과|랑|이랑|아|야)`, "iu").test(moveText));
-      if (!invited && !fact.evidence.includes(destination)) outside.set(normalized(fact.characterName), fact);
-    }
-  }
 
   recent.forEach((message, messageIndex) => {
     const story = stripFencedBlocks(message?.content || "");
@@ -391,18 +409,34 @@ export function deriveCurrentSceneState(args: {
     let remoteViewpoint = false;
 
     for (const passage of splitStoryPassages(sceneNarrationOnly(story))) {
+      const physicalMove = isUserMessage ? userSceneMove(passage, resolvedIdentities) : "";
       const requestedLocation = isUserMessage
-        ? userSceneMove(passage, args.identities) || requestedSceneLocation(passage, args.identities)
+        ? physicalMove || requestedSceneLocation(passage, resolvedIdentities)
         : "";
       const returnsToOriginal = isUserMessage && /원래\s*(?:방|장소|현장).{0,12}돌아/u.test(passage);
-      if (SCENE_RESET_PATTERN.test(passage) || requestedLocation || returnsToOriginal) {
+      if (resetsScene(passage) || requestedLocation || returnsToOriginal) {
+        const previousPresent = [...states.values()];
         states.clear();
-        if (!(lastMove >= 0 && messageIndex === 0 && requestedLocation)) outside.clear();
         userPlacedHere.clear();
         viewpointLocation = normalized(requestedLocation).replace(/\s/g, "");
         remoteViewpoint = false;
+        if (physicalMove) {
+          const bringsGroup = /(?:모두|다\s*같이|다들|전부).{0,24}(?:가자|이동|들어가)/u.test(passage);
+          for (const fact of [...outside.values(), ...previousPresent]) {
+            const key = normalized(fact.characterName);
+            const namedCompanion = usableEntityNames([fact.characterName, ...fact.characterAliases])
+              .some(name => new RegExp(`${characterNamePattern(name)}(?:와|과|랑|이랑|아|야)`, "iu").test(passage));
+            // "Everyone" accompanies only the current group, not absent people.
+            if (namedCompanion || (bringsGroup && previousPresent.some(row => row.characterName === fact.characterName))) {
+              states.set(key, { ...fact, evidence: compactEvidence(passage), messageIndex: sceneStart + messageIndex });
+              outside.delete(key);
+              userPlacedHere.add(key);
+            } else if (!fact.evidence.includes(physicalMove)) outside.set(key, fact);
+            else outside.delete(key);
+          }
+        } else outside.clear();
       }
-      const remoteSubjects = offSceneSubjects(passage, args.identities, viewpointLocation);
+      const remoteSubjects = offSceneSubjects(passage, resolvedIdentities, viewpointLocation);
       if (remoteSubjects.size) remoteViewpoint = true;
       else if (ROOM_LOCATION.test(viewpointLocation) && (LOCAL_ROOM_ANCHOR.test(passage) || passage.includes(viewpointLocation))) remoteViewpoint = false;
       else if (PERCEPTION_BRIDGE.test(passage) && [...passage.matchAll(OFF_SCENE_LOCATION)].length) remoteViewpoint = false;
@@ -422,7 +456,7 @@ export function deriveCurrentSceneState(args: {
           characterName: identity.characterName,
           characterAliases: identity.characterAliases,
           evidence: compactEvidence(passage),
-          messageIndex,
+          messageIndex: sceneStart + messageIndex,
         };
 
         // Exit wins when a compact sentence contains both movement directions;
@@ -495,7 +529,7 @@ function findNamedIncapacitationCue(passage: string, names: string[]) {
 }
 
 /**
- * Reconstructs user-authoritative exclusions from the recent raw scene.
+ * Reconstructs user-authoritative exclusions from source scene events.
  * Assistant prose is deliberately unable to clear this state: a character the
  * user expelled or banned stays outside until the user explicitly calls that
  * same character back or starts a new scene.
@@ -505,28 +539,19 @@ export function deriveCurrentSceneExclusions(args: {
   identities: ScenePresenceIdentity[];
   maxMessages?: number;
 }): ScenePresenceFact[] {
-  const identities = args.identities
-    .map((identity) => ({
-      characterName: String(identity.name || "").trim(),
-      characterAliases: usableEntityNames(identity.aliases || []),
-    }))
-    .filter((identity) => normalized(identity.characterName).length >= 2);
+  const identities = sceneIdentities(args.identities);
   if (!identities.length) return [];
 
-  const requestedMax = Number(args.maxMessages || 18);
-  const maxMessages = Number.isFinite(requestedMax)
-    ? Math.max(2, Math.floor(requestedMax))
-    : 18;
-  const recent = (args.messages || []).slice(-maxMessages);
+  const recent = args.messages || [];
   const states = new Map<string, ScenePresenceFact>();
 
   recent.forEach((message, messageIndex) => {
-    const story = stripFencedBlocks(message?.content || "");
+    if (normalized(message?.role) !== "user") return;
+    const story = sceneNarrationOnly(stripFencedBlocks(message?.content || ""));
     if (!story.trim()) return;
 
     for (const passage of splitStoryPassages(story)) {
-      if (normalized(message?.role) !== "user") continue;
-      if (SCENE_RESET_PATTERN.test(passage)) states.clear();
+      if (resetsScene(passage) || userSceneMove(passage, args.identities) || requestedSceneLocation(passage, args.identities)) states.clear();
 
       for (const identity of identities) {
         const names = usableEntityNames([

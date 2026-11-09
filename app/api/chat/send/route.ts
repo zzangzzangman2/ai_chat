@@ -64,6 +64,7 @@ import {
   removeUnsupportedRelationshipClaims,
 } from "@/lib/relationship_claim_consistency_guard";
 import { createGuardedTextStream } from "@/lib/guarded_text_stream";
+import { CHARACTER_IDENTITY_CONTINUITY_RULES } from "@/lib/character_identity_rules";
 import {
   deriveCurrentSceneExclusions,
   deriveCurrentSceneState,
@@ -2580,9 +2581,8 @@ ${body}`.trim();
         ? addressDirection.text
         : original;
     };
-    // Transient presence belongs to the recent raw scene, not long memory or
-    // residence canon. Strong entry/active-state evidence keeps a character in
-    // the current scene until a recent exit or explicit scene cut removes them.
+    // Replay source scene events across the full history. Message windows must
+    // not expire an established participant or a user-authored exclusion.
     const currentSceneState = applyActiveFocusToScene(deriveCurrentSceneState({
       messages: all.map((message: any) => ({
         role: String(message?.role || ""),
@@ -2594,7 +2594,6 @@ ${body}`.trim();
           name: identity.name,
           aliases: identity.aliases || [],
         })),
-      maxMessages: 14,
     }), activeCharacterFocus);
     let currentScenePresence = currentSceneState.present;
     const addressedSpeakers = activeCharacterFocus.locked
@@ -2608,7 +2607,7 @@ ${body}`.trim();
       : currentSceneState.offScene;
     const currentSceneExclusions = deriveCurrentSceneExclusions({
       messages: [
-        ...tail.map((message: any) => ({
+        ...all.map((message: any) => ({
           role: String(message?.role || ""),
           content: String(message?.content || ""),
         })),
@@ -2620,7 +2619,6 @@ ${body}`.trim();
           name: identity.name,
           aliases: identity.aliases || [],
         })),
-      maxMessages: 18,
     });
     const excludedSceneNames = new Set(
       currentSceneExclusions.flatMap((item) => [
@@ -3372,9 +3370,11 @@ const systemRaw = (cacheFriendlyLayout
       : "";
     const scenePresencePriorityBlock = [
       `# [CURRENT SCENE MEMBERSHIP HARD GUARD — APPLIES TO EVERY CHAT]`,
+      CHARACTER_IDENTITY_CONTINUITY_RULES,
       `- 최신 사용자 원문이 정한 현재 장면의 인물 구성과 위치는 최상위 정사다. 사용자가 직접 지시하지 않은 퇴장, 실종, 도주, 자기 방으로 이동, 재입장, 인물 교체를 새로 만들지 않는다.`,
       `- 사용자가 둘이/서로/얘들/다 같이처럼 현재 인물을 가리키면 직전 장면에 실제 남아 있는 인물을 그대로 이어 쓴다. 현장 밖 인물을 대신 끼워 넣지 않는다.`,
       `- 아래 자동 확인 명단은 등록 이름으로 확인한 부분 명단이며 현장 전원 목록이 아니다. 최근 원문에서 같은 현장에 있는 것으로 확인된 이름 없는 인물·역할·집단도 현재 장면에 포함한다. 명단 누락을 부재·침묵·발언 금지의 근거로 삼지 않는다. 반대로 과거 언급·전언·원격 장면만으로 현재 참석을 추측하지 않는다.`,
+      `- 명단 누락이나 최근 문단의 익명 표현은 이름 미확정의 증거가 아니다. 현재 인물의 정체는 원문에 있는 마지막 명시적 이름·역할·동행 관계와 대조한다. 같은 일행이 이름 대신 '세 사람/한 처자/그녀'로 이어져도 이미 확인된 이름을 잃거나 새 인물로 바꾸지 않는다.`,
       `- 쫓겨났거나 출입을 금지당한 인물은 사용자가 그 인물의 복귀를 명시하기 전까지 현장 밖에 둔다. 감정이 격해졌다는 이유로 안으로 돌아오게 하지 않는다.`,
       `- 현재 인물이 충격, 공포, 수치심을 느껴도 사용자의 지시 없이 '견디지 못하고 도망쳤다', '방으로 사라졌다', '자리를 떴다'처럼 장면에서 제거하지 않는다. 현 위치에서 표정·대사·행동으로 반응시킨다.`,
       `- 현재 인물을 반응에서 빼기 위해 기절, 혼절, 실신, 의식 상실, 수면, 마비, 발화 불능, 쓰러짐을 새로 만들지 않는다. 이런 상태는 최신 사용자 원문이나 검증된 현재 정사에 이미 명시된 경우에만 유지한다.`,
@@ -3455,6 +3455,7 @@ const systemRaw = (cacheFriendlyLayout
           `- 답변 우선권과 독점 발화는 다르다. 직접 질문받은 사람의 답을 다른 인물에게 넘기지 않되, 현장에 새로 도착했거나 이번 사건과 직접 관련된 사람은 자기 관점에서 자연스럽게 반응할 수 있다. 도착한 인물을 배경 명단에만 넣어 방치하지 않는다.`,
           `- 지시를 듣는 사람과 그 지시로 영향을 받는 현장 당사자를 구분한다. 대표자·상급자·동행인의 답만으로 당사자의 말과 의사를 대신하지 않는다. 명시적인 발화 제한이 없다면 당사자에게 자기 입장을 말할 차례를 주며, 설명자가 그 입장을 추측해 대신 확정하지 않는다.`,
           `- 현재 사건에서 자기 선택·설명·이견이 필요한 인물을 여러 턴 연속 표정·몸짓으로만 처리하지 않는다. 성별·직위·등록 이름 유무와 무관하게 필요한 직접 대사를 배분한다. 이름 없는 여러 사람은 최근 원문의 위치·역할로 구분하고 새 이름·관계를 지어내지 않는다. 단순 관중 전원에게 대사를 배정하거나 발화 순번을 기계적으로 돌리지는 않는다.`,
+          `- 역할·위치만으로 구분하는 규칙은 원문에서도 이름이 아직 정해지지 않은 인물에게만 적용한다. 이름과 현재 인물의 대응이 확인되면 화자가 바뀔 때 지문에 기존 이름을 써서 누가 말하는지 분명히 한다. 대상이 여러 명이라 '한 사람'만으로 누구인지 불명확하면 임의로 한 이름을 골라 치환하지 않는다.`,
           `- 당사자의 침묵·공포·타인의 대답을 승낙이나 동의로 해석하지 않는다. 거절·이견·도움 요청 등 그 인물의 독립적인 의사를 보존하고, 반응을 요구받았다는 이유로 복종하는 대사만 쓰지 않는다.`,
           `- 이름 없는 도착·진행·장면 전환 지시는 이전 상대에게 말을 건 것으로 단정하지 않는다. 현재 사건을 이어가며 필요한 인물만 반응시킨다. 등장인물 전원을 차례대로 말시키거나 멀리 있는 사람을 끼워 넣지 않는다.`,
           ...(activeCharacterFocus.locked ? [

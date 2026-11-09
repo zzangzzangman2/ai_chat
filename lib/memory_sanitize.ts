@@ -1,3 +1,5 @@
+import { CHARACTER_IDENTITY_CONTINUITY_RULES } from "./character_identity_rules";
+
 /**
  * Shared sanitizer / formatter for long-memory summaries.
  *
@@ -279,6 +281,7 @@ function maskSensitive(input: string): string {
  */
 export const LONG_MEMORY_SUMMARY_RULES = [
   "요약.txt 섹션 작성 규칙(중요):",
+  CHARACTER_IDENTITY_CONTINUITY_RULES,
   "- 출력은 '### 제목 (a-b턴)' 헤더 1줄 + 자연스러운 요약 문단 1개(1~3문장)만.",
   "- 말투는 항상 반말(해체, '~다')로 통일. '~요/~습니다' 같은 존댓말 종결 금지.",
   "- 라벨(예: 장소/시점:, 등장인물/세력:)로 줄을 나누지 말고, 한 문단 안에서 자연스럽게 이어서 쓸 것.",

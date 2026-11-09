@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { CHARACTER_IDENTITY_CONTINUITY_RULES } from "./character_identity_rules";
 import { hasGroundedHierarchyEvidence, RELATIONSHIP_CONTINUITY_RULES } from "@/lib/durable_character_state";
 
 import { generateText } from "@/lib/ai";
@@ -585,6 +586,7 @@ export async function extractStructuredCharacterGraph(params: {
     "- 형/누나/오빠/언니/선배/후배/대표님/주인님 같은 호칭은 동일 인물 통합과 가족·서열·직장 관계 판단에 활용한다.",
     "- 관계는 원문에 실제 전환 사건이 확인될 때 갱신한다. 최신 AI의 관계 형용사만으로 기존 설정을 덮어쓰지 않는다.",
     RELATIONSHIP_CONTINUITY_RULES,
+    CHARACTER_IDENTITY_CONTINUITY_RULES,
     "- known_by_ids는 관계의 양 끝 인물 목록이 아니다. 각 인물이 그 관계의 구체적 사실을 안다는 원문 근거가 있을 때만 넣는다.",
     "- 현장에 없었거나 잠들었거나 보지 못했거나, 복면·변장 때문에 정체를 확인하지 못한 인물은 known_by_ids에 넣지 않는다.",
     "- 전지적 지문이 범인·배후·비밀 정체를 확정해도 그 사실을 목격하거나 전달받지 못한 다른 인물은 알지 못한다.",
