@@ -8,6 +8,8 @@ const crypto = require("crypto");
 const readlineCore = require("readline");
 const readline = require("readline/promises");
 const { generationProgressAfterEvent, refusalRerollNotice } = require("../lib/generation_progress.js");
+const { createMaintenanceTransport } = require("./maintenance-transport.js");
+const { maintenanceRetryDetails } = require("./maintenance-result.js");
 
 const ROOT = path.resolve(__dirname, "..");
 const DB_PATH = path.join(ROOT, "data", "data.sqlite3");
@@ -121,6 +123,19 @@ const MAINTENANCE_PORT = Number(
     PORT + 1000
 );
 const MAINTENANCE_API_BASE = `http://127.0.0.1:${MAINTENANCE_PORT}`;
+const maintenanceTransport = createMaintenanceTransport({
+  primaryBase: API_BASE,
+  maintenanceBase: MAINTENANCE_API_BASE,
+  onRouteChange(base, previous) {
+    if (!base) {
+      console.log("\n[기억 갱신 연결 실패] 대기 작업을 유지하며 30초 뒤 다시 확인합니다.");
+    } else if (base !== MAINTENANCE_API_BASE) {
+      console.log("\n[기억 갱신 복구] 별도 기억 서버에 연결되지 않아 채팅 서버에서 갱신을 이어갑니다.");
+    } else if (previous !== undefined) {
+      console.log("\n[기억 갱신 복구] 별도 기억 서버 연결이 복구되었습니다.");
+    }
+  },
+});
 const sendInactivityTimeoutRaw = Number(process.env.DOS_SEND_INACTIVITY_TIMEOUT_MS || 45_000);
 const SEND_INACTIVITY_TIMEOUT_MS = Number.isFinite(sendInactivityTimeoutRaw)
   ? Math.max(15_000, sendInactivityTimeoutRaw)
@@ -168,7 +183,7 @@ const state = {
   // 페르소나 안내를 이미 띄운 채팅. 한 방에서 두 번 붙잡지 않기 위한 것으로,
   // 프로세스가 살아 있는 동안만 유지한다.
   personaPromptedChatIds: new Set(),
-  // 답변 뒤 기억 갱신은 별도 maintenance 서버에서 처리한다. 새 입력이 오면 느린
+  // 별도 maintenance 서버를 우선 사용하고, 연결이 끊기면 채팅 서버로 복구한다. 새 입력이 오면 느린
   // 캐릭터 작업은 양보시키되, 진행 중인 장기기억 블록은 끝까지 저장하게 둔다.
   maintenanceTimer: null,
   maintenanceController: null,
@@ -178,6 +193,7 @@ const state = {
   maintenancePaused: false,
   pendingCharacterRefreshes: new Map(),
   pendingMemoryRefreshes: new Map(),
+  maintenanceFailures: new Map(),
 };
 
 function createInactivityWatchdog(parentSignal, timeoutMs = SEND_INACTIVITY_TIMEOUT_MS) {
@@ -2925,11 +2941,31 @@ async function addCharacter(name) {
 async function refreshMemory(mode = "all") {
   if (!state.chatId) throw new Error("열린 채팅이 없습니다.");
   console.log("기억 갱신 중...");
-  await apiJson("/api/chat/memory/refresh", {
-    method: "POST",
-    body: JSON.stringify({ chatId: state.chatId, mode, allowBadOutputSave: false }),
-  });
-  console.log("기억 갱신 완료");
+  let response;
+  try {
+    response = await maintenanceTransport.request("/api/chat/memory/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chatId: state.chatId, mode, allowBadOutputSave: false }),
+      signal: state.activeController?.signal,
+    });
+  } catch (error) {
+    if (!isAbortLike(error)) {
+      queueBackgroundMaintenance({ chatId: state.chatId, memoryRefresh: { shouldRefresh: true, mode } });
+    }
+    throw error;
+  }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.ok !== true) {
+    queueBackgroundMaintenance({ chatId: state.chatId, memoryRefresh: { shouldRefresh: true, mode } });
+    throw new Error(`기억 갱신을 확인하지 못했습니다 (HTTP ${response.status}). 대기 작업을 유지합니다.`);
+  }
+  if (payload.morePending || payload.retryNeeded) {
+    queueBackgroundMaintenance({ chatId: state.chatId, memoryRefresh: { shouldRefresh: true, mode } });
+    console.log(`기억 갱신 진행: ${payload.summarizedEndTurn ?? "?"}/${payload.boundaryEndTurn ?? "?"}턴. 남은 작업은 자동으로 이어갑니다.`);
+  } else {
+    console.log(`기억 갱신 완료: ${payload.summarizedEndTurn ?? "?"}턴`);
+  }
 }
 
 // (삭제) 최근 user + assistant 한 쌍을 함께 삭제. 웹의 "휴지통" 동작과 동일.
@@ -3017,11 +3053,22 @@ function isAbortLike(error) {
 
 async function maintenanceHealth() {
   try {
-    const res = await fetch(`${MAINTENANCE_API_BASE}/api/auth/me`, { cache: "no-store" });
-    return res.status >= 200 && res.status < 500;
+    return await maintenanceTransport.select({ force: true });
   } catch {
     return false;
   }
+}
+
+function reportMaintenanceFailure(kind, reason, labelOverride = "") {
+  if (state.maintenanceFailures.get(kind) === reason) return;
+  state.maintenanceFailures.set(kind, reason);
+  const label = labelOverride || (kind === "memory" ? "장기요약" : "인물 기억");
+  console.log(`\n[${label} 갱신 지연] ${reason}. 대기 작업을 유지하며 자동으로 다시 시도합니다.`);
+}
+
+function reportMaintenanceSuccess(kind) {
+  if (!state.maintenanceFailures.delete(kind)) return;
+  console.log(`\n[기억 갱신 복구] ${kind === "memory" ? "장기요약" : "인물 기억"} 저장을 다시 확인했습니다.`);
 }
 
 function readMaintenancePortFile() {
@@ -3096,7 +3143,7 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   let response = null;
   try {
     if (kind === "character") {
-      response = await fetch(`${MAINTENANCE_API_BASE}/api/chat/characters/refresh`, {
+      response = await maintenanceTransport.request("/api/chat/characters/refresh", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3106,7 +3153,7 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
         signal: controller.signal,
       });
     } else {
-      response = await fetch(`${MAINTENANCE_API_BASE}/api/chat/memory/refresh`, {
+      response = await maintenanceTransport.request("/api/chat/memory/refresh", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3121,6 +3168,7 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   } catch (error) {
     if (isAbortLike(error) || controller.signal.aborted) return "paused";
     job.attempts = Number(job.attempts || 0) + 1;
+    reportMaintenanceFailure(kind, "서버 연결 실패");
     return "retry";
   } finally {
     if (state.maintenanceController === controller) state.maintenanceController = null;
@@ -3129,21 +3177,34 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
   }
 
   if (response && response.ok) {
+    const payload = await response.json().catch(() => null);
+    if (!payload || payload.ok !== true) {
+      job.attempts = Number(job.attempts || 0) + 1;
+      reportMaintenanceFailure(kind, "저장 성공 응답을 확인하지 못함");
+      return "retry";
+    }
     if (kind === "memory") {
-      const payload = await response.json().catch(() => null);
       // A 200 with a truncated/invalid body is not proof that durable work finished.
-      if (!payload || payload.ok !== true || payload.retryNeeded) {
+      if (payload.retryNeeded) {
         job.attempts = Number(job.attempts || 0) + 1;
+        const detail = maintenanceRetryDetails(payload, job.attempts);
+        job.retryDelayMs = detail.delayMs;
+        reportMaintenanceFailure(kind, detail.reason, detail.label);
         return "retry";
       }
       if (payload.skipped && payload.morePending) {
         job.attempts = Number(job.attempts || 0) + 1;
+        const detail = maintenanceRetryDetails(payload, job.attempts);
+        job.retryDelayMs = detail.delayMs;
+        reportMaintenanceFailure(kind, detail.reason, detail.label);
         return "retry";
       }
       if (payload && payload.morePending) {
+        reportMaintenanceSuccess(kind);
         const current = state.pendingMemoryRefreshes.get(key);
         if (current === job) {
           job.attempts = 0;
+          job.retryDelayMs = 0;
           job.mode = "all";
         }
         return "more";
@@ -3152,17 +3213,22 @@ async function runBackgroundMaintenanceJob(kind, key, job, generation) {
         state.pendingMemoryRefreshes.delete(key);
       }
     } else {
-      state.pendingCharacterRefreshes.delete(key);
+      if (state.pendingCharacterRefreshes.get(key) === job) state.pendingCharacterRefreshes.delete(key);
     }
+    reportMaintenanceSuccess(kind);
     return "done";
   }
   job.attempts = Number(job.attempts || 0) + 1;
   const status = Number(response && response.status || 0);
-  const permanentClientError = status >= 400 && status < 500 && status !== 408 && status !== 425 && status !== 429;
-  if (permanentClientError) {
-    if (kind === "character") state.pendingCharacterRefreshes.delete(key);
-    else state.pendingMemoryRefreshes.delete(key);
+  // Only a deleted/inaccessible chat is terminal. Configuration/auth failures
+  // must remain visible and retryable instead of silently discarding memory.
+  if (status === 404 || status === 410) {
+    const pending = kind === "character" ? state.pendingCharacterRefreshes : state.pendingMemoryRefreshes;
+    if (pending.get(key) === job) pending.delete(key);
+    console.log(`\n[기억 갱신 중단] 대상 채팅을 찾을 수 없어 해당 대기 작업을 종료합니다 (HTTP ${status}).`);
+    return "done";
   }
+  reportMaintenanceFailure(kind, `서버 오류 HTTP ${status}`);
   return "retry";
 }
 
@@ -3189,6 +3255,7 @@ async function drainBackgroundMaintenance(generation) {
   }
   state.maintenanceRunning = true;
   let retryNeeded = false;
+  let retryDelayMs = 30_000;
   try {
     while (!state.maintenancePaused && generation === state.maintenanceGeneration) {
       const picked = pickNextMaintenanceEntry(
@@ -3205,6 +3272,7 @@ async function drainBackgroundMaintenance(generation) {
       if (result === "paused") break;
       if (result === "retry") {
         retryNeeded = true;
+        retryDelayMs = Math.max(30_000, Number(picked.entry[1]?.retryDelayMs) || 30_000);
         break;
       }
     }
@@ -3213,7 +3281,7 @@ async function drainBackgroundMaintenance(generation) {
     // 취소된 옛 작업이 늦게 끝난 사이 새 응답이 큐에 들어왔을 수 있다. 이때는
     // 현재 generation으로 다시 예약해야 큐가 영원히 멈추지 않는다.
     if (!state.maintenancePaused) {
-      scheduleBackgroundMaintenance(retryNeeded ? 30_000 : MAINTENANCE_IDLE_DELAY_MS);
+      scheduleBackgroundMaintenance(retryNeeded ? retryDelayMs : MAINTENANCE_IDLE_DELAY_MS);
     }
   }
 }
@@ -3902,9 +3970,8 @@ async function handleCommand(line, rl) {
 async function checkMode() {
   console.log(`폴더: ${ROOT}`);
   console.log(`내부 서버: ${API_BASE} ${await health() ? "OK" : "연결 안 됨"}`);
-  console.log(
-    `기억 서버: ${MAINTENANCE_API_BASE} ${await maintenanceHealth() ? "OK" : "연결 안 됨"}`
-  );
+  const memoryBase = await maintenanceHealth();
+  console.log(`기억 갱신 경로: ${memoryBase || MAINTENANCE_API_BASE} ${memoryBase ? "OK" : "연결 안 됨"}`);
   console.log(`DB: ${fs.existsSync(DB_PATH) ? "OK" : "없음"}`);
   const chats = fs.existsSync(DB_PATH) ? listChats(5) : [];
   console.log(`최근 채팅: ${chats.length}개`);
@@ -3927,6 +3994,9 @@ async function main() {
     console.log("내부 서버에 연결하지 못했습니다. run-dos.ps1로 실행했는지 확인해 주세요.");
     process.exit(1);
   }
+
+  // Also runs when the PowerShell launcher reused an existing chat-only server.
+  await maintenanceHealth();
 
   const launched = await startupPresetLauncher();
   if (!launched) {

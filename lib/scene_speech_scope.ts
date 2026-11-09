@@ -1,8 +1,6 @@
-type SceneSpeaker = { characterName: string; characterAliases?: string[] };
+import { characterNamePattern } from "./character_mentions";
 
-function escapeRegex(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+type SceneSpeaker = { characterName: string; characterAliases?: string[] };
 
 const CONTACT_REQUEST = /(?:전화|무전|통화).{0,20}(?:받|걸|듣|연결)|(?:밖|문\s*너머|옆방).{0,24}(?:누구|말해|대답|들어\s*보|들려\s*줘)|(?:모두|다들|너희|너네|각자|둘\s*다).{0,25}(?:대답|말해|말하|알려|설명)|(?:들어와|불러와|데려와)/u;
 const REMOTE_SPEECH = /(?:문\s*밖|문(?:짝)?[^.!?\n]{0,16}(?:너머|사이)|옆\s*방|다른\s*방)[^.!?\n]{0,100}(?:말(?:했|하|을)|외(?:쳤|치)|대답|재촉|타이르|호소|목소리)/u;
@@ -10,7 +8,7 @@ const SPEECH_CUE = /(?:말(?:했|하|을)|외(?:쳤|치)|대답|재촉|타이르
 
 function userAddressesSpeaker(text: string, names: string[]) {
   return names.some((name) => new RegExp(
-    `${escapeRegex(name)}(?:아|야)(?:[\\s,.!?~…]|$)|${escapeRegex(name)}(?:은|는|이|가|도)?\\s*(?:말해|대답|설명|알려|들어와|돌아와)`, "iu"
+    `${characterNamePattern(name)}(?:아|야)(?:[\\s,.!?~…]|$)|${characterNamePattern(name)}(?:은|는|이|가|도)?\\s*(?:말해|대답|설명|알려|들어와|돌아와)`, "iu"
   ).test(text));
 }
 
@@ -21,20 +19,24 @@ export function removeUnrequestedOffSceneSpeech(args: {
   text: string;
   contextText?: string;
   offSceneCharacters: SceneSpeaker[];
+  addressedCharacters?: SceneSpeaker[];
   currentUserText?: string;
   allowExternalContact?: boolean;
 }) {
   const text = String(args.text || "");
   const currentUserText = String(args.currentUserText || "");
-  if (args.allowExternalContact || CONTACT_REQUEST.test(currentUserText)) return { text, removed: 0 };
-  const allowedSubjects: RegExp[] = [];
+  if (!args.addressedCharacters?.length && (args.allowExternalContact || CONTACT_REQUEST.test(currentUserText))) return { text, removed: 0 };
+  const subjectPatterns = (names: string[]) => names.flatMap(name => [
+    new RegExp(`${characterNamePattern(name)}(?:은|는|이|가|도)`, "iu"),
+    new RegExp(`${characterNamePattern(name)}\\s*[:：](?:\\s|$)`, "iu"),
+    new RegExp(`${characterNamePattern(name)}의[^.!?\\n]{0,20}(?:목소리|말(?:이|은|에|을)|재촉|대답|외침)`, "iu"),
+  ]);
+  const allowedSubjects: RegExp[] = (args.addressedCharacters || []).flatMap(speaker =>
+    subjectPatterns([speaker.characterName, ...(speaker.characterAliases || [])]));
   const subjects = args.offSceneCharacters.flatMap((speaker) => {
     const names = [...new Set([speaker.characterName, ...(speaker.characterAliases || [])])]
       .map((name) => name.trim()).filter((name) => name.length >= 2);
-    const patterns = names.flatMap((name) => [
-      new RegExp(`${escapeRegex(name)}(?:은|는|이|가|도)`, "iu"),
-      new RegExp(`${escapeRegex(name)}의[^.!?\\n]{0,20}(?:목소리|말(?:이|은|에|을)|재촉|대답|외침)`, "iu"),
-    ]);
+    const patterns = subjectPatterns(names);
     if (userAddressesSpeaker(currentUserText, names)) {
       allowedSubjects.push(...patterns);
       return [];
@@ -63,7 +65,7 @@ export function removeUnrequestedOffSceneSpeech(args: {
     const outside = isOutside(narration);
     // A background attendance list appended to a local paragraph must not take
     // ownership of the local character's next line. Remove only its sentences.
-    if (!dialogue && outside && /^\s*\*[\s\S]*\*\s*$/u.test(part)) {
+    if (!dialogue && /^\s*\*[\s\S]*\*\s*$/u.test(part)) {
       const inner = part.trim().slice(1, -1);
       const sentences = inner.split(/(?<=[.!?。！？])\s+/u);
       const kept = sentences.filter((sentence) => !isOutside(sentence));

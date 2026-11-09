@@ -1,12 +1,14 @@
 import fs from "fs";
 import path from "path";
 import PDFDocument from "pdfkit";
-import type { NovelChapter } from "@/lib/novel_export";
+import type { NovelChapter, NovelCharacter } from "@/lib/novel_export";
 
 export type NovelPdfInput = {
   title: string;
   author?: string;
   chapters: NovelChapter[];
+  introduction?: string;
+  characters?: NovelCharacter[];
   generatedAt?: Date;
 };
 
@@ -115,9 +117,17 @@ export async function buildNovelPdf(input: NovelPdfInput) {
       { width: doc.page.width - 92, align: "center" }
     );
 
+  // Front matter stays ahead of the novel; character introductions are an appendix.
+  if (normalizePdfText(input.introduction)) {
+    doc.addPage();
+    doc.font("NovelBold").fontSize(18).fillColor("#24211d").text("작품 소개", { align: "center" });
+    doc.moveDown(1.4);
+    addChapterBody(doc, input.introduction!);
+  }
+
   // Contents
   doc.addPage();
-  doc.font("NovelBold").fontSize(18).fillColor("#24211d").text("차례", { align: "center" });
+  doc.font("NovelBold").fontSize(18).fillColor("#24211d").text("목차", { align: "center" });
   doc.moveDown(1.4);
   for (const chapter of input.chapters) {
     doc
@@ -125,6 +135,12 @@ export async function buildNovelPdf(input: NovelPdfInput) {
       .fontSize(10)
       .fillColor("#3c3833")
       .text(chapter.title, { paragraphGap: 7 });
+  }
+  const characters = (input.characters || []).filter((character) =>
+    normalizePdfText(character.name) && normalizePdfText(character.introduction)
+  );
+  if (characters.length) {
+    doc.font("NovelRegular").fontSize(10).fillColor("#3c3833").text("등장인물 소개", { paragraphGap: 7 });
   }
 
   for (const chapter of input.chapters) {
@@ -137,6 +153,21 @@ export async function buildNovelPdf(input: NovelPdfInput) {
     // 독자가 볼 필요가 없는 원문 턴 범위는 싣지 않는다.
     doc.moveDown(1.45);
     addChapterBody(doc, chapter.body);
+  }
+
+  if (characters.length) {
+    doc.addPage();
+    doc.font("NovelBold").fontSize(18).fillColor("#24211d").text("등장인물 소개", { align: "center" });
+    doc.moveDown(1.4);
+    for (const character of characters) {
+      // Keep each name with at least the opening lines of its introduction.
+      doc.font("NovelBold").fontSize(12);
+      const nameHeight = doc.heightOfString(normalizePdfText(character.name));
+      if (doc.y + nameHeight + 48 > doc.page.height - doc.page.margins.bottom) doc.addPage();
+      doc.fillColor("#24211d").text(normalizePdfText(character.name), { paragraphGap: 6 });
+      addChapterBody(doc, character.introduction);
+      doc.moveDown(0.5);
+    }
   }
 
   const range = doc.bufferedPageRange();

@@ -115,14 +115,20 @@ function Test-PortAvailable {
 
 function Test-AppHealth {
   param([int]$Port)
-  $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-  if (-not $listener) { return $false }
-  try {
-    $res = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/api/auth/me" -TimeoutSec 2
-    return $res.StatusCode -ge 200 -and $res.StatusCode -lt 500
-  } catch {
-    return $false
+  # Probe HTTP directly; neither TCP inventory nor system proxy settings decide
+  # whether this is our app. The helper has an absolute request deadline.
+  $healthyPort = Invoke-AppPortDiscovery -Ports @($Port)
+  return $healthyPort -eq $Port
+}
+
+function Invoke-AppPortDiscovery {
+  param([int[]]$Ports)
+  $helper = Join-Path $PSScriptRoot "dos-client\server-discovery.js"
+  $result = & node $helper @Ports
+  if ($LASTEXITCODE -ne 0) {
+    throw "Internal server discovery failed. Check the bundled Node runtime."
   }
+  return [int]($result | Select-Object -Last 1)
 }
 
 function Find-FreePort {
@@ -155,10 +161,7 @@ function Find-HealthyAppPort {
   }
   $candidates += 3000..3020
 
-  foreach ($candidate in ($candidates | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
-    if (Test-AppHealth -Port $candidate) { return $candidate }
-  }
-  return 0
+  return Invoke-AppPortDiscovery -Ports $candidates
 }
 
 function Write-StartupProgress {
@@ -288,7 +291,7 @@ function Start-DosServer {
   while (((Get-Date) - $startedAt).TotalSeconds -lt $startupLimitSeconds) {
     $elapsed = [int][Math]::Floor(((Get-Date) - $startedAt).TotalSeconds)
     if ($elapsed -eq 0 -or ($elapsed - $lastProgressAt) -ge 3) {
-      Write-StartupProgress -Message "Opening port 3000 server..." -Elapsed $elapsed -Total $startupLimitSeconds
+      Write-StartupProgress -Message "Opening port $Port server..." -Elapsed $elapsed -Total $startupLimitSeconds
       $lastProgressAt = $elapsed
     }
     if (Test-AppHealth -Port $Port) {
@@ -382,6 +385,7 @@ function Stop-ExistingDosInstance {
 }
 
 Add-LocalNodeToPath
+Write-Host "ARCA DOS: checking runtime and local server..." -ForegroundColor Cyan
 Assert-Node20
 
 if (-not (Test-Path -LiteralPath ".env.local")) {

@@ -640,6 +640,7 @@ export async function POST(req: Request) {
           thinkingBudget: 0,
           temperature: 0.1,
           topP: 0.8,
+          timeoutMs: 120_000,
           signal: req.signal,
         },
       });

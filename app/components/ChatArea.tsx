@@ -49,6 +49,7 @@ import { CHAT_MODEL_IDS, type ChatModelId, coerceChatModelId, isGemini4ArgonMode
 import { mergeStreamFinalContent } from "@/app/components/chat/ChatArea/streamMerge";
 import { repairUnbalancedNovelBodyMarkers } from "@/lib/novel_output_balance";
 import { supportsAbilityViewQuickCommand } from "@/lib/meta_panel_policy";
+import type { NovelExportHistoryItem } from "@/lib/novel_export_store";
 
 const LOCAL_POINTS_DISABLED = true;
 
@@ -695,6 +696,12 @@ export default function ChatArea(props: {
     message: "",
   });
   const novelExportAbortRef = useRef<AbortController | null>(null);
+  const [novelExportId, setNovelExportId] = useState("");
+  const [novelExportHistory, setNovelExportHistory] = useState<NovelExportHistoryItem[]>([]);
+  const [novelHistoryError, setNovelHistoryError] = useState("");
+  const [novelActionPending, setNovelActionPending] = useState("");
+  const novelHistoryChatRef = useRef(chatId);
+  novelHistoryChatRef.current = chatId;
 
   // Drawer 모드라도 "장기기억/관계도" 화면은 더 넓게 보이도록 도킹한다.
   // - 모바일(좁은 화면)에서는 기존처럼 drawer(overlay)로 유지
@@ -1660,6 +1667,38 @@ const loadOlder = useCallback(async () => {
     const hostname = String(window.location.hostname || "").toLowerCase();
     setNovelExportAvailable(hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1");
   }, []);
+
+  const refreshNovelHistory = useCallback(async (signal?: AbortSignal) => {
+    if (!chatId || !novelExportAvailable) return;
+    try {
+      const res = await fetch(`/api/chat/novel/export?chatId=${encodeURIComponent(chatId)}`, { cache: "no-store", signal });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "저장 기록을 불러오지 못했습니다.");
+      if (novelHistoryChatRef.current !== chatId || signal?.aborted) return;
+      setNovelExportHistory(Array.isArray(data.exports) ? data.exports : []);
+      setNovelHistoryError("");
+    } catch (error) {
+      if (novelHistoryChatRef.current === chatId && !signal?.aborted) {
+        setNovelHistoryError(error instanceof Error ? error.message : "저장 기록을 불러오지 못했습니다.");
+      }
+    }
+  }, [chatId, novelExportAvailable]);
+
+  useEffect(() => {
+    setNovelExportHistory([]);
+    setNovelHistoryError("");
+    setNovelExportId("");
+    setNovelActionPending("");
+    setNovelExportState({ running: false, percent: 0, message: "" });
+  }, [chatId]);
+
+  useEffect(() => {
+    if (!effectiveSettingsOpen || settingsView !== "home" || !novelExportAvailable || !chatId) return;
+    const controller = new AbortController();
+    void refreshNovelHistory(controller.signal);
+    const timer = window.setInterval(() => { void refreshNovelHistory(controller.signal); }, 10000);
+    return () => { controller.abort(); window.clearInterval(timer); };
+  }, [effectiveSettingsOpen, settingsView, novelExportAvailable, chatId, novelExportState.running, refreshNovelHistory]);
 
   // 소설 만들기는 현재 화면과 연결된 작업이다. 다른 채팅/작품으로 이동하거나
   // 컴포넌트를 나가면 서버 호출도 즉시 중단한다.
@@ -4287,24 +4326,74 @@ return (
 
   function cancelNovelExport() {
     novelExportAbortRef.current?.abort();
-    setNovelExportState({ running: false, percent: 0, message: "취소됨" });
-    showToast("소설 만들기 취소", "PDF를 만들지 않았습니다.", "error", 2500);
+    setNovelExportState((state) => ({ ...state, message: "중단 중 · 완료된 장은 보관됩니다." }));
+    showToast("소설 만들기 취소", "완료된 장은 저장 기록에서 다운로드하거나 이어서 만들 수 있습니다.", "success", 3500);
   }
 
-  async function startNovelExport() {
+  async function pauseNovelExport(exportId: string) {
+    if (!chatId || !exportId || novelActionPending) return;
+    setNovelActionPending(`pause:${exportId}`);
+    try {
+      const res = await fetch("/api/chat/novel/export", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId, action: "pause", exportId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "일시중지하지 못했습니다.");
+      if (novelHistoryChatRef.current !== chatId) return;
+      await refreshNovelHistory();
+    } catch (error) {
+      if (novelHistoryChatRef.current === chatId) showToast("일시중지 실패", error instanceof Error ? error.message : "다시 시도해 주세요.", "error");
+    } finally {
+      if (novelHistoryChatRef.current === chatId) setNovelActionPending("");
+    }
+  }
+
+  function saveNovelPdfBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function downloadSavedNovel(entry: NovelExportHistoryItem) {
+    if (!chatId || novelActionPending || !entry.completedChapters) return;
+    setNovelActionPending(`download:${entry.id}`);
+    try {
+      const res = await fetch(`/api/chat/novel/export?chatId=${encodeURIComponent(chatId)}&exportId=${encodeURIComponent(entry.id)}&download=1`, { cache: "no-store" });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data?.error || "PDF를 다운로드하지 못했습니다.");
+      }
+      saveNovelPdfBlob(await res.blob(), entry.filename);
+      await refreshNovelHistory();
+    } catch (error) {
+      if (novelHistoryChatRef.current === chatId) showToast("PDF 다운로드 실패", error instanceof Error ? error.message : "다시 시도해 주세요.", "error");
+    } finally {
+      if (novelHistoryChatRef.current === chatId) setNovelActionPending("");
+    }
+  }
+
+  async function startNovelExport(resume?: NovelExportHistoryItem) {
     if (!chatId) {
       showToast("채팅이 없습니다", "먼저 채팅을 생성해 주세요.", "error");
       return;
     }
-    if (novelExportState.running) return;
-    const confirmed = window.confirm(
+    if (novelExportState.running || novelExportAbortRef.current) return;
+    const confirmed = resume || window.confirm(
       [
         "현재 채팅의 처음부터 끝까지 모두 읽어 한국식 웹소설 PDF로 재구성합니다.",
         "",
-        "긴 채팅은 여러 장으로 나누어 장마다 AI를 호출하므로 시간이 걸릴 수 있습니다.",
+        "Gemini 4 Argon이 긴 채팅을 여러 장으로 나누어 집필하므로 시간이 걸릴 수 있습니다.",
         "작품 제목은 채팅방 제목을 복사하지 않고 원고 내용에 맞춰 새로 정합니다.",
-        "진행 중 설정 화면을 닫거나 다른 채팅으로 이동하거나 페이지를 나가면 작업이 취소됩니다.",
-        "완료될 때까지 이 화면에서 그대로 기다려 주세요.",
+        "표지·작품 소개·목차를 앞에, 등장인물 소개를 본문 맨 뒤에 넣습니다.",
+        "완성된 장은 자동 저장됩니다. 일시중지한 뒤 지금까지의 PDF를 받거나 다음 장부터 이어서 만들 수 있습니다.",
+        "화면을 닫으면 진행 중인 장은 멈추며, 완료된 장은 저장 기록에 남습니다.",
+        "새로 만들기는 기존 저장 기록을 보존한 채 처음부터 새 원고를 만듭니다.",
         "",
         "원본 채팅과 장기기억 DB는 변경되지 않습니다. 계속할까요?",
       ].join("\n")
@@ -4313,13 +4402,15 @@ return (
 
     const controller = new AbortController();
     novelExportAbortRef.current = controller;
-    setNovelExportState({ running: true, percent: 1, message: "전체 대화 불러오는 중" });
+    setNovelExportId(resume?.id || "");
+    setNovelExportState({ running: true, percent: resume ? Math.floor(resume.completedChapters / resume.totalChapters * 90) : 1,
+      message: resume ? `${resume.completedChapters + 1}장부터 이어서 준비 중` : "전체 대화 불러오는 중" });
 
     try {
       const res = await fetch("/api/chat/novel/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId }),
+        body: JSON.stringify({ chatId, action: resume ? "resume" : "start", exportId: resume?.id }),
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -4332,9 +4423,12 @@ return (
       const decoder = new TextDecoder();
       let pending = "";
       let completed: any = null;
+      let paused: { completedChapters: number; total: number } | null = null;
       const acceptLine = (line: string) => {
         if (!line.trim()) return;
         const event = JSON.parse(line);
+        if (novelHistoryChatRef.current !== chatId || novelExportAbortRef.current !== controller) return;
+        if (event.exportId) setNovelExportId(String(event.exportId));
         if (event?.type === "progress") {
           setNovelExportState({
             running: true,
@@ -4346,6 +4440,8 @@ return (
         } else if (event?.type === "done") {
           completed = event;
           setNovelExportState({ running: true, percent: 100, message: "다운로드 준비 완료" });
+        } else if (event?.type === "paused") {
+          paused = { completedChapters: Number(event.completedChapters || 0), total: Number(event.total || 1) };
         }
       };
 
@@ -4358,6 +4454,13 @@ return (
         if (done) break;
       }
       if (pending.trim()) acceptLine(pending);
+      if (novelHistoryChatRef.current !== chatId || novelExportAbortRef.current !== controller) return;
+      if (paused) {
+        const saved = paused as { completedChapters: number; total: number };
+        setNovelExportState({ running: false, percent: Math.floor(saved.completedChapters / saved.total * 100), message: `${saved.completedChapters}장까지 저장 · 일시중지` });
+        showToast("소설 일시중지", saved.completedChapters ? `${saved.completedChapters}장까지 저장했습니다. 저장 기록에서 PDF를 받을 수 있습니다.` : "아직 완성된 장이 없습니다. 이어서 하기를 누르면 1장부터 시작합니다.", "success", 4500);
+        return;
+      }
       if (!completed?.pdfBase64) throw new Error("완성된 PDF 데이터가 없습니다.");
 
       const base64 = String(completed.pdfBase64);
@@ -4369,14 +4472,7 @@ return (
         for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
         blobParts.push(bytes as unknown as BlobPart);
       }
-      const url = URL.createObjectURL(new Blob(blobParts, { type: "application/pdf" }));
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = String(completed.filename || "소설.pdf");
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      saveNovelPdfBlob(new Blob(blobParts, { type: "application/pdf" }), String(completed.filename || "소설.pdf"));
       setNovelExportState({ running: false, percent: 100, message: "완료" });
       showToast(
         "소설 PDF 완성",
@@ -4385,8 +4481,9 @@ return (
         4500
       );
     } catch (error: any) {
+      if (novelHistoryChatRef.current !== chatId || novelExportAbortRef.current !== controller) return;
       if (controller.signal.aborted || error?.name === "AbortError") {
-        setNovelExportState({ running: false, percent: 0, message: "취소됨" });
+        setNovelExportState({ running: false, percent: 0, message: "중단됨 · 완료된 장은 저장 기록에서 확인" });
       } else {
         const message = String(error?.message || "소설 PDF 생성 실패");
         setNovelExportState({ running: false, percent: 0, message: "실패" });
@@ -4394,6 +4491,7 @@ return (
       }
     } finally {
       if (novelExportAbortRef.current === controller) novelExportAbortRef.current = null;
+      if (novelHistoryChatRef.current === chatId) await refreshNovelHistory();
     }
   }
 
@@ -6433,10 +6531,21 @@ const insertNarrationMarkers = useCallback(() => {
                   <div style={{ minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 900 }}>소설로 만들기</div>
                     <div style={{ fontSize: 12, opacity: 0.65, marginTop: 3, lineHeight: 1.35 }}>
-                      전체 대화를 한국식 웹소설로 재구성해 PDF로 저장합니다.
+                      Argon으로 전체 대화를 소설로 만듭니다. 목차는 앞에, 등장인물 소개는 맨 뒤에 넣습니다.
                     </div>
                   </div>
                   {novelExportState.running ? (
+                    <div style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      disabled={!novelExportId || !!novelActionPending}
+                      onClick={() => { void pauseNovelExport(novelExportId); }}
+                      style={{ padding: "8px 10px", borderRadius: 10, border: "none", background: CHAT_THEME.accent,
+                        color: "#fff", cursor: novelActionPending ? "wait" : "pointer", fontWeight: 900,
+                        opacity: !novelExportId || novelActionPending ? 0.5 : 1 }}
+                    >
+                      {novelActionPending === `pause:${novelExportId}` ? "중지 중…" : "일시중지"}
+                    </button>
                     <button
                       type="button"
                       onClick={cancelNovelExport}
@@ -6453,11 +6562,12 @@ const insertNarrationMarkers = useCallback(() => {
                     >
                       취소
                     </button>
+                    </div>
                   ) : (
                     <button
                       type="button"
-                      disabled={!chatId || busy}
-                      onClick={startNovelExport}
+                      disabled={!chatId || busy || novelExportHistory.some((entry) => entry.status === "running" || entry.status === "pausing")}
+                      onClick={() => { void startNovelExport(); }}
                       style={{
                         flex: "0 0 auto",
                         padding: "8px 12px",
@@ -6469,7 +6579,7 @@ const insertNarrationMarkers = useCallback(() => {
                         fontWeight: 900,
                       }}
                     >
-                      PDF 만들기
+                      {novelExportHistory.length ? "새로 만들기" : "PDF 만들기"}
                     </button>
                   )}
                 </div>
@@ -6497,7 +6607,60 @@ const insertNarrationMarkers = useCallback(() => {
                       {novelExportState.percent}% · {novelExportState.message}
                     </div>
                     <div style={{ marginTop: 4, fontSize: 11, color: "#fca5a5", lineHeight: 1.35 }}>
-                      이 화면을 닫거나 다른 채팅으로 나가면 취소됩니다. 완료될 때까지 그대로 기다려 주세요.
+                      완성된 장은 자동 저장됩니다. 일시중지하거나 화면을 닫으면 작성 중인 장만 멈추며, 이어서 할 때 그 장부터 다시 시작합니다.
+                    </div>
+                  </div>
+                ) : null}
+                {novelHistoryError ? (
+                  <div style={{ marginTop: 12, fontSize: 12, color: "#fca5a5" }}>
+                    {novelHistoryError}
+                    <button type="button" onClick={() => { void refreshNovelHistory(); }} style={{ marginLeft: 8 }}>다시 불러오기</button>
+                  </div>
+                ) : null}
+                {novelExportHistory.length ? (
+                  <div style={{ marginTop: 14, borderTop: `1px solid ${CHAT_THEME.borderStrong}`, paddingTop: 12 }}>
+                    <div style={{ fontSize: 12, fontWeight: 900 }}>저장 기록</div>
+                    <div style={{ fontSize: 11, opacity: 0.65, marginTop: 4, lineHeight: 1.5 }}>
+                      처음 시작한 시점의 대화를 기준으로 이어집니다. PDF에는 지금까지 완성된 모든 장이 들어갑니다.
+                    </div>
+                    <div style={{ maxHeight: 300, overflowY: "auto" }}>
+                      {novelExportHistory.map((entry) => {
+                        const active = entry.status === "running" || entry.status === "pausing";
+                        return (
+                          <div key={entry.id} style={{ padding: "12px 0", borderBottom: `1px solid ${CHAT_THEME.borderStrong}` }}>
+                            <div style={{ fontSize: 13, fontWeight: 800, overflowWrap: "anywhere" }}>{entry.title}</div>
+                            <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4, lineHeight: 1.6 }}>
+                              {({ running: "작성 중", pausing: "일시중지 중", paused: "일시중지", completed: "완료", failed: "오류로 중단" })[entry.status]}
+                              {` · ${entry.completedChapters}/${entry.totalChapters}장 저장 · ${new Date(entry.updatedAt).toLocaleString("ko-KR")}`}
+                            </div>
+                            {entry.error ? <div style={{ marginTop: 4, fontSize: 11, color: "#fca5a5" }}>{entry.error}</div> : null}
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginTop: 8 }}>
+                              <button type="button" disabled={!entry.completedChapters || !!novelActionPending}
+                                onClick={() => { void downloadSavedNovel(entry); }}
+                                style={{ padding: "7px 9px", borderRadius: 8, border: `1px solid ${CHAT_THEME.borderStrong}`,
+                                  background: CHAT_THEME.bg2, color: "#fff", cursor: "pointer", fontSize: 12,
+                                  opacity: !entry.completedChapters || novelActionPending ? 0.5 : 1 }}>
+                                {novelActionPending === `download:${entry.id}` ? "PDF 준비 중…" : `PDF 다운로드${entry.completedChapters ? ` (${entry.completedChapters}장)` : ""}`}
+                              </button>
+                              {active ? (
+                                <button type="button" disabled={entry.status === "pausing" || !!novelActionPending}
+                                  onClick={() => { void pauseNovelExport(entry.id); }}
+                                  style={{ padding: "7px 9px", borderRadius: 8, border: "none", background: CHAT_THEME.accent, color: "#fff", cursor: "pointer", fontSize: 12 }}>
+                                  {entry.status === "pausing" ? "중지 중…" : "일시중지"}
+                                </button>
+                              ) : entry.completedChapters < entry.totalChapters ? (
+                                <button type="button" disabled={novelExportState.running || busy || !!novelActionPending || novelExportHistory.some((item) => item.status === "running" || item.status === "pausing")}
+                                  onClick={() => { void startNovelExport(entry); }}
+                                  style={{ padding: "7px 9px", borderRadius: 8, border: "none", background: CHAT_THEME.accent,
+                                    color: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 800,
+                                    opacity: novelExportState.running || busy || novelActionPending ? 0.5 : 1 }}>
+                                  이어서 하기 ({entry.completedChapters + 1}장부터)
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 ) : null}

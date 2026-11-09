@@ -21,6 +21,7 @@ import {
   inferPersonaNameFromMessages,
 } from "@/lib/identity_memory";
 import { syncCharacterVitals } from "@/lib/character_vitals";
+import { enforceCharacterAges, parseCharacterAge, type CharacterAge } from "@/lib/character_age";
 import {
   loadRelationshipGraph,
   syncIdentityCanonRelations,
@@ -88,7 +89,7 @@ import {
   type PhysicalFactIdentity,
 } from "@/lib/physical_fact_consistency_guard";
 import { buildSpatialCanon } from "@/lib/spatial_canon";
-import { resolveActiveCharacterFocus } from "@/lib/active_character_focus";
+import { resolveActiveCharacterFocus, applyActiveFocusToScene } from "@/lib/active_character_focus";
 import { removeUnrequestedOffSceneSpeech } from "@/lib/scene_speech_scope";
 import {
   normalizeNovelParagraphMarkers,
@@ -2048,18 +2049,25 @@ ${body}`.trim();
       if (String(message?.id || "") === String(userMsg.id || "")) continue;
       previousUserTextsForFocus.push(String(message?.content || ""));
     }
+    let focusRelationships: RelationshipGraphData["relations"] = [];
+    try { focusRelationships = loadRelationshipGraph(cid).relations; } catch { /* Legacy schemas can still use explicit names. */ }
     const activeCharacterFocus = resolveActiveCharacterFocus({
-      identities: continuityIdentities.map((identity) => ({
+      identities: continuityLedgerIdentities.filter(identity => identity.name !== personaNameFinal).map((identity) => ({
         id: identity.id,
         name: identity.name,
         aliases: identity.aliases,
+        profile: identity.profile,
+        role: identity.role,
+        relationshipNote: identity.relationshipNote,
       })),
+      relationships: focusRelationships,
+      personaName: personaNameFinal,
       currentUserText: userText,
       previousUserTexts: previousUserTextsForFocus,
       maxPreviousTurns: 12,
     });
-    // Assistant narration is intentionally excluded here. A hallucinated speaker
-    // must not become the next turn's interlocutor merely because the model named it.
+    // User address determines reply priority, not the complete cast. Actual scene
+    // arrivals are tracked separately below and remain eligible to participate.
     recentCharacterFocusText = activeCharacterFocus.anchorText;
     // Derive state from source messages, not ranked summaries. Deleted turns
     // disappear from this view automatically; summary mistakes cannot revive NPCs.
@@ -2133,7 +2141,7 @@ ${body}`.trim();
         personaName: personaNameFinal,
         personaAge: personaAgeFinal,
       });
-      relationshipGraph = loadRelationshipGraph(cid);
+      relationshipGraph = loadRelationshipGraph(cid, durableCharacterCanon);
       dynamicCharacterContext = buildDynamicCharacterContext({
         chatId: cid,
         personaName: personaNameFinal,
@@ -2141,7 +2149,9 @@ ${body}`.trim();
         recentFocusText: recentCharacterFocusText,
         // The active user-authored focus anchors pronouns without changing who
         // is physically present in the scene.
-        userMentionText: activeCharacterFocus.anchorText || characterFocusText,
+        userMentionText: activeCharacterFocus.locked
+          ? `${activeCharacterFocus.anchorText}\n${activeCharacterFocus.names.join(", ")}`
+          : characterFocusText,
         priorityNames: continuityLedger.promptStates.map((state) => state.name),
         graph: relationshipGraph,
       });
@@ -2216,9 +2226,16 @@ ${body}`.trim();
     };
     const identityCanonBlock = formatIdentityCanonBlock(identityCanonForPrompt);
     let canonicalCharacterFacts = [] as ReturnType<typeof loadCanonicalCharacterFacts>;
+    let characterAgeCanon: CharacterAge[] = [];
     let canonicalCharacterFactsBlock = "";
     try {
-      canonicalCharacterFacts = loadCanonicalCharacterFacts(cid);
+      canonicalCharacterFacts = loadCanonicalCharacterFacts(cid, { messages: all, characters: continuityLedgerIdentities });
+      characterAgeCanon = canonicalCharacterFacts.filter((fact) => fact.factKey === "age")
+        .map((fact) => ({ name: fact.subjectName, age: parseCharacterAge(fact.value) }));
+      if (authoritativePersonaFacts.age > 0) {
+        characterAgeCanon = characterAgeCanon.filter((person) => person.name !== personaNameFinal);
+        characterAgeCanon.push({ name: personaNameFinal, age: authoritativePersonaFacts.age });
+      }
       canonicalCharacterFactsBlock = formatCanonicalCharacterFactsBlock({
         persona: authoritativePersonaFacts,
         facts: canonicalCharacterFacts,
@@ -2488,6 +2505,16 @@ ${body}`.trim();
       sanitizeGeneratedEpistemicText(text, epistemicFirewall, {
         groundedFactIds: groundedEpistemicFactIds,
       });
+    const sanitizeCharacterAgeText = (text: unknown, contextText: unknown = "") => {
+      const checked = enforceCharacterAges({
+        text, contextText, ages: characterAgeCanon, characters: continuityLedgerIdentities,
+      });
+      if (checked.rewritten) dbg({
+        tag: "send.guard.character-age", chatId: cid, reqId,
+        rewritten: checked.rewritten, names: checked.names,
+      });
+      return checked.text;
+    };
     const sanitizePhysicalOwnership = (text: unknown) =>
       enforcePhysicalFactOwnership({
         text,
@@ -2515,7 +2542,7 @@ ${body}`.trim();
       const vitalStatus = sanitizeVitalStatus(legalStatus.text, true);
       const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
       const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
-      const communication = sanitizeCommunicationAbilities(physicalOwnership.text);
+      const communication = sanitizeCommunicationAbilities(sanitizeCharacterAgeText(physicalOwnership.text));
       const addressDirection = sanitizeAddressDirections(communication.text);
       if (addressDirection.replaced > 0) {
         // Done-only responses can take this recovery path without passing the
@@ -2556,7 +2583,7 @@ ${body}`.trim();
     // Transient presence belongs to the recent raw scene, not long memory or
     // residence canon. Strong entry/active-state evidence keeps a character in
     // the current scene until a recent exit or explicit scene cut removes them.
-    const currentSceneState = deriveCurrentSceneState({
+    const currentSceneState = applyActiveFocusToScene(deriveCurrentSceneState({
       messages: all.map((message: any) => ({
         role: String(message?.role || ""),
         content: String(message?.content || ""),
@@ -2568,8 +2595,17 @@ ${body}`.trim();
           aliases: identity.aliases || [],
         })),
       maxMessages: 14,
-    });
+    }), activeCharacterFocus);
     let currentScenePresence = currentSceneState.present;
+    const addressedSpeakers = activeCharacterFocus.locked
+      ? legalStatusIdentities.filter(identity => activeCharacterFocus.names.includes(identity.name) &&
+          (activeCharacterFocus.reason !== "continued-address" || currentSceneState.present.some(fact => fact.characterName === identity.name)))
+          .map(identity => ({ characterName: identity.name, characterAliases: identity.aliases || [] }))
+      : [];
+    const unrequestedSpeakers = activeCharacterFocus.exclusive
+      ? legalStatusIdentities.filter(identity => !identity.isPersona && !activeCharacterFocus.names.includes(identity.name))
+          .map(identity => ({ characterName: identity.name, characterAliases: identity.aliases || [] }))
+      : currentSceneState.offScene;
     const currentSceneExclusions = deriveCurrentSceneExclusions({
       messages: [
         ...tail.map((message: any) => ({
@@ -2730,6 +2766,8 @@ ${body}`.trim();
       communicationAbilityChars: strlen(communicationAbilityBlock),
       activeCharacterFocus: activeCharacterFocus.names,
       activeCharacterFocusReason: activeCharacterFocus.reason,
+      activeCharacterFocusExclusive: Boolean(activeCharacterFocus.exclusive),
+      addressedSpeakers: addressedSpeakers.map(speaker => speaker.characterName),
       spatialCanonChars: strlen(spatialCanon.block),
       spatialResidenceCount: spatialCanon.residences.length,
       spatialRelativeAnchorCount: spatialCanon.relativeAnchors.length,
@@ -3336,6 +3374,7 @@ const systemRaw = (cacheFriendlyLayout
       `# [CURRENT SCENE MEMBERSHIP HARD GUARD — APPLIES TO EVERY CHAT]`,
       `- 최신 사용자 원문이 정한 현재 장면의 인물 구성과 위치는 최상위 정사다. 사용자가 직접 지시하지 않은 퇴장, 실종, 도주, 자기 방으로 이동, 재입장, 인물 교체를 새로 만들지 않는다.`,
       `- 사용자가 둘이/서로/얘들/다 같이처럼 현재 인물을 가리키면 직전 장면에 실제 남아 있는 인물을 그대로 이어 쓴다. 현장 밖 인물을 대신 끼워 넣지 않는다.`,
+      `- 아래 자동 확인 명단은 등록 이름으로 확인한 부분 명단이며 현장 전원 목록이 아니다. 최근 원문에서 같은 현장에 있는 것으로 확인된 이름 없는 인물·역할·집단도 현재 장면에 포함한다. 명단 누락을 부재·침묵·발언 금지의 근거로 삼지 않는다. 반대로 과거 언급·전언·원격 장면만으로 현재 참석을 추측하지 않는다.`,
       `- 쫓겨났거나 출입을 금지당한 인물은 사용자가 그 인물의 복귀를 명시하기 전까지 현장 밖에 둔다. 감정이 격해졌다는 이유로 안으로 돌아오게 하지 않는다.`,
       `- 현재 인물이 충격, 공포, 수치심을 느껴도 사용자의 지시 없이 '견디지 못하고 도망쳤다', '방으로 사라졌다', '자리를 떴다'처럼 장면에서 제거하지 않는다. 현 위치에서 표정·대사·행동으로 반응시킨다.`,
       `- 현재 인물을 반응에서 빼기 위해 기절, 혼절, 실신, 의식 상실, 수면, 마비, 발화 불능, 쓰러짐을 새로 만들지 않는다. 이런 상태는 최신 사용자 원문이나 검증된 현재 정사에 이미 명시된 경우에만 유지한다.`,
@@ -3410,16 +3449,27 @@ const systemRaw = (cacheFriendlyLayout
       `- 원문에서 완료된 사망은 이후의 명시적인 사용자 부활·생존 정정이 있기 전까지 유지한다. 뒤늦은 AI의 행동·대사·생존 묘사나 요약은 사망을 취소하는 근거가 아니다. 원문 확정 상태 블록의 출처와 변경 턴을 우선한다.`,
       `- 응답을 내기 직전에 새 사망 주장마다 누가, 언제, 어떤 완료 사건으로 죽었는지 근거를 확인한다. 명시적 근거가 없으면 그 문장을 삭제하고 생존한 현재 상황을 유지한다.`,
     ].join("\n");
-    const activeInterlocutorPriorityBlock = activeCharacterFocus.locked
-      ? [
-          `# [CURRENT INTERLOCUTOR HARD GUARD — APPLIES TO EVERY CHAT]`,
-          `- 최신 사용자 입력의 직접 대상은 ${activeCharacterFocus.names.join(", ")}이다. 이 판정은 최신 사용자 발화와 그 이전 사용자 호명만으로 정했으며, 과거 어시스턴트 서술보다 우선한다.`,
-          `- 최신 입력의 '너/넌/널/네가/너한테' 같은 2인칭은 위 인물을 가리킨다. 다른 등록 인물로 바꾸지 않는다.`,
-          `- 다른 인물이 장면에 함께 있거나 반응할 수는 있지만, 위 인물의 나이·직업·관계·기억·행동을 다른 인물에게 옮기거나 서로 합치지 않는다.`,
+    const activeInterlocutorPriorityBlock = [
+          `# [CURRENT INTERLOCUTOR PRIORITY — APPLIES TO EVERY CHAT]`,
+          `- 발화 순서는 최신 사용자 지목 → 현재 현장의 사건·질문·도착·합류 → 이어지는 대화 문맥으로 정한다. 과거에 한 번 불렀다는 이유로 그 인물만 계속 말하게 하지 않는다.`,
+          `- 답변 우선권과 독점 발화는 다르다. 직접 질문받은 사람의 답을 다른 인물에게 넘기지 않되, 현장에 새로 도착했거나 이번 사건과 직접 관련된 사람은 자기 관점에서 자연스럽게 반응할 수 있다. 도착한 인물을 배경 명단에만 넣어 방치하지 않는다.`,
+          `- 지시를 듣는 사람과 그 지시로 영향을 받는 현장 당사자를 구분한다. 대표자·상급자·동행인의 답만으로 당사자의 말과 의사를 대신하지 않는다. 명시적인 발화 제한이 없다면 당사자에게 자기 입장을 말할 차례를 주며, 설명자가 그 입장을 추측해 대신 확정하지 않는다.`,
+          `- 현재 사건에서 자기 선택·설명·이견이 필요한 인물을 여러 턴 연속 표정·몸짓으로만 처리하지 않는다. 성별·직위·등록 이름 유무와 무관하게 필요한 직접 대사를 배분한다. 이름 없는 여러 사람은 최근 원문의 위치·역할로 구분하고 새 이름·관계를 지어내지 않는다. 단순 관중 전원에게 대사를 배정하거나 발화 순번을 기계적으로 돌리지는 않는다.`,
+          `- 당사자의 침묵·공포·타인의 대답을 승낙이나 동의로 해석하지 않는다. 거절·이견·도움 요청 등 그 인물의 독립적인 의사를 보존하고, 반응을 요구받았다는 이유로 복종하는 대사만 쓰지 않는다.`,
+          `- 이름 없는 도착·진행·장면 전환 지시는 이전 상대에게 말을 건 것으로 단정하지 않는다. 현재 사건을 이어가며 필요한 인물만 반응시킨다. 등장인물 전원을 차례대로 말시키거나 멀리 있는 사람을 끼워 넣지 않는다.`,
+          ...(activeCharacterFocus.locked ? [
+          `- ${activeCharacterFocus.reason === "continued-address" ? "최근 대화의 우선 상대" : "최신 사용자 입력의 직접 대상"}는 ${activeCharacterFocus.names.join(", ")}이다. 새 지목·장면 진행·현장 변화가 있으면 이전 상대의 우선권을 자동으로 연장하지 않는다.`,
+          ...(activeCharacterFocus.familyNames?.length ? [`- 현재 호칭은 ${activeCharacterFocus.familyNames.join(", ")}의 부모인 ${activeCharacterFocus.names.join(", ")}를 가리킨다. 다른 인물의 부모·친족으로 바꾸거나, 그 가족이 이 자리에 있다고 만들어내지 않는다.`] : []),
+          ...(activeCharacterFocus.exclusive ? [
+            `- 사용자가 위 대상만 대답하거나 단둘이 대화하도록 명시했다. 그 요청이 이어지는 동안 다른 인물의 끼어드는 대사를 덧붙이지 않는다. 새 상대·전체 대상 지시나 장면 전환이 있으면 다시 판단한다.`,
+          ] : []),
+          `- 같은 대화가 이어지는 동안 '너/넌/널/네가/너한테' 같은 2인칭은 위 인물을 우선 가리킨다. 새 인물의 도착·질문·호명으로 대화가 넘어갔다면 최신 문맥으로 해석한다.`,
+          `- 위 인물을 상태창이나 배경 명단에만 적어 두고 다른 인물에게 답변을 맡기지 않는다. 발화 불가·부재 등 실제 제약을 반영하며, 응답 요구를 승낙·동의로 바꾸지 않는다.`,
+          `- 다른 인물이 장면에 함께 있더라도 위 인물의 나이·직업·관계·기억·행동을 다른 인물에게 옮기거나 서로 합치지 않는다.`,
           `- 사용자가 위 인물에게 직접 질문했다면 먼저 그 질문에 구체적으로 답한다. 새 인물·초인종·전화·외부 사건으로 질문을 회피하거나 장면 초점을 빼앗지 않는다.`,
           `- 직전 어시스턴트 응답이나 장기요약이 다른 화자를 잘못 세웠다면 그 오기를 이어 쓰지 말고 위 대상으로 복구한다.`,
-        ].join("\n")
-      : "";
+          ] : []),
+        ].join("\n");
     const addressDirectionPriorityBlock = formatAddressDirectionGuard(
       canonicalAddressDirections
     );
@@ -3516,6 +3566,7 @@ const systemRaw = (cacheFriendlyLayout
 	          durableCharacterCanonBlock,
 	          persistentCharacterConditionsBlock,
 	          scenePresencePriorityBlock,
+	          activeInterlocutorPriorityBlock,
 	          sanitizePromptCached(recentExpressionAvoidanceBlock),
 	          sceneViewpointPriorityBlock,
 	          currentOocPriorityBlock ? `` : "",
@@ -3742,6 +3793,7 @@ const systemRaw = (cacheFriendlyLayout
       `- 주인공의 다음 행동이나 대사를 대신 쓰지 않고, 현재 NPC 반응과 장면만 전개한다.`,
       `- 목표 분량은 현재 현장의 의미 있는 반응·대사로 채운다. 옆방·먼 곳 인물의 대화·속마음·상태 재방송으로 길이를 늘리지 않는다.`,
       `- 현재 입력이 둘 다·각자·모두·너네·너희처럼 복수 NPC에게 답변을 요구하면, 대상 전원의 관찰 가능한 반응과 대답을 본문에서 모두 끝낸 뒤에만 상태창으로 넘어간다. 한 명만 답하고 종료하지 않는다.`,
+      `- 답변 전 직접 말을 건 대상과 이번 사건의 현장 당사자를 각각 확인한다. 대표자의 대사를 여러 번 쓰는 것으로 다른 당사자의 답을 대신하지 않는다. 명시적인 발화 제한과 실제 발화 능력을 반영하되, 이름 없는 사람도 원문의 역할·위치에 따라 구분해 필요한 자기 의견을 말하게 한다.`,
       `- 메타/상태창이 필요하면 완결된 본문 뒤에 전체 fenced 코드블록을 한 번만 붙이고 닫는다.`,
     ].join("\n");
 
@@ -3964,7 +4016,8 @@ const systemRaw = (cacheFriendlyLayout
       const speech = removeUnrequestedOffSceneSpeech({
         text: presence.text,
         contextText,
-        offSceneCharacters: currentSceneState.offScene,
+        offSceneCharacters: unrequestedSpeakers,
+        addressedCharacters: addressedSpeakers,
         currentUserText: userText,
         allowExternalContact: Boolean(worldDirectorBlock || currentOocInstruction),
       });
@@ -4178,7 +4231,7 @@ let cancelStreamWork: (() => void) | null = null;
           );
           streamRelationshipContext = `${streamRelationshipContext}\n${text}`.slice(-1200);
           const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
-          const scenePresence = sanitizeScenePresence(physicalOwnership.text, streamCommunicationContext);
+          const scenePresence = sanitizeScenePresence(sanitizeCharacterAgeText(physicalOwnership.text, streamCommunicationContext), streamCommunicationContext);
           const communication = sanitizeCommunicationAbilities(
             scenePresence.text,
             streamCommunicationContext
@@ -4778,7 +4831,7 @@ if (!TRANSPORT_STREAMING) {
             const vitalStatus = sanitizeVitalStatus(legalStatus.text, true);
             const relationshipClaims = sanitizeRelationshipClaims(vitalStatus.text);
             const physicalOwnership = sanitizePhysicalOwnership(relationshipClaims.text);
-            const scenePresence = sanitizeScenePresence(physicalOwnership.text);
+            const scenePresence = sanitizeScenePresence(sanitizeCharacterAgeText(physicalOwnership.text));
             const communication = sanitizeCommunicationAbilities(scenePresence.text);
             streamEpistemicRedactions += epistemic.redactedSegments;
             streamAuthorityClaimRedactions += authorityClaims.removed;
@@ -4795,7 +4848,8 @@ if (!TRANSPORT_STREAMING) {
           if (!assistantText.trim()) {
             const recovered = removeUnrequestedOffSceneSpeech({
               text: recoverAfterOverfilter(factGuardRecoverySource),
-              offSceneCharacters: currentSceneState.offScene,
+              offSceneCharacters: unrequestedSpeakers,
+              addressedCharacters: addressedSpeakers,
               currentUserText: userText,
               allowExternalContact: Boolean(worldDirectorBlock || currentOocInstruction),
             }).text.trim();
@@ -6177,7 +6231,7 @@ if (_beforeComplete !== assistantText) debugReasons.push("trim:COMPLETE_AFTER_BU
     const physicalOwnershipOutputChecked = sanitizePhysicalOwnership(
       relationshipClaimOutputChecked.text
     );
-    const scenePresenceOutputChecked = sanitizeScenePresence(physicalOwnershipOutputChecked.text);
+    const scenePresenceOutputChecked = sanitizeScenePresence(sanitizeCharacterAgeText(physicalOwnershipOutputChecked.text));
     const communicationOutputChecked = sanitizeCommunicationAbilities(
       scenePresenceOutputChecked.text
     );

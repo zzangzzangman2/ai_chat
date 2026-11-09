@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { hasGroundedHierarchyEvidence, RELATIONSHIP_CONTINUITY_RULES } from "@/lib/durable_character_state";
 
 import { generateText } from "@/lib/ai";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
@@ -224,10 +225,22 @@ export type StructuredCharacterFact = CanonicalFactObservation;
 
 export type StructuredCharacterGraph = {
   ok: boolean;
+  failure?: { code: "rate_limited" | "timeout" | "aborted" | "provider_error" | "invalid_response"; retryAfterMs: number };
   characters: StructuredCharacter[];
   relationships: StructuredRelationship[];
   facts: StructuredCharacterFact[];
 };
+
+export function classifyStructuredGraphFailure(error: unknown): NonNullable<StructuredCharacterGraph["failure"]> {
+  const value = error as { name?: unknown; message?: unknown; status?: unknown; code?: unknown } | null;
+  const text = String(value?.message || error || "");
+  if (Number(value?.status || value?.code) === 429 || /\b429\b|RESOURCE_EXHAUSTED|resource exhausted/iu.test(text)) {
+    return { code: "rate_limited", retryAfterMs: 60_000 };
+  }
+  if (/timeout|timed?\s*out|시간(?:이)?\s*초과|대기\s*시간.*초과/iu.test(text)) return { code: "timeout", retryAfterMs: 30_000 };
+  if (value?.name === "AbortError" || /\baborted\b/iu.test(text)) return { code: "aborted", retryAfterMs: 0 };
+  return { code: "provider_error", retryAfterMs: 30_000 };
+}
 
 function cleanText(value: unknown, max = 400) {
   return String(value ?? "")
@@ -570,7 +583,8 @@ export async function extractStructuredCharacterGraph(params: {
     "- details에 호칭을 설명할 때도 반드시 'A가 B를 X라고 부른다'처럼 발화자와 수신자 실명을 모두 써서 address_* 필드와 같은 방향으로 작성한다.",
     "- relationship의 source_role은 evidence가 속한 원문 태그가 [사용자]면 user, [어시스턴트]면 assistant로 정확히 쓴다.",
     "- 형/누나/오빠/언니/선배/후배/대표님/주인님 같은 호칭은 동일 인물 통합과 가족·서열·직장 관계 판단에 활용한다.",
-    "- 관계는 고정 설정이 아니다. 최신 대화에서 관계가 발전하거나 깨졌다면 초기 직업·초면 관계보다 최신 상태를 우선한다.",
+    "- 관계는 원문에 실제 전환 사건이 확인될 때 갱신한다. 최신 AI의 관계 형용사만으로 기존 설정을 덮어쓰지 않는다.",
+    RELATIONSHIP_CONTINUITY_RULES,
     "- known_by_ids는 관계의 양 끝 인물 목록이 아니다. 각 인물이 그 관계의 구체적 사실을 안다는 원문 근거가 있을 때만 넣는다.",
     "- 현장에 없었거나 잠들었거나 보지 못했거나, 복면·변장 때문에 정체를 확인하지 못한 인물은 known_by_ids에 넣지 않는다.",
     "- 전지적 지문이 범인·배후·비밀 정체를 확정해도 그 사실을 목격하거나 전달받지 못한 다른 인물은 알지 못한다.",
@@ -582,7 +596,7 @@ export async function extractStructuredCharacterGraph(params: {
     "- relation에 '미확인', '알 수 없음', '관계 미정', '중립'을 쓰는 것은 엄격히 금지한다.",
     "- 명확한 구조적 관계가 없으면 relationships에 넣지 않는다. '현재 사건으로 얽힌 당사자', '대화를 나누며 알아가는 사이', 감정·행동·일시적 상황을 관계 라벨로 만들지 않는다.",
     "- 기존 레지스트리에 이미 있던 두 인물 사이의 가족·혼인 관계는 [어시스턴트] 출력만으로 새로 만들지 않는다. 사용자 설정·수동 관계도에 확정되었거나 기존 동일 관계를 유지하는 경우만 기록한다.",
-    "- 감정(공포, 호감, 분노, 경계)은 relation이 아니다. 감정은 details에만 쓰고 relation에는 가족·학교·직장·사회적 지위 또는 현재 상황 관계를 쓴다.",
+    "- 일시 감정(공포, 호감, 분노)은 relation이 아니다. 지속적인 원한·적대 사건은 두 당사자와 원인을 보존하며, 고용·직책과 혼동하지 않는다. 임시 협조·복종은 부하 직원·하인 관계가 아니다.",
     "- aliases에는 원문에 실제 등장한 표현만 쓴다. '너/당신/그/그녀/우리' 같은 문맥 의존 대명사는 aliases에 넣지 않는다.",
     "- aliases는 evidence 한 구절 안에 main_name과 alias가 함께 있어 동일 인물임이 직접 증명될 때만 넣는다. 근거가 분리되거나 추측이면 aliases를 비운다.",
     "- 이름이 없는 역할 인물에게 새 이름을 지어내지 않는다. 이름 미상 노드도 만들지 않는다.",
@@ -637,7 +651,7 @@ export async function extractStructuredCharacterGraph(params: {
           rawTextSample: responseText.slice(0, 1200),
         }));
       }
-      return { ok: false, characters: [], relationships: [], facts: [] };
+      return { ok: false, failure: { code: "invalid_response", retryAfterMs: 30_000 }, characters: [], relationships: [], facts: [] };
     }
   } catch (error: unknown) {
     if (process.env.CHAT_DEBUG === "1") {
@@ -647,10 +661,10 @@ export async function extractStructuredCharacterGraph(params: {
         error: String((error as { message?: unknown })?.message || error),
       }));
     }
-    return { ok: false, characters: [], relationships: [], facts: [] };
+    return { ok: false, failure: classifyStructuredGraphFailure(error), characters: [], relationships: [], facts: [] };
   }
   if (!parsed) {
-    return { ok: false, characters: [], relationships: [], facts: [] };
+    return { ok: false, failure: { code: "invalid_response", retryAfterMs: 30_000 }, characters: [], relationships: [], facts: [] };
   }
 
   const existingById = new Map(existing.map((item) => [item.id, item]));
@@ -817,6 +831,11 @@ export async function extractStructuredCharacterGraph(params: {
       declaredSourceRole !== sourceRole ||
       !addressIsValid
     ) {
+      rejectedRelationshipCount += 1;
+      continue;
+    }
+    if (!hasGroundedHierarchyEvidence({relation,evidence,subjectName:source.mainName,
+      objectName:target.mainName,sourceRole,personaName:params.personaName})) {
       rejectedRelationshipCount += 1;
       continue;
     }
@@ -1209,6 +1228,8 @@ export function applyStructuredCharacterGraph(params: {
       const objectKey = stableNameKey(objectName, personaName);
       if (!subjectKey || !objectKey || subjectKey === objectKey) continue;
       const sourceRole = relationship.sourceRole === "user" ? "user" : "assistant";
+      if (!hasGroundedHierarchyEvidence({relation,evidence:relationship.evidence,
+        subjectName,objectName,sourceRole,personaName})) continue;
       const addressTerm = cleanText(relationship.addressTerm, 40);
       const addressSpeakerName = addressTerm
         ? cleanText(relationship.addressSpeakerName, 80)

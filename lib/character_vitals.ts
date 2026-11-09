@@ -2,6 +2,8 @@ import { randomUUID } from "crypto";
 
 import { decryptIfPossible } from "@/lib/crypto";
 import { db } from "@/lib/db";
+import { loadCanonicalCharacterFacts } from "./canonical_character_facts";
+import { parseCharacterAge } from "./character_age";
 import type { IdentityCanon, IdentityMessageLike } from "@/lib/identity_memory";
 
 export type CharacterGraphNode = {
@@ -450,6 +452,18 @@ export function syncCharacterVitals(params: {
     chatCreatedAt: Math.max(0, Number(chat?.createdAt || 0)),
     roster,
   });
+  // A direct NPC introduction is a valid baseline even when the user never
+  // restated its age. Reuse the same timeline-aware age canon as generation.
+  const establishedAges = loadCanonicalCharacterFacts(chatId, { characters: roster, messages: params.messages })
+    .filter((fact) => fact.factKey === "age")
+    .map((fact) => ({ name: fact.subjectName, age: parseCharacterAge(fact.value) }));
+  for (const state of states) {
+    const established = establishedAges.find((person) => person.name === state.name);
+    if (state.key !== "persona" && state.ageSource !== "인물 프로필" && established) {
+      state.age = established.age;
+      state.ageSource = "이전 원문 및 사용자 시간 경과";
+    }
+  }
   const now = Date.now();
   const upsert = db.prepare(
     `INSERT INTO chat_character_vitals

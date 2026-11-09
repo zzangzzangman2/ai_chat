@@ -26,6 +26,7 @@ import { removeUnsupportedLegalStatusClaims } from "@/lib/legal_status_consisten
 import { removeUnsupportedVitalStatusClaims } from "@/lib/vital_status_consistency_guard";
 import {
   applyStructuredCharacterGraph,
+  classifyStructuredGraphFailure,
   extractStructuredCharacterGraph,
   loadStructuredCharacterIdentities,
 } from "@/lib/structured_relationship_memory";
@@ -604,6 +605,8 @@ async function detectCharactersFromWindow(params: {
         thinkingBudget: 128,
         temperature: 0.1,
         topP: 0.9,
+        // Background extraction must yield so later summary blocks can advance.
+        timeoutMs: 120_000,
         signal: params.llmOpts.signal,
       },
     });
@@ -685,6 +688,7 @@ type StructuredGraphRefreshOutcome = {
   autoAliasesUpdated: string[];
   autoRelationshipsUpserted: number;
   autoFactsUpserted: number;
+  structuredGraphFailure?: ReturnType<typeof classifyStructuredGraphFailure>;
 };
 
 async function refreshStructuredCharacterState(params: {
@@ -701,7 +705,7 @@ async function refreshStructuredCharacterState(params: {
   now: number;
   signal?: AbortSignal;
 }): Promise<StructuredGraphRefreshOutcome> {
-  const empty = (): StructuredGraphRefreshOutcome => ({
+  const empty = (failure?: ReturnType<typeof classifyStructuredGraphFailure>): StructuredGraphRefreshOutcome => ({
     attempted: true,
     structuredGraphParsed: false,
     structuredGraphRefreshed: false,
@@ -712,6 +716,7 @@ async function refreshStructuredCharacterState(params: {
     autoAliasesUpdated: [],
     autoRelationshipsUpserted: 0,
     autoFactsUpserted: 0,
+    structuredGraphFailure: failure,
   });
 
   try {
@@ -742,6 +747,7 @@ async function refreshStructuredCharacterState(params: {
         maxOutputTokens: 4096,
         maxReasoningTokens: 128,
         thinkingBudget: 128,
+        timeoutMs: 120_000,
         signal: params.signal,
       },
       windowStartTurn: params.graphWindowStartTurn,
@@ -760,8 +766,10 @@ async function refreshStructuredCharacterState(params: {
         .filter(Boolean)
     );
     const missingCandidateNames: string[] = [];
-    const shouldUseFallback =
-      !structuredGraph.ok || wasRosterEmpty;
+    // A smaller extraction can repair malformed JSON. It cannot repair a
+    // throttled/timed-out provider; a second immediate call only adds load.
+    const shouldUseFallback = (!structuredGraph.ok || wasRosterEmpty) &&
+      (!structuredGraph.failure || structuredGraph.failure.code === "invalid_response");
 
     let autoCharactersAdded: string[] = [];
     let autoAliasesUpdated: string[] = [];
@@ -862,6 +870,7 @@ async function refreshStructuredCharacterState(params: {
     return {
       attempted: true,
       structuredGraphParsed: structuredGraph.ok,
+      structuredGraphFailure: structuredGraph.failure,
       structuredGraphRefreshed,
       fallbackUsed: shouldUseFallback,
       candidateNames,
@@ -882,7 +891,7 @@ async function refreshStructuredCharacterState(params: {
         error: String((error as { message?: unknown })?.message || error),
       }));
     }
-    return empty();
+    return empty(classifyStructuredGraphFailure(error));
   }
 }
 
@@ -1278,6 +1287,10 @@ export async function POST(req: Request) {
         withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(
           chatId, pending.blockStartTurn, { structuredGraphPending: null }
         ));
+      } else {
+        withCurrentChatHistory(historySnapshot, () => updateMemoryBlockMeta(chatId, pending.blockStartTurn, {
+          structuredGraphLastFailure: graphOutcome.structuredGraphFailure || { code: "invalid_response", retryAfterMs: 30_000 },
+        }));
       }
       const remaining = loadPendingMemoryWork(chatId, boundaryEndTurn);
       return NextResponse.json({
@@ -2148,6 +2161,7 @@ export async function POST(req: Request) {
     let autoRelationshipsUpserted = 0;
     let autoFactsUpserted = 0;
     let structuredGraphParsed = false;
+    let structuredGraphFailure: StructuredGraphRefreshOutcome["structuredGraphFailure"];
     let structuredGraphRefreshed = false;
     let structuredGraphFallbackUsed = false;
     let structuredGraphCandidateNames: string[] = [];
@@ -2189,6 +2203,7 @@ export async function POST(req: Request) {
       autoRelationshipsUpserted = graphOutcome.autoRelationshipsUpserted;
       autoFactsUpserted = graphOutcome.autoFactsUpserted;
       structuredGraphParsed = graphOutcome.structuredGraphParsed;
+      structuredGraphFailure = graphOutcome.structuredGraphFailure;
       structuredGraphRefreshed = graphOutcome.structuredGraphRefreshed;
       structuredGraphFallbackUsed = graphOutcome.fallbackUsed;
       structuredGraphCandidateNames = graphOutcome.candidateNames;
@@ -2231,6 +2246,7 @@ export async function POST(req: Request) {
       autoRelationshipsUpserted,
       autoFactsUpserted,
       structuredGraphParsed,
+      structuredGraphFailure,
       structuredGraphRefreshed,
       structuredGraphFallbackUsed,
       structuredGraphCandidateNames,

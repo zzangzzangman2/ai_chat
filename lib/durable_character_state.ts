@@ -26,7 +26,39 @@ export type DurableRelationshipState = DurableStateEvidence & {
 export type DurableCharacterCanon = {
   lifeStates: DurableLifeState[];
   relationships: DurableRelationshipState[];
+  hierarchies?: Array<DurableStateEvidence & { subjectName: string; objectName: string }>;
 };
+
+// Shared by generation and both memory writers. Recency or repeated model text
+// is not independent evidence that an established relationship changed.
+export const RELATIONSHIP_CONTINUITY_RULES = [
+  "- 관계는 감정(적대·불신), 행동(협조·복종), 지위(고용·직책), 자발적 충성을 구분한다. 공포·협박·패배·강요로 명령을 따르거나 예의를 갖춘 것만으로 원한이 풀리거나 부하·심복이 된 것은 아니다.",
+  "- 적대의 원인과 당사자 두 실명을 보존한다. 사과 없는 순응, 일회성 심부름, 주인님 같은 호칭, 호감도 수치만으로 화해·고용·충성을 확정하지 않는다. 적대적인 고용인도 가능하며 지위와 감정은 별개다.",
+  "- 기존 상태와 충돌하는 AI 서술은 반복 횟수나 최신성만으로 정본이 되지 않는다. 관계가 바뀌려면 사용자 명시 설정·정정 또는 당사자·원인·결과가 확인된 전환 사건이 필요하다. AI가 임의로 화해·임명 사건을 만들어 모순을 정당화하지 않는다.",
+  "- 사용자 명령·제안·희망과 상대가 실제로 수락한 결과를 구분한다. 명시적 설정 변경은 반영하되, 명령에 대한 감정·승낙·충성을 자동으로 덧붙이지 않는다.",
+  "- 적대 인물을 장면 편의를 위해 자발적인 문지기·시중꾼·혼례 준비 담당으로 배치하지 않는다. 기존 직책이나 실제 요구가 없다면 그런 역할을 만들지 않으며, 요구가 있어도 기존 원한과 거부·경계의 이유를 유지한다.",
+].join("\n");
+
+const HIERARCHY_RELATIONS = new Set(["부하 직원", "상사", "고용주", "비서", "주인", "하인"]);
+const HIERARCHY_STATUS = /(?:부하(?:\s*직원)?|수하|심복|충복|고용인|하인|상사|고용주|비서|주인)(?:이|가|은|는|으로|로|인|이다|이었다|였다|이었)|(?:고용|채용|임명|임관|입사|취임)(?:했|되었|됐|한다|했다|하였)|(?:부하|수하|하인|비서)로\s*(?:삼|받아들|들어)/u;
+const NEGATED_HIERARCHY = /(?:부하|수하|심복|충복|고용인|하인|상사|고용주|비서|주인)(?:이|가|은|는)?\s*(?:아니|없)|(?:고용|채용|임명|입사)(?:하|되)?지\s*(?:않|못)/u;
+const UNCERTAIN_HIERARCHY = /(?:만약|가정|꿈|소문|척|위장|연기|될\s*수|삼을\s*수|[?？])|(?:고용|채용|임명|부하|수하|하인|주인)[^.!?\n]{0,30}(?:해라|하라|하라고|하자|해주세요|해줘|될까|되어라|되라고|되고\s*싶|되면|된다면|되겠|삼겠다|삼겠|삼아라|삼자|삼아줘)/u;
+
+/** Exact source evidence is required; an honorific or frightened obedience alone
+ * cannot establish an employment/master relation, even after many repetitions. */
+export function hasGroundedHierarchyEvidence(input: {
+  relation: string; evidence: unknown; subjectName: string; objectName: string;
+  sourceRole?: string; personaName?: string;
+}) {
+  if (!HIERARCHY_RELATIONS.has(input.relation)) return true;
+  const evidence = String(input.evidence || "");
+  if (!HIERARCHY_STATUS.test(evidence) || NEGATED_HIERARCHY.test(evidence) || UNCERTAIN_HIERARCHY.test(evidence)) return false;
+  if (input.sourceRole !== "user" && COERCED_ACTION.test(evidence)
+    && !/(?:고용|채용|임명|입사)(?:했|되었|됐다|했다)|고용\s*계약/u.test(evidence)) return false;
+  const names = identityMatcher([{name:input.subjectName}, {name:input.objectName}])(evidence).map(m => m.name);
+  return [input.subjectName, input.objectName].every(name => names.includes(name)
+    || (input.sourceRole === "user" && name === input.personaName && /(?:나는|내가|나의|내\s|나를|나에게|내게)/u.test(evidence)));
+}
 
 function clean(value: unknown, max = 800) {
   return String(value ?? "").replace(/\s+/gu, " ").trim().slice(0, max);
@@ -88,10 +120,11 @@ const UNCERTAIN_CONTEXT = /(?:만약|가정(?:하면|하|한)|상상(?:하면|�
 const REPORTED_EVENT = /(?:죽었다|사망했다|숨졌다|부활했다|화해했다)(?:고|는)\s*(?:말|주장|듣|들었|믿|생각|소식|보도|보고|소문|전해)/u;
 const DEAD_EVENT = /(?:사망(?:했|하였|함|됐|되었)|사살(?:됐|되었|당했|됨)|살해(?:당했|당하였다|됐|되었)|죽었|숨졌|숨을\s*거두(?:었|었다)|목숨을\s*잃(?:었|었다)|시신으로\s*발견(?:됐|되었)|사체로\s*발견(?:됐|되었)|순직(?:했|함)|서거(?:했|함))/u;
 const ALIVE_EVENT = /(?:부활(?:했|하였|한다|하다|하여|시킨|시켰|시켜)|되살아(?:났|난|나|왔다)|되살(?:렸|린다|리다|려)|살아\s*(?:있(?:다|어|음|는\s*것)|돌아(?:왔|온|와))|살아서\s*돌아(?:왔|온|와)|생존(?:했|해\s*있|이\s*확인))/u;
-const HOSTILE_EVENT = /(?:원수|적대\s*관계|적대하|증오하|증오했|미워하|미워했|불신하|불신했|절교(?:했|한다|했다)|배신(?:했|했다|당했|당했다)|(?:사이|관계)(?:가|는)?\s*(?:매우\s*|아주\s*|몹시\s*)?(?:나쁘|나빠|틀어졌|악화됐)|신뢰를\s*잃었)/u;
+const HOSTILE_EVENT = /(?:원수|적대\s*관계|적대적|적대하|적의(?:를|가)|원한(?:을|이)|증오하|증오했|미워하|미워했|불신하|불신했|절교(?:했|한다|했다)|배신(?:했|했다|당했|당했다)|(?:사이|관계)(?:가|는)?\s*(?:매우\s*|아주\s*|몹시\s*)?(?:나쁘|나빠|틀어졌|악화됐)|신뢰를\s*잃었)/u;
+const ATTACK_EVENT = /(?:공격(?:했|한다|하며)|습격(?:했|한다)|칼(?:을|로)[^.!?\n]{0,35}(?:휘둘|겨누|찌르|내리)|(?:베어|베려|찌르려|내리꽂히|쪼개버리|쪼개버릴))/u;
 const RECONCILED_EVENT = /(?:화해(?:했|한다|했다|하였|하기로\s*했)|용서(?:했|한다|했다|하였)|오해를\s*풀(?:었|었다)|관계를\s*회복(?:했|한다|했다)|(?:친구|동료|동맹)(?:가|이)\s*되(?:었|었다)|친구로\s*지내기로\s*했)/u;
 const NEGATED_RELATION = /(?:원수|적대\s*관계|증오|미워|불신|절교|배신|화해|용서|친구)[^.!?\n]{0,16}(?:않|아니|못했|못하|없었다|없다|취소)/u;
-const NEGATED_HOSTILITY = /(?:원수|적대\s*관계)(?:가|이|는|은)?\s*(?:아니|없)|(?:증오|미워|불신|절교|배신)(?:하(?:지|지는|기는)|한\s*(?:적이|것이))?\s*(?:않|못|없|아니)/u;
+const NEGATED_HOSTILITY = /(?:원수|적대\s*관계|적의|원한)(?:가|이|는|은)?\s*(?:아니|없)|(?:적대적이지|적대|증오|미워|불신|절교|배신)(?:하(?:지|지는|기는)|한\s*(?:적이|것이))?\s*(?:않|못|없|아니)/u;
 const NEGATED_RECONCILIATION = /(?:화해|용서|관계\s*회복)(?:하(?:지|지는|기는)|한\s*(?:적이|것이))?\s*(?:않|못|없|아니)|친구(?:가|는|이)?\s*(?:아니|되(?:지|지는)\s*않)/u;
 
 function withoutQuotes(text: string) {
@@ -130,7 +163,7 @@ function ownsPredicate(tail: string, predicate: RegExp) {
 }
 function pairForSentence(sentence: string, mentions: Mention[], personaName: string) {
   const names = [...new Set(mentions.map((item) => item.name))];
-  if (names.length === 1 && personaName && names[0] !== personaName && /(?:나는|나와|나를|나에게|내게|우리\s*사이)/u.test(sentence)) {
+  if (names.length === 1 && personaName && names[0] !== personaName && /(?:나는|내가|나와|나를|나에게|나한테|내게|내\s|우리\s*사이)/u.test(sentence)) {
     names.push(personaName);
   }
   // More than two names needs semantic attribution; do not guess an owner.
@@ -156,10 +189,10 @@ function eventExcerpt(sentence: string, mentions: Mention[], eventIndex: number)
   return merged.map((range) => sentence.slice(range.start,range.end).trim()).filter(Boolean).join(" … ");
 }
 function isDirectedRelationship(sentence: string, mentions: Mention[], personaName: string) {
-  const namedTarget = mentions.some((mention) => /^(?:을|를|에게|한테)(?:\s|$)/u.test(sentence.slice(mention.end)));
-  const selfTarget = personaName && /(?:나를|나에게|내게)/u.test(sentence);
+  const namedTarget = mentions.some((mention) => /^(?:을|를|에게|한테)(?:\s|$)|^의\s*(?:목|정수리|머리|가슴|심장)(?:을|를|에)/u.test(sentence.slice(mention.end)));
+  const selfTarget = personaName && /(?:나를|나에게|나한테|내게)/u.test(sentence);
   const mutual = /(?:서로|두\s*사람|둘은|둘이)/u.test(sentence);
-  const pairStatus = /(?:원수|적대\s*관계|(?:사이|관계)(?:가|는)?\s*[^.!?]{0,15}(?:나쁘|나빠|틀어졌|악화됐|회복)|절교|화해|친구(?:가|로)|동맹(?:이|으로))/u.test(sentence);
+  const pairStatus = /(?:원수(?:가|다|이다|이며|였|로)|적대\s*관계|(?:사이|관계)(?:가|는)?\s*[^.!?]{0,15}(?:나쁘|나빠|틀어졌|악화됐|회복)|절교|화해|친구(?:가|로)|동맹(?:이|으로))/u.test(sentence);
   return Boolean(namedTarget || selfTarget || mutual || (pairStatus && !/(?:함께|같이)/u.test(sentence)));
 }
 
@@ -171,6 +204,7 @@ export function deriveDurableCharacterCanon(params: {
   const findMentions = identityMatcher(params.identities);
   const life = new Map<string, DurableLifeState>();
   const relationships = new Map<string, DurableRelationshipState>();
+  const hierarchies = new Map<string, DurableStateEvidence & { subjectName: string; objectName: string }>();
   let userTurn = 0;
   for (const message of params.messages) {
     const rawRole = String(message.role || "").toLowerCase();
@@ -208,25 +242,31 @@ export function deriveDurableCharacterCanon(params: {
         }
       }
       const pair = pairForSentence(sentence, mentions, clean(params.personaName, 80));
+      if (pair && role === "user" && hasGroundedHierarchyEvidence({
+        relation:"부하 직원", evidence:sentence, subjectName:pair[0], objectName:pair[1],
+        sourceRole:role, personaName:params.personaName,
+      })) hierarchies.set(pairKey(pair), {subjectName:pair[0],objectName:pair[1],...evidence});
+      if (pair && role === "user" && NEGATED_HIERARCHY.test(sentence)) hierarchies.delete(pairKey(pair));
       if (!pair || !isDirectedRelationship(sentence, mentions, clean(params.personaName, 80))) continue;
       const previous = relationships.get(pairKey(pair));
       const reconciled = role === "user" && RECONCILED_EVENT.test(sentence) && !NEGATED_RECONCILIATION.test(sentence);
-      const hostile = HOSTILE_EVENT.test(sentence) && !NEGATED_HOSTILITY.test(sentence);
+      const attack = ATTACK_EVENT.test(sentence) && !/(?:훈련|대련|연습|시범|연극|공격하지|겨누지|찌르지)/u.test(sentence);
+      const hostile = (HOSTILE_EVENT.test(sentence) || attack) && !NEGATED_HOSTILITY.test(sentence);
       if (reconciled || (hostile && (role === "user" || !previous))) {
         relationships.set(pairKey(pair), {
           subjectName: pair[0], objectName: pair[1], kind: reconciled ? "reconciled" : "hostile", ...evidence,
-          evidence: eventExcerpt(sentence,mentions,(reconciled ? RECONCILED_EVENT : HOSTILE_EVENT).exec(sentence)?.index || 0),
+          evidence: eventExcerpt(sentence,mentions,(reconciled ? RECONCILED_EVENT : attack ? ATTACK_EVENT : HOSTILE_EVENT).exec(sentence)?.index || 0),
         });
       }
     }
   }
-  return { lifeStates: [...life.values()], relationships: [...relationships.values()] };
+  return { lifeStates: [...life.values()], relationships: [...relationships.values()], hierarchies:[...hierarchies.values()] };
 }
 
 export function buildDurableCharacterCanonBlock(canon: DurableCharacterCanon) {
-  if (!canon.lifeStates.length && !canon.relationships.length) return "";
   const lines = [
     "# [원문 근거를 보존한 인물 상태 — 최근 AI 출력·요약보다 우선]",
+    RELATIONSHIP_CONTINUITY_RULES,
     "- 아래 상태는 남아 있는 원문 사건에서 재구성했다. 최근 AI의 재등장·친밀한 태도·요약만으로 사망이나 적대 상태를 해제하지 않는다.",
     "- 사망한 인물은 현재 장면에서 육체로 말하거나 행동할 수 없다. 명시된 회상·꿈·유령 장면은 구분하며, 사용자의 명시적 부활·생존 정정만 생사 변경으로 인정한다.",
     "- 적대 관계에는 그 원인과 경계·불신이 남는다. 대화·미소·예의·일시 협조만으로 친밀·용서·화해로 바꾸지 않는다. 사용자가 명시한 화해·용서 사건은 반영한다.",
@@ -242,6 +282,9 @@ export function buildDurableCharacterCanonBlock(canon: DurableCharacterCanon) {
 
 const LIVING_ACTION = /(?:살아\s*있|살아서|생존(?:했|해|한)|부활(?:했|한|하여)|되살아|말(?:했|한다|하며|하고|했다)|대답(?:했|한다|하며)|대꾸|물었|묻(?:는다|고|자)|질문(?:했|한다)|웃(?:었|는다|으며)|미소를|걷(?:는다|고)|걸어|들어(?:왔|온다|와)|다가(?:왔|온다|와)|고개를|손을\s*(?:들|내밀|뻗)|눈을\s*(?:뜨|뜬|떴)|몸을\s*(?:일으|돌)|앉(?:았|는다|아)|일어(?:났|난다|나)|먹(?:었|는다)|마(?:셨|신다)|건넸|악수|포옹|껴안|돌아(?:왔|온다|와)|모습을\s*드러|문을\s*열)/u;
 const FRIENDLY_ACTION = /(?:가장\s*(?:소중한|친한)\s*친구|절친|친구가\s*되|친구로\s*지내|화해(?:했|했다|한다)|용서(?:했|했다|한다)|다정(?:하게|한)|친근(?:하게|한)|반갑게|기쁘게\s*맞|따뜻하게\s*(?:안|맞|품)|애정|포옹|껴안)/u;
+const LOYALTY_CLAIM = /(?:충성(?:을\s*바|을\s*맹세|하|스러운|스레|심)|충직한|충실한\s*(?:부하|수하)|심복|충복|진심으로\s*(?:따르|복종|섬기)|원한(?:을|과)[^.!?\n]{0,20}(?:잊|버|풀))/u;
+const HIERARCHY_CLAIM = /(?:부하|수하|하인|고용인|비서)(?:로서|로\s*(?:삼|일|행동|움직)|가\s*되|이\s*되|인\s|였다|이다|다[.*\s]|답게)|(?:그의|그녀의)\s*(?:충직한\s*)?(?:부하|수하|심복)/u;
+const COERCED_ACTION = /(?:공포|두려|두렵|협박|위협|겁에|강요|강제|억지|어쩔\s*수\s*없이|거역할\s*엄두|기세에\s*눌|적대|불신|원한)/u;
 const PERFORMED_FRIENDLINESS = /(?:척(?:했|한다|하며|하고)|가식|억지|위장|연기|조롱|비웃|냉소|경계[^.!?\n]{0,16}감추|적대[^.!?\n]{0,16}감추)/u;
 
 function outputSentences(line: string) {
@@ -281,6 +324,7 @@ export function guardGeneratedDurableCharacterState(input: {
   const text = String(input.text || "");
   const deceased = new Set(input.canon.lifeStates.filter((state) => state.kind === "deceased").map((state) => key(state.name)));
   const hostile = new Set(input.canon.relationships.filter((state) => state.kind === "hostile").map((state) => pairKey([state.subjectName, state.objectName])));
+  const authorizedHierarchy = new Set((input.canon.hierarchies || []).map(state => pairKey([state.subjectName,state.objectName])));
   if (!text || (!deceased.size && !hostile.size)) return { text, removed: 0, violations: [] as string[] };
   const findMentions = identityMatcher(input.identities);
   let inFence = false;
@@ -324,6 +368,25 @@ export function guardGeneratedDurableCharacterState(input: {
       && !UNCERTAIN_CONTEXT.test(narration)) {
       violations.add(`hostility_reversal:${pair.join("/")}`);
       invalid = true;
+    }
+    // Pronouns may refer to the established enemy only when no other named
+    // counterpart appears. Never transfer a third party's loyalty to that pair.
+    let hierarchyPair = pair;
+    const uniqueNames = [...new Set(mentions.map(m => m.name))];
+    if (!hierarchyPair && uniqueNames.length === 1 && /(?:그의|그녀의|그에게|그녀에게|주인공의|주인공에게)/u.test(narration)) {
+      const candidates = input.canon.relationships.filter(state => state.kind === "hostile"
+        && [state.subjectName,state.objectName].includes(uniqueNames[0])
+        && [state.subjectName,state.objectName].includes(clean(input.personaName,80)));
+      if (candidates.length === 1) hierarchyPair = [candidates[0].subjectName,candidates[0].objectName];
+    }
+    if (hierarchyPair && hostile.has(pairKey(hierarchyPair)) && !UNCERTAIN_HIERARCHY.test(narration)
+      && !NEGATED_HIERARCHY.test(narration) && !PERFORMED_FRIENDLINESS.test(narration)) {
+      const inventedRole = HIERARCHY_CLAIM.test(narration) && !authorizedHierarchy.has(pairKey(hierarchyPair));
+      const inventedLoyalty = LOYALTY_CLAIM.test(narration) && !/(?:충성[^.!?\n]{0,12}(?:않|아니|없))/u.test(narration);
+      if (inventedRole || inventedLoyalty) {
+        violations.add(`hostility_subordination:${hierarchyPair.join("/")}`);
+        invalid = true;
+      }
     }
     if (invalid) {
       removed += 1; changed = true;

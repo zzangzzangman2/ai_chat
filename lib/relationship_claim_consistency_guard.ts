@@ -335,8 +335,21 @@ function isEverydaySiblingReference(term: string, modifier: string, following: s
 
 function repairNameReferenceArtifacts(
   text: string,
-  variants: Array<{ value: string; canonical: string }>
-) {
+  variants: Array<{ value: string; canonical: string }>,
+  simplifiedNames: Set<string> = new Set()
+): { text: string; rewritten: number; labels: string[] } {
+  if (text.includes("```")) {
+    let rewritten = 0;
+    const labels = new Set<string>();
+    const output = text.split(/(```[\s\S]*?(?:```|$))/gu).map(part => {
+      if (part.startsWith("```")) return part;
+      const repaired = repairNameReferenceArtifacts(part, variants, simplifiedNames);
+      rewritten += repaired.rewritten;
+      repaired.labels.forEach(label => labels.add(label));
+      return repaired.text;
+    }).join("");
+    return { text: output, rewritten, labels: [...labels] };
+  }
   let output = text;
   let rewritten = 0;
   const labels = new Set<string>();
@@ -346,6 +359,27 @@ function repairNameReferenceArtifacts(
     seenValues.add(variant.value);
     const name = escapeRegex(variant.value);
     const boundary = "(?<![가-힣A-Za-z0-9])";
+    // A neutralized modifier must not turn a named call into
+    // "지아야, 그 사람 지아야". Only collapse an identical vocative;
+    // ordinary third-person references and deliberate repeated calls stay.
+    const neutralVocative = new RegExp(
+      `${boundary}(${name}(?:아|야))\\s*[,，]\\s*(?:그\\s*사람|그\\s*아이)\\s+\\1(?=$|[\\s,.!?。！？~…"”])`, "gu"
+    );
+    output = output.replace(neutralVocative, (_matched, call: string) => {
+      rewritten += 1;
+      labels.add(`호명 중립 치환 중복: ${variant.canonical}`);
+      return call;
+    });
+    if (simplifiedNames.has(variant.value)) {
+      const repeatedVocative = new RegExp(
+        `${boundary}(${name}(?:아|야))\\s*[,，]\\s*\\1(?=$|[\\s,.!?。！？~…"”])`, "gu"
+      );
+      output = output.replace(repeatedVocative, (_matched, call: string) => {
+        rewritten += 1;
+        labels.add(`호칭 보정 후 중복: ${variant.canonical}`);
+        return call;
+      });
+    }
     const coordinated = new RegExp(
       `${boundary}${name}(?:이?랑|와|과)\\s*${name}(?=(?:은|는|이|가|을|를|의|에게|한테|에서|으로|로|부터|까지|만|도|\\s|[,，.!?。！？]|$))`,
       "gu"
@@ -437,9 +471,13 @@ export function removeUnsupportedRelationshipClaims(input: {
   if (!source.trim()) return { text: source, removed: 0, rewritten: 0, claims: [] };
   const identities = input.identities || [];
   const variants = buildIdentityLookup(identities);
-  if (variants.length < 2) return { text: source, removed: 0, rewritten: 0, claims: [] };
+  if (variants.length < 2) {
+    const repaired = repairNameReferenceArtifacts(source, variants);
+    return { text: repaired.text, removed: 0, rewritten: repaired.rewritten, claims: repaired.labels };
+  }
   const claims = familyClaims(input.relations || []);
   const rejected = new Set<string>();
+  const simplifiedNames = new Set<string>();
   let rewritten = 0;
   const contextText = String(input.contextText || "").slice(-1200);
   const inferenceSource = contextText ? `${contextText}\n${source}` : source;
@@ -453,14 +491,23 @@ export function removeUnsupportedRelationshipClaims(input: {
   ].sort((a, b) => b.length - a.length).join("|");
   const wordEnd = "(?=$|[^\\p{L}\\p{N}_])";
   const particles = "(?:은|는|이|가|을|를|의|와|과|랑|이랑|도|만|한테서|에게서|한테|에게|께서|께|으로|로|부터|까지|처럼|보다)";
+  const namedTargets = variants.filter(variant => {
+    const canonical = identities.find(identity => key(identity.name) === key(variant.value));
+    return canonical ? key(canonical.name) === key(variant.canonical) :
+      !variants.some(other => key(other.value) === key(variant.value) && key(other.canonical) !== key(variant.canonical));
+  });
+  const namedTargetPattern = [...new Set(namedTargets.map(variant => variant.value))].map(escapeRegex).join("|");
+  const namedTargetSuffix = namedTargetPattern
+    ? `(?:[ \\t]+(${namedTargetPattern})(?=${wordEnd}|${particles}|아|야))?`
+    : "()";
   const possessive = new RegExp(
     `(?<![\\p{L}\\p{N}_])(?:우리|저희|내|제)\\s*(?:(첫째|둘째|셋째|막내|친|양)\\s*)?(${familyTerms})` +
-    `(?=${wordEnd}|${particles}{1,3}${wordEnd}|이(?:다|야|라|었|고|며|면|지|죠|니|겠|든|오|자)|입|였|인${wordEnd})`,
+    `(?=${wordEnd}|${particles}{1,3}${wordEnd}|이(?:다|야|라|었|고|며|면|지|죠|니|겠|든|오|자)|입|였|인${wordEnd})${namedTargetSuffix}`,
     "gu"
   );
   const fences = [...source.matchAll(/```[\s\S]*?(?:```|$)/gu)]
     .map((match) => ({ start: match.index!, end: match.index! + match[0].length }));
-  let rewrittenText = source.replace(possessive, (matched, modifier: string, rawTerm: string, offset: number) => {
+  let rewrittenText = source.replace(possessive, (matched, modifier: string, rawTerm: string, namedTarget: string, offset: number) => {
     if (fences.some((fence) => offset >= fence.start && offset < fence.end)) return matched;
     const relation = normalizeFamilyTerm(rawTerm);
     if (isEverydaySiblingReference(relation, modifier || "", source.slice(offset + matched.length))) {
@@ -469,7 +516,10 @@ export function removeUnsupportedRelationshipClaims(input: {
     const inferenceAt = inferenceOffset + offset;
     const speaker = inferSpeaker(inferenceSource, inferenceAt, variants);
     if (!speaker) return matched;
-    const target = inferTarget(inferenceSource, inferenceAt, speaker, variants);
+    // An appositional name in the original phrase is explicit evidence about
+    // the referent. It is stronger than guessing from nearby narration.
+    const target = (namedTarget && namedTargets.find(variant => variant.value === namedTarget)?.canonical) ||
+      inferTarget(inferenceSource, inferenceAt, speaker, variants);
     if (target) {
       if (
         claimSupported(claims, speaker, target, relation) ||
@@ -479,6 +529,10 @@ export function removeUnsupportedRelationshipClaims(input: {
       }
       rewritten += 1;
       rejected.add(`${speaker} → ${relation} → ${target}`);
+      if (namedTarget) {
+        simplifiedNames.add(namedTarget);
+        return namedTarget;
+      }
       // Inferring the target is useful for validation, but it is not safe for
       // text generation. Replacing "내 딸" with a nearby name produced broken
       // prose such as "박지아랑 박지아" and even changed the victim. Neutralize
@@ -521,10 +575,11 @@ export function removeUnsupportedRelationshipClaims(input: {
     return restoreOuterNarrationMarkers(line, kept.join(" "));
   });
   rewrittenText = lines.join("\n").replace(/\n{3,}/gu, "\n\n");
-  const nameArtifacts = repairNameReferenceArtifacts(rewrittenText, variants);
+  // Repair prose only. INFO/STATUS contents are persistent structured data.
+  const nameArtifacts = repairNameReferenceArtifacts(rewrittenText, variants, simplifiedNames);
   rewrittenText = nameArtifacts.text;
   rewritten += nameArtifacts.rewritten;
-  nameArtifacts.labels.forEach((label) => rejected.add(label));
+  nameArtifacts.labels.forEach(label => rejected.add(label));
 
   if (!removed && !rewritten) {
     return { text: source, removed: 0, rewritten: 0, claims: [] };
@@ -552,6 +607,7 @@ export function formatRelationshipCanonGuardBlock(input: {
     "- 언니·오빠·누나·형·동생은 사회적 호칭으로도 쓰인다. '우리 언니/내 동생'이라는 일상 호칭만으로 혈연을 확정하거나, 혈연 목록에 없다는 이유로 정상 호칭을 익명화하지 않는다. 친혈연·입양·가족관계의 명시적 주장은 정본으로 별도 확인한다.",
     "- 보정 과정에서도 모호한 가족 호칭을 주변 인물의 이름으로 추측 치환하지 않는다. 같은 인물명을 나열하거나 같은 이름·조사구를 연달아 반복하지 않으며, 한 사람의 고유명사에 '들'을 붙여 집단처럼 쓰지 않는다.",
     "- 대상이 명확한 인물은 이름이나 이미 정해진 호칭으로 자연스럽게 지칭한다. 최근 답변의 '그 사람' 같은 중립 치환을 말버릇처럼 반복하지 않는다. 대상이 불명확할 때는 이름을 추측하지 않는다.",
+    "- 호칭 바로 뒤에 원문 이름이 있으면 그 이름을 보존한다. 관계 수식어를 교정하면서 '그 사람 이름'을 만들거나, 같은 이름의 호명을 불필요하게 중복하지 않는다. 정상적인 제3자 지칭은 그대로 둔다.",
     "- 관계가 불확실하면 가족 호칭을 쓰지 말고 대상의 이름이나 중립 표현을 쓴다. 새 관계가 필요하면 사용자가 설정하기 전까지 확정하지 않는다.",
   ];
   if (exact.length) {

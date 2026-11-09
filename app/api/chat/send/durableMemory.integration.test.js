@@ -39,7 +39,7 @@ function visit(node){
       if(source.includes('guardedTextStream.finish()'))bufferedGuardSource=source;
     }
   }
-  if(ts.isVariableDeclaration(node)&&['cumulativeMemory','historySummaryForPromptRaw','memoryBlock','systemRaw','systemWithIdentityCanon','system','systemForContinuationRaw','systemForStatus','sceneViewpointPriorityBlock','worldDirectorBlock','oneShotLengthContract'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
+  if(ts.isVariableDeclaration(node)&&['cumulativeMemory','historySummaryForPromptRaw','memoryBlock','systemRaw','systemWithIdentityCanon','system','systemForContinuationRaw','systemForStatus','scenePresencePriorityBlock','sceneViewpointPriorityBlock','worldDirectorBlock','oneShotLengthContract','activeInterlocutorPriorityBlock','addressedSpeakers','unrequestedSpeakers'].includes(node.name.getText(ast)))promptInitializers.set(node.name.getText(ast),node.initializer);
   ts.forEachChild(node,visit);
 }
 visit(ast);
@@ -64,6 +64,15 @@ function timeline(event){
     {id:`a${i+1}`,role:'assistant',content:'조용한 하루가 지나갔다.'},
   ]).flat();
 }
+
+test('production final-state sanitizer rejects invented allegiance after 500 turns',()=>{
+  const history=timeline('박도훈은 이서윤에게 적대적이었다.');
+  history.push({id:'drift',role:'assistant',content:'박도훈은 이서윤의 충직한 부하가 되었다.'});
+  const result=setup(history);
+  assert.equal(result.canon.relationships[0].kind,'hostile');
+  assert.equal(result.sanitize('*박도훈은 이서윤의 부하로서 명령을 받았다.*',true).text,'');
+  assert.equal(result.sanitize('*박도훈은 이서윤을 두려워해 어쩔 수 없이 짐을 옮겼다.*',true).text,'*박도훈은 이서윤을 두려워해 어쩔 수 없이 짐을 옮겼다.*');
+});
 function evaluatePrompt(name,values){
   const expression=promptInitializers.get(name);
   assert.ok(expression,`production prompt ${name} must exist`);
@@ -148,6 +157,7 @@ test('production scene sanitizer blocks a bystander before streaming and in the 
     removeScenePresenceContradictionPassages:recognition.removeScenePresenceContradictionPassages,
     removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,
     currentScenePresence:scene.present,currentSceneExclusions:[],currentSceneState:scene,userText:'계속 읽어줘.',
+    unrequestedSpeakers:scene.offScene,addressedSpeakers:[],
   });
   const raw='*지아는 문서를 펼쳤다.*\n\n"첫 항목부터 읽을게요."\n\n*민서는 문밖에서 말을 보탰다.*\n\n"어서 승인해 주세요!"\n\n*지아는 다음 항목을 짚었다.*\n\n"날짜도 확인해요."\n\n```INFO\n장소: 서재\n```';
   const result=sanitize(raw);
@@ -168,6 +178,154 @@ test('production scene sanitizer blocks a bystander before streaming and in the 
   assert.match(emitted,/날짜도 확인/);
 });
 
+test('a direct conversation keeps reply priority without deleting relevant local participants',()=>{
+  const focusModule=load(path.join(root,'lib/active_character_focus.ts'));
+  const recognition=load(path.join(root,'lib/recognition_consistency_guard.ts'));
+  const speech=load(path.join(root,'lib/scene_speech_scope.ts'));
+  const identities=[{id:'jia',name:'지아'},{id:'minseo',name:'민서'}];
+  const focus=focusModule.resolveActiveCharacterFocus({identities,currentUserText:'그래, 다음은?',previousUserTexts:['지아야 지도 좀 설명해줘']});
+  const facts=identities.map(identity=>({characterName:identity.name,characterAliases:[],evidence:'이전 장면',messageIndex:0}));
+  const scene=focusModule.applyActiveFocusToScene({present:facts,offScene:[],location:'서재'},focus);
+  const fixtures={activeCharacterFocus:focus,legalStatusIdentities:identities,currentSceneState:scene};
+  const addressedSpeakers=evaluatePrompt('addressedSpeakers',fixtures);
+  const unrequestedSpeakers=evaluatePrompt('unrequestedSpeakers',fixtures);
+  assert.deepEqual(addressedSpeakers.map(s=>s.characterName),['지아']);
+  assert.deepEqual(scene.offScene,[]);
+  const sanitize=evaluatePrompt('sanitizeScenePresence',{
+    removeScenePresenceContradictionPassages:recognition.removeScenePresenceContradictionPassages,
+    removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,
+    currentScenePresence:scene.present,currentSceneExclusions:[],currentSceneState:scene,userText:'그래, 다음은?',
+    addressedSpeakers,unrequestedSpeakers,
+  });
+  const raw='*지아는 지도를 펼쳤다.*\n\n"다음은 이 길이에요."\n\n*민서는 자기 가방에서 나침반을 꺼냈다.*\n\n"제가 길을 확인할게요."';
+  const result=sanitize(raw);
+  assert.match(result.text,/다음은 이 길/);
+  assert.equal(result.text,raw);
+  const prompt=evaluatePrompt('activeInterlocutorPriorityBlock',{activeCharacterFocus:focus});
+  assert.match(prompt,/우선권과 독점 발화는 다르다/);
+  assert.doesNotMatch(prompt,/사용자가 위 대상만 대답/);
+});
+
+test('production arrival handoff preserves the new guest in streaming and final output while filtering remote interruptions',()=>{
+  const focusModule=load(path.join(root,'lib/active_character_focus.ts'));
+  const recognition=load(path.join(root,'lib/recognition_consistency_guard.ts'));
+  const speech=load(path.join(root,'lib/scene_speech_scope.ts'));
+  const stream=load(path.join(root,'lib/guarded_text_stream.ts'));
+  const identities=[{id:'jia',name:'지아'},{id:'guest',name:'영안공주'},{id:'remote',name:'민서'}];
+  const messages=[
+    {role:'user',content:'지아야 일정을 설명해줘'},
+    {role:'assistant',content:'*지아는 마당에 서 있었다. 민서는 먼 마을에 있었다.*'},
+    {role:'user',content:'*행사계속진행*'},
+    {role:'assistant',content:'*영안 공주가 마당에 들어왔다.*'},
+    {role:'user',content:'*도착*'},
+    {role:'assistant',content:'*영안 공주는 마당 한가운데 서 있었다.*'},
+  ];
+  const focus=focusModule.resolveActiveCharacterFocus({identities,currentUserText:'그래, 다음은?',previousUserTexts:messages.filter(m=>m.role==='user').reverse().map(m=>m.content)});
+  assert.equal(focus.locked,false);
+  const scene=recognition.deriveCurrentSceneState({identities,messages});
+  assert.ok(scene.present.some(f=>f.characterName==='영안공주'));
+  assert.ok(scene.offScene.some(f=>f.characterName==='민서'));
+  const fixtures={activeCharacterFocus:focus,legalStatusIdentities:identities,currentSceneState:scene};
+  const sanitize=evaluatePrompt('sanitizeScenePresence',{
+    removeScenePresenceContradictionPassages:recognition.removeScenePresenceContradictionPassages,
+    removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,
+    currentScenePresence:scene.present,currentSceneExclusions:[],currentSceneState:scene,userText:'그래, 다음은?',
+    addressedSpeakers:evaluatePrompt('addressedSpeakers',fixtures),unrequestedSpeakers:evaluatePrompt('unrequestedSpeakers',fixtures),
+  });
+  const raw='*영안 공주는 초청장을 펼쳤다.*\n\n"초대해 주셔서 감사합니다."\n\n*지아는 빈자리를 가리켰다.*\n\n"이쪽에 앉으세요."\n\n*민서는 먼 마을에서 외쳤다.*\n\n"내 말부터 들어요."';
+  const result=sanitize(raw);
+  assert.match(result.text,/초대해 주셔서 감사합니다/);
+  assert.match(result.text,/이쪽에 앉으세요/);
+  assert.doesNotMatch(result.text,/민서|내 말부터/);
+  let context='',emitted='';
+  const gate=stream.createGuardedTextStream(text=>{
+    const filtered=sanitize(text,context);context=(context+'\n'+text).slice(-1600);return filtered.text;
+  },{paragraphs:true});
+  for(const char of raw)emitted+=gate.push(char);
+  emitted+=gate.finish();
+  assert.equal(emitted.trim(),result.text.trim());
+  const scope=evaluatePrompt('activeInterlocutorPriorityBlock',{activeCharacterFocus:focus});
+  assert.match(scope,/도착한 인물을 배경 명단에만 넣어 방치하지 않는다/);
+  assert.doesNotMatch(scope,/최근 대화의 우선 상대/);
+  const system=evaluatePrompt('system',{systemWithIdentityCanon:'[HISTORY]',activeInterlocutorPriorityBlock:scope});
+  for(const lightweight of [true,false]){
+    const output=evaluatePrompt('systemForContinuationRaw',{system,activeInterlocutorPriorityBlock:scope,isGemini3ProFamilyModel:()=>lightweight});
+    assert.ok(output.includes(scope));
+  }
+});
+
+test('explicit private speech still restricts speakers, while an expired address never restores absent participants',()=>{
+  const focusModule=load(path.join(root,'lib/active_character_focus.ts'));
+  const identities=[{id:'jia',name:'지아'},{id:'other',name:'민서'}];
+  const focus=focusModule.resolveActiveCharacterFocus({identities,currentUserText:'지아야 너만 대답해'});
+  const fixtures={activeCharacterFocus:focus,legalStatusIdentities:identities,currentSceneState:{present:[],offScene:[]}};
+  assert.deepEqual(evaluatePrompt('unrequestedSpeakers',fixtures).map(f=>f.characterName),['민서']);
+  assert.match(evaluatePrompt('activeInterlocutorPriorityBlock',fixtures),/사용자가 위 대상만 대답/);
+  const follow=focusModule.resolveActiveCharacterFocus({identities,currentUserText:'다음은?',previousUserTexts:['지아야 설명해줘']});
+  const offScene=[{characterName:'지아'}];
+  const afterExit={...fixtures,activeCharacterFocus:follow,currentSceneState:{present:[],offScene}};
+  assert.deepEqual(evaluatePrompt('addressedSpeakers',afterExit),[]);
+  assert.deepEqual(evaluatePrompt('unrequestedSpeakers',afterExit),offScene);
+});
+
+test('a partial registered cast keeps unnamed affected participants eligible in main and continuation prompts',()=>{
+  const {buildFormatGuide}=load(path.join(root,'app/api/chat/send/_server/formatGuide.ts'));
+  const focusModule=load(path.join(root,'lib/active_character_focus.ts'));
+  const activeCharacterFocus=focusModule.resolveActiveCharacterFocus({identities:[{id:'manager',name:'김팀장'}],currentUserText:'김팀장, 여기 있는 직원 세 명의 근무 시간을 조정해 주세요.'});
+  assert.equal(activeCharacterFocus.exclusive,false);
+  const scenePresencePriorityBlock=evaluatePrompt('scenePresencePriorityBlock',{
+    JSON,currentScenePresence:[{characterName:'김팀장',evidence:'회의실에 서 있었다.'}],currentSceneExclusions:[],
+  });
+  const activeInterlocutorPriorityBlock=evaluatePrompt('activeInterlocutorPriorityBlock',{activeCharacterFocus});
+  const formatGuide=buildFormatGuide({statusRequired:'NO',targetChars:1200,promptMinChars:900,promptMaxChars:1600});
+  assert.match(scenePresencePriorityBlock,/부분 명단이며 현장 전원 목록이 아니다/);
+  assert.match(activeInterlocutorPriorityBlock,/지시를 듣는 사람과 그 지시로 영향을 받는 현장 당사자를 구분/);
+  assert.match(activeInterlocutorPriorityBlock,/침묵·공포·타인의 대답을 승낙이나 동의로 해석하지 않는다/);
+  assert.match(formatGuide,/직접 호명되지 않았다는 이유로 사건 당사자를 배경 인물로 취급하지 않는다/);
+  assert.match(formatGuide,/이름 없는 여러 사람도 각자 별도 인물/);
+  const system=evaluatePrompt('system',{systemWithIdentityCanon:'[MEMORY]',scenePresencePriorityBlock,activeInterlocutorPriorityBlock});
+  for(const lightweight of [true,false]){
+    const continuation=evaluatePrompt('systemForContinuationRaw',{system,scenePresencePriorityBlock,activeInterlocutorPriorityBlock,formatGuide,isGemini3ProFamilyModel:()=>lightweight});
+    for(const prompt of [system,continuation]){
+      assert.ok(prompt.includes(scenePresencePriorityBlock));
+      assert.ok(prompt.includes(activeInterlocutorPriorityBlock));
+    }
+    assert.ok(continuation.includes(formatGuide));
+  }
+  const completion=evaluatePrompt('oneShotLengthContract',{});
+  assert.match(completion,/대표자의 대사를 여러 번 쓰는 것으로 다른 당사자의 답을 대신하지 않는다/);
+});
+
+test('a manager address preserves unnamed local employees own replies, regardless of gender, during streaming and saving',()=>{
+  const focusModule=load(path.join(root,'lib/active_character_focus.ts'));
+  const recognition=load(path.join(root,'lib/recognition_consistency_guard.ts'));
+  const speech=load(path.join(root,'lib/scene_speech_scope.ts'));
+  const stream=load(path.join(root,'lib/guarded_text_stream.ts'));
+  const identities=[{id:'manager',name:'김팀장'},{id:'remote',name:'박감사'}];
+  const focus=focusModule.resolveActiveCharacterFocus({identities,currentUserText:'김팀장, 여기 있는 직원 세 명의 근무 시간을 조정해 주세요.'});
+  const scene={present:[{characterName:'김팀장',characterAliases:[],evidence:'회의실에 서 있었다.',messageIndex:1}],offScene:[{characterName:'박감사',characterAliases:[]}],location:'회의실'};
+  const fixtures={activeCharacterFocus:focus,legalStatusIdentities:identities,currentSceneState:scene};
+  const sanitize=evaluatePrompt('sanitizeScenePresence',{
+    removeScenePresenceContradictionPassages:recognition.removeScenePresenceContradictionPassages,
+    removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,
+    currentScenePresence:scene.present,currentSceneExclusions:[],currentSceneState:scene,userText:'김팀장, 여기 있는 직원 세 명의 근무 시간을 조정해 주세요.',
+    addressedSpeakers:evaluatePrompt('addressedSpeakers',fixtures),unrequestedSpeakers:evaluatePrompt('unrequestedSpeakers',fixtures),
+  });
+  for(const role of ['여직원','남직원','직원']){
+    const local=`*김팀장은 일정표를 펼쳤다.*\n\n"희망 시간을 듣고 정하겠습니다."\n\n*왼쪽 ${role}은 오전 칸을 가리켰다.*\n\n"저는 오전에 일하고 싶어요."\n\n*가운데 ${role}은 손을 들었다.*\n\n"저는 오후가 좋겠습니다."\n\n*오른쪽 ${role}은 일정표를 확인했다.*\n\n"그날은 어렵습니다. 다른 날짜로 정해주세요."`;
+    const raw=local+'\n\n*박감사는 문밖에서 말을 보탰다.*\n\n"제가 다 결정하겠습니다."';
+    const complete=sanitize(raw);
+    assert.equal(complete.text.trim(),local);
+    let context='',emitted='';
+    const gate=stream.createGuardedTextStream(text=>{
+      const filtered=sanitize(text,context);context=(context+'\n'+text).slice(-1600);return filtered.text;
+    },{paragraphs:true});
+    for(const char of raw)emitted+=gate.push(char);
+    emitted+=gate.finish();
+    assert.equal(emitted.trim(),complete.text.trim());
+  }
+});
+
 test('unchanged done-only drafts run the production final guard despite having no live deltas',()=>{
   assert.ok(bufferedGuardSource);
   const speech=load(path.join(root,'lib/scene_speech_scope.ts'));
@@ -180,6 +338,7 @@ test('unchanged done-only drafts run the production final guard despite having n
     guardedTextStream:{finish:()=>'',output:()=>''},enqueueWire:()=>{},
     sanitizeGeneratedFacts:pass,sanitizeAuthorityClaims:pass,sanitizeVitalStatus:pass,
     sanitizeRelationshipClaims:pass,sanitizePhysicalOwnership:pass,sanitizeCommunicationAbilities:pass,
+    sanitizeCharacterAgeText:text=>text,
     removeUnsupportedLegalStatusClaims:({text})=>pass(text),
     sanitizeScenePresence:text=>{fullGuardCalls++;return speech.removeUnrequestedOffSceneSpeech({text,offSceneCharacters:offScene});},
     recoverAfterOverfilter:text=>text,removeUnrequestedOffSceneSpeech:speech.removeUnrequestedOffSceneSpeech,

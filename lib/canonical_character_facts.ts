@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "crypto";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
 import { db } from "@/lib/db";
 import { resolveCanonicalFactCandidate } from "@/lib/canonical_fact_resolution";
+import { buildCharacterAgeCanon, resolveCanonicalAgeCandidate, type AgeIdentity } from "./character_age";
 
 export const CANONICAL_FACT_KEYS = [
   "age",
@@ -234,7 +235,10 @@ export function storeCanonicalFactObservations(params: {
   return inserted;
 }
 
-export function loadCanonicalCharacterFacts(chatIdRaw: string) {
+export function loadCanonicalCharacterFacts(chatIdRaw: string, context?: {
+  messages: Array<{ role?: unknown; content?: unknown }>;
+  characters: AgeIdentity[];
+}) {
   const chatId = cleanText(chatIdRaw, 120);
   if (!chatId) return [] as ResolvedCanonicalFact[];
   let rows: Array<Record<string, unknown>> = [];
@@ -245,8 +249,7 @@ export function loadCanonicalCharacterFacts(chatIdRaw: string) {
                 sourceRole, authority, confidence, evidence, turnNo
          FROM chat_character_facts
          WHERE chatId=?
-         ORDER BY turnNo ASC, createdAt ASC
-         LIMIT 2400`
+         ORDER BY turnNo ASC, createdAt ASC`
       )
       .all(chatId) as Array<Record<string, unknown>>;
   } catch {
@@ -283,11 +286,45 @@ export function loadCanonicalCharacterFacts(chatIdRaw: string) {
 
   const resolved: ResolvedCanonicalFact[] = [];
   for (const facts of groups.values()) {
-    // User-authored facts are authoritative. Assistant-only identity claims are
-    // promoted only after the same value is independently repeated in two turns,
-    // preventing a single mistaken speaker switch from becoming permanent canon.
-    const fact = resolveCanonicalFactCandidate(facts);
+    // User facts win. A directly evidenced age has its own stable-value policy;
+    // other assistant identity claims still need independent corroboration.
+    const fact = facts[0]?.factKey === "age"
+      ? resolveCanonicalAgeCandidate(facts)
+      : resolveCanonicalFactCandidate(facts);
     if (fact) resolved.push(fact);
+  }
+  // Structured extraction can miss an early introduction or first observe an
+  // already-drifted age. Rebuild age canon from originals, not the latest prose.
+  // All consumers (generation, graph, and memory extraction) share this view.
+  try {
+    const messages = context?.messages || (db.prepare(
+      `SELECT role, content FROM messages WHERE chatId=? ORDER BY createdAt ASC, id ASC`
+    ).all(chatId) as Array<{ role: string; content: string }>).map((row) => ({
+      role: row.role, content: decryptIfPossible(row.content),
+    }));
+    const characters = context?.characters || (db.prepare(
+      `SELECT id, name, aliases FROM chat_character_roster WHERE chatId=? AND enabled != 0`
+    ).all(chatId) as Array<{ id: string; name: string; aliases: string }>).map((row) => ({
+      ...row, aliases: decryptIfPossible(row.aliases),
+    }));
+    const ages = buildCharacterAgeCanon({ facts: resolved, characters, messages });
+    const existingAges = new Map(resolved.filter((fact) => fact.factKey === "age").map((fact) => [fact.subjectName, fact]));
+    const ageFacts: ResolvedCanonicalFact[] = ages.map((age) => {
+      const existing = existingAges.get(age.name);
+      const role = age.sourceRole || existing?.sourceRole || "assistant";
+      return {
+        id: existing?.id || `source-age:${age.name}`,
+        subjectKey: existing?.subjectKey || characters.find((person) => person.name === age.name)?.id || `name:${age.name}`,
+        subjectName: age.name, category: "age", factKey: "age", value: `${age.age}세`,
+        evidence: age.evidence || existing?.evidence || "", sourceRole: role,
+        confidence: role === "user" ? 100 : 95, authority: role === "user" ? 100 : 40,
+        turnNo: age.turnNo ?? existing?.turnNo ?? 0,
+      };
+    });
+    const otherFacts = resolved.filter((fact) => fact.factKey !== "age");
+    resolved.splice(0, resolved.length, ...otherFacts, ...ageFacts);
+  } catch {
+    // Legacy databases without source tables retain their evidenced observations.
   }
   return resolved.sort(
     (a, b) =>
@@ -336,7 +373,9 @@ export function formatCanonicalCharacterFactsBlock(params: {
     ) {
       return false;
     }
-    if (!focus.size) return true;
+    // Ages are compact identity constraints, including for someone who speaks
+    // unexpectedly. Scene focus must not silently drop them from the prompt.
+    if (fact.factKey === "age" || !focus.size) return true;
     const name = normalizedKey(fact.subjectName);
     const key = normalizedKey(fact.subjectKey);
     return fact.subjectKey === "persona" || focus.has(name) || focus.has(key);
@@ -348,6 +387,7 @@ export function formatCanonicalCharacterFactsBlock(params: {
     "- 아래 수치·직업·외형·정체·거주지를 뜻이 바뀌는 동의어로 바꾸지 말고, 모순되는 묘사를 새로 만들지 않는다.",
     "- 특히 AI가 반복해서 쓴 키·체중·체형·외모는 사용자 확정 없이 정본이 되지 않는다.",
     "- 관계·나이·직업·신체·거주지가 실제로 변한 경우에만 최신 사용자의 명시적 서술/OOC로 갱신한다.",
+    "- 나이는 최초 원문과 사용자의 명시적 변경·실제 시간 경과를 대조한 값이다. 다른 요약이나 AI 답변의 나이가 다르면 오류로 취급하며, 생일·성장·과거 나이를 새로 지어내 차이를 설명하지 않는다. 알 수 없는 나이는 추측하지 않는다.",
     "- 아래 정본은 모순 방지를 위한 참고 자료다. 키·체중·나이 같은 고정 정보를 이름 앞 수식어로 매번 붙이지 않는다. 사용자가 묻거나 현재 행동에 수치가 직접 필요한 경우에만 서술한다.",
   ];
   const guidanceRowCount = rows.length;
@@ -369,10 +409,14 @@ export function formatCanonicalCharacterFactsBlock(params: {
       );
     }
   }
-  for (const fact of selected.slice(0, 120)) {
+  const promptFacts = [
+    ...selected.filter((fact) => fact.factKey === "age"),
+    ...selected.filter((fact) => fact.factKey !== "age").slice(0, 120),
+  ];
+  for (const fact of promptFacts) {
     rows.push(
       `- ${fact.subjectName} · ${FACT_LABELS[fact.factKey]}: ${fact.value} ` +
-        `(근거: ${fact.sourceRole === "user" ? "사용자 확정" : "검증된 이전 서술"}, ${fact.turnNo}턴)`
+        `(근거: ${fact.sourceRole === "user" ? "사용자 확정" : "이전 원문"}, ${fact.turnNo}턴)`
     );
   }
   return rows.length > guidanceRowCount ? rows.join("\n") : "";

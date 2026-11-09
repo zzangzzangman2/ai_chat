@@ -95,7 +95,8 @@ test("cancelled graph extraction cannot apply character or fact changes", async 
     buildAuthoritativePersonaFacts: () => [],
     loadStructuredCharacterIdentities: () => [],
     loadCanonicalCharacterFacts: () => [],
-    extractStructuredCharacterGraph: async () => {
+    extractStructuredCharacterGraph: async ({ llmOpts }) => {
+      assert.equal(llmOpts.timeoutMs, 120_000);
       controller.abort();
       return { ok: false, characters: [], relationships: [], facts: [] };
     },
@@ -106,6 +107,36 @@ test("cancelled graph extraction cannot apply character or fact changes", async 
   try {
     await assert.rejects(refresh({ chatId: "chat", signal: controller.signal }), { name: "AbortError" });
   } finally { f.db.close(); }
+});
+
+test("provider throttle and timeout do not trigger another extraction on the same provider", async () => {
+  const graphSource = fs.readFileSync(path.resolve(__dirname, "../../../../../lib/structured_relationship_memory.ts"), "utf8");
+  const graphAst = ts.createSourceFile("graph.ts", graphSource, ts.ScriptTarget.Latest, true);
+  const classification = graphAst.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "classifyStructuredGraphFailure").getText(graphAst).replace(/^export /, "");
+  const classify = Function(compile(classification) + "\nreturn classifyStructuredGraphFailure;")();
+  const failures = [
+    classify(new Error('{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}')),
+    classify(new Error("Gemini 응답 대기 시간이 초과되었습니다 (120초).")),
+    classify(new Error("provider unavailable")),
+    { code: "invalid_response", retryAfterMs: 30_000 },
+  ];
+  assert.deepEqual(failures.map(f => f.code), ["rate_limited", "timeout", "provider_error", "invalid_response"]);
+  for (const failure of failures) {
+    let fallbackCalls = 0;
+    const deps = {
+      db: { prepare: () => ({ all: () => [] }) },
+      buildAuthoritativePersonaFacts: () => ({}), loadStructuredCharacterIdentities: () => [], loadCanonicalCharacterFacts: () => [],
+      extractStructuredCharacterGraph: async () => ({ ok: false, failure, characters: [], relationships: [], facts: [] }),
+      detectCharactersFromWindow: async () => { fallbackCalls++; return []; },
+      throwIfMemoryRefreshAborted: () => {}, classifyStructuredGraphFailure: classify,
+      StaleChatHistoryError: class extends Error {},
+    };
+    const refresh = Function(...Object.keys(deps), compile(declarations(["refreshStructuredCharacterState"])) + "\nreturn refreshStructuredCharacterState;")(...Object.values(deps));
+    const result = await refresh({ chatId: "chat", graphWindowStartTurn: 733, graphWindowEndTurn: 744, now: 1 });
+    assert.deepEqual(result.structuredGraphFailure, failure);
+    assert.equal(result.structuredGraphParsed, false);
+    assert.equal(fallbackCalls, failure.code === "invalid_response" ? 1 : 0);
+  }
 });
 
 test("summary and graph repairs alternate even when both keep failing", async () => {

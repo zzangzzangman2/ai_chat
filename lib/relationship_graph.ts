@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { deriveDurableCharacterCanon, hasGroundedHierarchyEvidence, type DurableCharacterCanon } from "@/lib/durable_character_state";
 
 import { db } from "@/lib/db";
 import { decryptIfPossible, encryptIfPossible } from "@/lib/crypto";
@@ -190,7 +191,7 @@ export function narrativeRelationshipLabel(params: {
   // relationship. A verified user transition or the canonical graph edge can.
   const storedRelationshipSource = [params.relationshipNote, params.role, params.profile]
     .map(cleanRelationshipSource).filter(Boolean).join(" ");
-  if (/(?:철천지원수|불구대천|원수|적대\s*관계)/u.test(storedRelationshipSource)
+  if (/(?:철천지원수|불구대천|원수|적대\s*관계|적대적|원한)/u.test(storedRelationshipSource)
     && params.latestSourceRole !== "user") return "원수";
   for (const [label, pattern] of LATEST_RELATIONSHIP_TRANSITIONS) {
     if (latestSource && pattern.test(latestSource)) return label;
@@ -399,21 +400,27 @@ function relationshipAuthority(row: RelationshipGraphRelation) {
   return 0;
 }
 
-function selectCurrentStoredRelationships(rows: RelationshipGraphRelation[]) {
+export function selectCurrentStoredRelationships(rows: RelationshipGraphRelation[]) {
   const selected = new Map<string, RelationshipGraphRelation>();
+  const bonds = new Set(["원수", "라이벌", "친구", "절친", "동맹"]);
+  const hierarchy = new Set(["부하 직원", "상사", "고용주", "비서", "주인", "하인"]);
   for (const row of rows.filter(
     (item) => {
       if (item.source !== "structured") return true;
+      if (!hasGroundedHierarchyEvidence({relation:item.relation,evidence:item.evidence,
+        subjectName:item.subjectName,objectName:item.objectName,sourceRole:item.sourceRole,
+        personaName:item.subjectKey === "persona" ? item.subjectName : item.objectKey === "persona" ? item.objectName : ""})) return false;
       if (item.addressTerm) return true;
       if (!CANONICAL_STRUCTURAL_RELATIONS.has(item.relation)) return false;
       if (String(item.sourceRole || "").toLowerCase() === "user") return true;
-      // Assistant extraction is an observation, not immediate canon. Keep it
-      // quarantined until the same structural relation appears on another turn.
-      // This prevents one generated hallucination from entering every later prompt.
+      // Assistant extraction is an observation, not immediate canon.
+      // Repetition is only corroboration after evidence validation, never proof
+      // that a bow, honorific or coerced errand created an employment relation.
       return Number(item.lastSeenTurn || 0) > Number(item.firstSeenTurn || 0);
     }
   )) {
-    const pairKey = unorderedRelationshipPairKey(row.subjectKey, row.objectKey);
+    // An employee may still distrust their employer; preserve both dimensions.
+    const pairKey = `${unorderedRelationshipPairKey(row.subjectKey, row.objectKey)}\u0000${hierarchy.has(row.relation) ? "hierarchy" : bonds.has(row.relation) ? "bond" : "structural"}`;
     const previous = selected.get(pairKey);
     if (!previous) {
       selected.set(pairKey, row);
@@ -421,6 +428,11 @@ function selectCurrentStoredRelationships(rows: RelationshipGraphRelation[]) {
     }
     const rowAuthority = relationshipAuthority(row);
     const previousAuthority = relationshipAuthority(previous);
+    if (previous.relation === "원수" && row.relation !== "원수" && rowAuthority < 3) continue;
+    if (row.relation === "원수" && previous.relation !== "원수" && previousAuthority < 3) {
+      selected.set(pairKey, row);
+      continue;
+    }
     const rowPriority = RELATIONSHIP_EVOLUTION_PRIORITY[row.relation] || 0;
     const previousPriority = RELATIONSHIP_EVOLUTION_PRIORITY[previous.relation] || 0;
     const rowSort = [
@@ -680,7 +692,38 @@ export function updateCharacterAffinity(params: {
   return { score, delta, label: affinityLabel(score) };
 }
 
-export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData {
+export function applyDurableRelationshipCanon(rows: RelationshipGraphRelation[], canon: DurableCharacterCanon, personaName: string) {
+  const pair = (a: string, b: string) => [cleanText(a,80),cleanText(b,80)].sort().join("\u0000");
+  const authorizedHierarchy = new Set((canon.hierarchies || []).map(state => pair(state.subjectName,state.objectName)));
+  let result = [...rows];
+  for (const state of canon.relationships) {
+    const statePair = pair(state.subjectName,state.objectName);
+    const matches = (row: RelationshipGraphRelation) => pair(row.subjectName,row.objectName) === statePair;
+    if (state.kind === "reconciled") {
+      result = result.filter(row => !matches(row) || row.relation !== "원수" || row.isManual);
+      continue;
+    }
+    result = result.filter(row => {
+      if (!matches(row) || row.isManual) return true;
+      if (["친구","절친","동맹"].includes(row.relation)) return false;
+      if (["부하 직원","상사","고용주","비서","주인","하인"].includes(row.relation)) {
+        // A role already established before the conflict may coexist with it.
+        return authorizedHierarchy.has(statePair) || row.firstSeenTurn < state.turnNo;
+      }
+      return true;
+    });
+    if (result.some(row => matches(row) && (row.relation === "원수" || row.isManual))) continue;
+    const nameKey = (name:string) => name === personaName ? "persona" : `name:${name.toLocaleLowerCase("ko-KR")}`;
+    result.push({id:`source-hostility:${state.sourceMessageId}:${statePair}`,subjectKey:nameKey(state.subjectName),
+      subjectName:state.subjectName,subjectRosterId:"",relation:"원수",slotKey:"source:hostility",objectKey:nameKey(state.objectName),
+      objectName:state.objectName,objectRosterId:"",objectRole:state.evidence,knownByNames:[],knowledgeEvidence:"",
+      evidence:state.evidence,sourceRole:state.sourceRole,addressSpeakerKey:"",addressSpeakerName:"",addressTargetKey:"",addressTargetName:"",addressTerm:"",
+      firstSeenTurn:state.turnNo,lastSeenTurn:state.turnNo,updatedAt:0,source:"identity",isManual:false});
+  }
+  return result;
+}
+
+export function loadRelationshipGraph(chatIdRaw: string, sourceCanon?: DurableCharacterCanon): RelationshipGraphData {
   const chatId = cleanText(chatIdRaw, 120);
   if (!chatId) return { personaName: "", nodes: [], relations: [], affinities: [] };
   const settings = db
@@ -855,7 +898,7 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
     (relation) =>
       !relation.addressTerm || canonicalAddressRelationIds.has(relation.id)
   );
-  const normalizedRelations = selectCurrentStoredRelationships(directionFilteredRelations.map((row) => {
+  let normalizedRelations = selectCurrentStoredRelationships(directionFilteredRelations.map((row) => {
     const subjectIsPersona =
       Boolean(normalizedPersona) &&
       cleanText(row.subjectName, 80).toLocaleLowerCase("ko-KR") === normalizedPersona;
@@ -870,8 +913,19 @@ export function loadRelationshipGraph(chatIdRaw: string): RelationshipGraphData 
       objectRosterId: objectIsPersona ? "" : row.objectRosterId,
     };
   }).filter((row) => !isInvalidRelationshipLabel(row.relation)));
+  // Existing chats are repaired as a derived view, without rewriting their
+  // messages or pinning a correction that would outlive undo. Send supplies its
+  // already reconstructed canon; standalone graph views rebuild from sources.
+  const durableCanon = sourceCanon || deriveDurableCharacterCanon({
+    messages: (db.prepare(`SELECT id, role, content FROM messages WHERE chatId=? ORDER BY createdAt ASC, id ASC`).all(chatId) as Array<{id:string;role:string;content:string}>)
+      .map(row => ({...row,content:decryptIfPossible(row.content)})),
+    identities: [...rawNodes.map(node => ({name:node.name})), {name:personaName}],
+    personaName,
+  });
+  normalizedRelations = applyDurableRelationshipCanon(normalizedRelations, durableCanon, personaName);
   const personaRelationByName = new Map<string, string>();
   for (const relation of normalizedRelations) {
+    if (relation.relation !== "원수" && personaRelationByName.get(cleanText(relation.subjectKey === "persona" ? relation.objectName : relation.subjectName, 80).toLocaleLowerCase("ko-KR")) === "원수") continue;
     if (relation.subjectKey === "persona") {
       personaRelationByName.set(
         cleanText(relation.objectName, 80).toLocaleLowerCase("ko-KR"),
@@ -990,7 +1044,7 @@ const SYMMETRIC_RELATIONS = new Set([
 
 export function formatRelationshipGraphBlock(graph: RelationshipGraphData) {
   const lines: string[] = [
-    "# [저장된 관계도·현재 나이 — 최신 정사, 기본 프로필보다 우선]",
+    "# [저장된 관계도·현재 나이 — 사용자 명시 정정과 원문 근거를 보존한 인물 상태 우선]",
     "- 아래 나이는 명시된 나이와 이후 시간 경과를 합산한 현재값이다. 초기 페르소나/인물 프로필의 나이와 다르면 아래 현재 나이를 따른다.",
     "- 관계도는 세계관 정사이며 그 자체로 모든 인물의 개인 지식이 아니다. 각 관계의 '알고 있는 인물'만 그 구체적 사실을 안다.",
     "- '알고 있는 인물: 없음(세계관 전용)'인 비밀·범인·배후·정체는 직접 목격하거나 전달받은 별도 근거가 생기기 전까지 NPC 기억으로 옮기지 않는다.",

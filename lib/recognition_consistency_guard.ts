@@ -1,3 +1,5 @@
+import { characterNamePattern, mentionsCharacterName } from "./character_mentions";
+
 export type RecognitionConsistencyFact = {
   characterId: string;
   characterName: string;
@@ -120,20 +122,19 @@ function splitStoryPassages(value: unknown) {
 }
 
 function passageMentionsName(passage: string, names: string[]) {
-  const key = normalized(passage);
-  return names.some((name) => key.includes(name));
+  return names.some((name) => mentionsCharacterName(passage, name));
 }
 
 function nameBeforeCuePattern(name: string, cue: RegExp, distance = 100) {
   return new RegExp(
-    `${escapeRegex(name)}(?:은|는|이|가|을|를|에게|한테|도|만|의|와|과)?[^.!?。！？\\n]{0,${distance}}(?:${cue.source})`,
+    `${characterNamePattern(name)}(?:은|는|이|가|을|를|에게|한테|도|만|의|와|과)?[^.!?。！？\\n]{0,${distance}}(?:${cue.source})`,
     "iu"
   );
 }
 
 function cueBeforeNamePattern(name: string, cue: RegExp, distance = 100) {
   return new RegExp(
-    `(?:${cue.source})[^.!?。！？\\n]{0,${distance}}${escapeRegex(name)}(?:은|는|이|가|을|를|에게|한테|도|만|의|와|과)?`,
+    `(?:${cue.source})[^.!?。！？\\n]{0,${distance}}${characterNamePattern(name)}(?:은|는|이|가|을|를|에게|한테|도|만|의|와|과)?`,
     "iu"
   );
 }
@@ -163,7 +164,7 @@ function findNamedDirectionalCue(args: {
 }) {
   const matches: RegExpExecArray[] = [];
   for (const name of args.names) {
-    const escapedName = escapeRegex(name);
+    const escapedName = characterNamePattern(name);
     const subject = new RegExp(
       `${escapedName}(?:이|가)[^.!?。！？\\n]{0,70}(?:${args.cue.source})`,
       "iu"
@@ -247,7 +248,7 @@ function passageShowsActivePresence(passage: string, names: string[]) {
   // subject: "무릎을 꿇고 있던 안유진은 ...".
   for (const name of names) {
     const stateBeforeSubject = new RegExp(
-      `(?:무릎을\\s*꿇고|앉아|서|누워|기대어|붙잡혀|포박(?:되어|돼)|묶여|갇혀)[^.!?。！？\\n]{0,45}(?:있던|있는)\\s*(?:[\\p{L}\\p{N}_-]+\\s+){0,4}${escapeRegex(name)}(?:은|는|이|가)?`,
+      `(?:무릎을\\s*꿇고|앉아|서|누워|기대어|붙잡혀|포박(?:되어|돼)|묶여|갇혀)[^.!?。！？\\n]{0,45}(?:있던|있는)\\s*(?:[\\p{L}\\p{N}_-]+\\s+){0,4}${characterNamePattern(name)}(?:은|는|이|가)?`,
       "iu"
     );
     if (stateBeforeSubject.test(passage)) return true;
@@ -269,7 +270,7 @@ function userSceneMove(text: string, identities: ScenePresenceIdentity[]) {
   if (!move) return "";
   const prefix = text.slice(0, move.index);
   if (identities.some((identity) => usableEntityNames([identity.name, ...(identity.aliases || [])]).some(
-    (name) => new RegExp(`${escapeRegex(name)}(?:은|는|이|가)[^.!?。！？]*$`, "iu").test(prefix)
+    (name) => new RegExp(`${characterNamePattern(name)}(?:은|는|이|가)[^.!?。！？]*$`, "iu").test(prefix)
   ))) return "";
   return move[0].split(/(?:으로|로)/u)[0].replace(/\s/g, "");
 }
@@ -284,7 +285,7 @@ function offSceneSubjects(passage: string, identities: ScenePresenceIdentity[], 
   const subjects: { name: string; start: number; end: number }[] = [];
   for (const identity of identities) {
     for (const name of usableEntityNames([identity.name, ...(identity.aliases || [])])) {
-      const pattern = new RegExp(`${escapeRegex(name)}(?:은|는|이|가|도|와|과|(?=\\s*[,，]))`, "giu");
+      const pattern = new RegExp(`${characterNamePattern(name)}(?:은|는|이|가|도|와|과|(?=\\s*[,，]))`, "giu");
       for (const match of passage.matchAll(pattern)) {
         subjects.push({ name: normalized(identity.name), start: match.index!, end: match.index! + match[0].length });
       }
@@ -377,7 +378,7 @@ export function deriveCurrentSceneState(args: {
     const bringsGroup = /(?:모두|다\s*같이|다들|전부).{0,24}(?:가자|이동|들어가)/u.test(moveText);
     for (const fact of [...previous.offScene, ...previous.present]) {
       const invited = bringsGroup || usableEntityNames([fact.characterName, ...fact.characterAliases])
-        .some((name) => new RegExp(`${escapeRegex(name)}(?:와|과|랑|이랑|아|야)`, "iu").test(moveText));
+        .some((name) => new RegExp(`${characterNamePattern(name)}(?:와|과|랑|이랑|아|야)`, "iu").test(moveText));
       if (!invited && !fact.evidence.includes(destination)) outside.set(normalized(fact.characterName), fact);
     }
   }
@@ -407,7 +408,7 @@ export function deriveCurrentSceneState(args: {
       else if (PERCEPTION_BRIDGE.test(passage) && [...passage.matchAll(OFF_SCENE_LOCATION)].length) remoteViewpoint = false;
       else if ([...states.values()].some((fact) =>
         usableEntityNames([fact.characterName, ...fact.characterAliases]).some((name) =>
-          new RegExp(`${escapeRegex(name)}(?:은|는|이|가)`, "iu").test(passage)
+          new RegExp(`${characterNamePattern(name)}(?:은|는|이|가)`, "iu").test(passage)
         )
       )) remoteViewpoint = false;
       for (const identity of identities) {
@@ -606,7 +607,7 @@ function currentTurnOverridesScenePresence(value: unknown, names: string[]) {
 function findNamedIntroduction(passage: string, names: string[]) {
   for (const name of names) {
     const pattern = new RegExp(
-      `(?:저는|전|제\\s*이름은|내\\s*이름은)?[^"”.!?。！？\\n]{0,45}${escapeRegex(name)}(?:\\s*(?:이라고|라고)\\s*(?:합니다|해요)|\\s*(?:입니다|예요|이에요))`,
+      `(?:저는|전|제\\s*이름은|내\\s*이름은)?[^"”.!?。！？\\n]{0,45}${characterNamePattern(name)}(?:\\s*(?:이라고|라고)\\s*(?:합니다|해요)|\\s*(?:입니다|예요|이에요))`,
       "iu"
     );
     const match = pattern.exec(passage);
@@ -868,7 +869,7 @@ function passageTargetsNamedThirdParty(args: {
   for (const name of usableEntityNames(args.sceneCharacterNames)) {
     if (excluded.has(name)) continue;
     const targetPattern = new RegExp(
-      `${escapeRegex(name)}(?:에게|한테|더러|을\\s*향해|를\\s*향해|쪽을\\s*보며|을\\s*보며|를\\s*보며)`,
+      `${characterNamePattern(name)}(?:에게|한테|더러|을\\s*향해|를\\s*향해|쪽을\\s*보며|을\\s*보며|를\\s*보며)`,
       "giu"
     );
     const matches = [...targetWindow.matchAll(targetPattern)];

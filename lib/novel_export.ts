@@ -12,6 +12,11 @@ export type NovelSourceChunk = {
   source: string;
 };
 
+export type NovelCharacter = {
+  name: string;
+  introduction: string;
+};
+
 export type NovelChapter = {
   index: number;
   title: string;
@@ -19,6 +24,30 @@ export type NovelChapter = {
   startTurn: number;
   endTurn: number;
   novelTitle?: string;
+  introduction?: string;
+  characters?: NovelCharacter[];
+};
+
+// Return editorial material with each chapter, without another model call.
+export const NOVEL_CHAPTER_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    novelTitle: { type: "string" },
+    title: { type: "string" },
+    introduction: { type: "string" },
+    body: { type: "string" },
+    characters: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { name: { type: "string" }, introduction: { type: "string" } },
+        required: ["name", "introduction"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["novelTitle", "title", "introduction", "body", "characters"],
+  additionalProperties: false,
 };
 
 function plain(value: unknown) {
@@ -127,7 +156,7 @@ export function buildNovelSourceChunks(
 
 function stripGeneratedDecorations(value: unknown) {
   return plain(value)
-    .replace(/^```(?:text|markdown|md)?\s*\n?/i, "")
+    .replace(/^```(?:text|markdown|md|json)?\s*\n?/i, "")
     .replace(/\n?```\s*$/i, "")
     .replace(/<<<END_OF_OUTPUT>>>/g, "")
     .trim();
@@ -138,6 +167,39 @@ export function parseGeneratedNovelChapter(
   source: Pick<NovelSourceChunk, "index" | "startTurn" | "endTurn">
 ): NovelChapter {
   const text = stripGeneratedDecorations(value);
+  if (text.startsWith("{")) {
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`${source.index}장 원고 응답이 완성되지 않았습니다. 다시 시도해 주세요.`);
+    }
+    if (typeof data.title !== "string" || !data.title.trim() ||
+        typeof data.body !== "string" || !data.body.trim() ||
+        !Array.isArray(data.characters)) {
+      throw new Error(`${source.index}장 원고 형식이 올바르지 않습니다.`);
+    }
+    // Reuse the established title normalization for both structured and legacy output.
+    const chapter = parseGeneratedNovelChapter(
+      `화 제목: ${data.title.replace(/\r?\n/g, " ").trim().slice(0, 60)}\n\n${data.body}`,
+      source
+    );
+    return {
+      ...chapter,
+      ...(source.index === 1 && typeof data.novelTitle === "string" && data.novelTitle.trim()
+        ? { novelTitle: data.novelTitle.trim().slice(0, 60) } : {}),
+      ...(source.index === 1 && typeof data.introduction === "string" && data.introduction.trim()
+        ? { introduction: plain(data.introduction).trim() } : {}),
+      characters: data.characters.flatMap((character: unknown) => {
+        if (!character || typeof character !== "object") return [];
+        const { name, introduction } = character as Partial<NovelCharacter>;
+        if (typeof name !== "string" || typeof introduction !== "string") return [];
+        const cleanName = name.normalize("NFC").replace(/\s+/g, " ").trim();
+        const cleanIntroduction = plain(introduction).trim();
+        return cleanName && cleanIntroduction ? [{ name: cleanName, introduction: cleanIntroduction }] : [];
+      }),
+    };
+  }
   const lines = text.split(/\r?\n/);
   let firstNonBlank = lines.findIndex((line) => line.trim());
   let novelTitle = "";
@@ -173,6 +235,20 @@ export function parseGeneratedNovelChapter(
     endTurn: source.endTurn,
     ...(novelTitle ? { novelTitle } : {}),
   };
+}
+
+export function collectNovelCharacters(chapters: NovelChapter[]): NovelCharacter[] {
+  const characters = new Map<string, NovelCharacter>();
+  for (const chapter of chapters) {
+    for (const character of chapter.characters || []) {
+      const name = character.name.normalize("NFC").replace(/\s+/g, " ").trim();
+      // Preserve the first introduction, instead of replacing it with later plot spoilers.
+      if (name && character.introduction.trim() && !characters.has(name)) {
+        characters.set(name, { name, introduction: character.introduction.trim() });
+      }
+    }
+  }
+  return [...characters.values()];
 }
 
 export function chooseGeneratedNovelTitle(chapters: NovelChapter[]) {
@@ -239,7 +315,10 @@ export function buildNovelSystemPrompt() {
     "- 미성년자 관련 성적·착취 장면은 구체적으로 재현하지 않고 위협, 사건 결과와 후유증을 중심으로 비노골적으로 처리한다.",
     "- 출력에는 채팅방 제목, 원문 범위, 메시지 수, 작성일 같은 편집·생성 메타데이터를 넣지 않는다.",
     "- 채팅방 제목을 작품 제목으로 복사하지 않는다. 첫 장에서 원문의 핵심 인물·갈등·분위기를 바탕으로 짧은 작품 제목을 새로 짓는다.",
-    "- 출력은 작품 제목(첫 장만), 이 장의 제목과 본문만 쓴다. 대사는 큰따옴표, 지문과 대사는 모두 들여쓰기 없이 같은 왼쪽 선에서 시작하고, 모든 문단은 빈 줄 하나로 구분한다.",
+    "- 출력은 지정된 JSON 객체 하나다. novelTitle은 작품 제목(첫 장만), title은 장 제목, introduction은 작품 소개(첫 장만), body는 소설 본문, characters는 등장인물 소개 배열이다. 코드 울타리나 JSON 밖의 설명은 쓰지 않는다.",
+    "- body에는 소설 본문만 쓴다. 작품 소개·목차·등장인물 소개는 본문에 끼워 넣지 않는다. 대사는 큰따옴표, 지문과 대사는 모두 들여쓰기 없이 같은 왼쪽 선에서 시작하고, 모든 문단은 빈 줄 하나로 구분한다.",
+    "- 작품 소개는 첫 원문에 드러난 주인공·상황·갈등을 2-3문장으로 소개한다. 이후 사건·결말·원문에 없는 설정을 만들지 않는다.",
+    "- characters에는 이번 원문에 실제로 등장하는 인물의 name(원문 이름)과 introduction(정체·역할·관계를 소개하는 1-2문장)을 쓴다. 이름을 모르면 원문의 호칭을 유지한다. 인물이나 이력을 지어내지 않고, 같은 인물의 이름 표기를 일관되게 유지한다. 등장인물 소개는 책 맨 뒤 부록에만 실린다.",
   ].join("\n");
 }
 
@@ -248,12 +327,17 @@ export function buildNovelChapterPrompt(args: {
   chunkCount: number;
   previousTail: string;
   source: string;
+  knownCharacters?: string[];
 }) {
   return [
     `전체 ${args.chunkCount}장 중 ${args.chunkIndex}장 원고를 작성한다.`,
     args.chunkIndex === 1
-      ? "첫 줄은 '작품 제목: 새로 지은 제목', 둘째 줄은 '화 제목: 이 장의 구체적이고 짧은 제목' 형식으로 쓰고, 빈 줄 뒤부터 소설 본문을 쓴다. 채팅방 제목은 참고하거나 복사하지 않는다."
-      : "첫 줄에는 이 장의 구체적이고 짧은 제목만 쓰고, 빈 줄 뒤부터 소설 본문을 쓴다.",
+      ? "JSON의 novelTitle에 새로 지은 작품 제목, introduction에 스포일러 없는 작품 소개, title에 이 장의 구체적이고 짧은 제목, body에 소설 본문을 쓴다. 채팅방 제목은 참고하거나 복사하지 않는다."
+      : "JSON의 title에 이 장의 구체적이고 짧은 제목, body에 소설 본문을 쓴다. novelTitle과 introduction은 빈 문자열로 둔다.",
+    "characters에는 이번 원문에 등장하는 인물의 이름과 짧은 소개를 담는다. 본문과 별도 필드로 분리하고, 등장인물이 없으면 빈 배열로 둔다.",
+    args.knownCharacters?.length
+      ? `[앞선 장에 나온 인물 이름 - 같은 인물은 이 표기를 유지]\n${JSON.stringify(args.knownCharacters)}`
+      : "",
     "본문에는 장 제목을 다시 쓰거나 원문 턴 범위·채팅방 제목·메시지 수 같은 생성 정보를 넣지 않는다.",
     "지문과 대사는 모두 들여쓰기 없이 같은 왼쪽 선에서 시작하고, 문단 사이는 빈 줄 하나로 통일한다.",
     "출력 전 원고만 조용히 다시 읽고, 동일한 과거형 종결 3연속·동일 문장 골격 3연속·짧은 단문 5연속이 있으면 사건을 바꾸지 않는 범위에서 문장 결합과 길이 조절로 고친다. 검수 과정은 출력하지 않는다.",
